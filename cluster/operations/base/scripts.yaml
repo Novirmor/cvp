@@ -1,0 +1,37 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-scripts
+  labels:
+    app.kubernetes.io/name: backup-runner
+    app.kubernetes.io/part-of: cvp
+data:
+  backup.sh: |
+    #!/bin/sh
+    set -eu
+
+    : "${BACKUP_BUCKET:?BACKUP_BUCKET is required}"
+    : "${BACKUP_PREFIX:?BACKUP_PREFIX is required}"
+
+    timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    archive="/work/application-${timestamp}.tar.gz"
+    test -d /source
+    tar -C /source -czf "${archive}" .
+    sha256sum "${archive}" > "${archive}.sha256"
+
+    echo "Backup archive and checksum created: ${archive}"
+    echo "This template intentionally stops before provider-specific upload."
+    echo "Replace this section with an application-native dump and encrypted R2 upload."
+    exit 2
+  check.sh: |
+    #!/bin/sh
+    set -eu
+
+    : "${BACKUP_BUCKET:?BACKUP_BUCKET is required}"
+    : "${BACKUP_PREFIX:?BACKUP_PREFIX is required}"
+    : "${EXPECTED_OBJECT:?EXPECTED_OBJECT is required}"
+
+    echo "This template must be replaced with an R2/object-store integrity check."
+    echo "The check must fail for a missing, stale, empty, or checksum-invalid object."
+    exit 2

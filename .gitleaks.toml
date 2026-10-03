@@ -1,0 +1,8 @@
+# Gitleaks configuration: extend the default rule set and exclude the
+# vendored Ansible collection tree, which ships upstream documentation and
+# test fixtures containing fake credentials.
+[extend]
+useDefault = true
+
+[allowlist]
+paths = ["ansible/collections/"]

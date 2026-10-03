@@ -1,0 +1,119 @@
+---
+- name: Create the local-path storage directory
+  ansible.builtin.file:
+    path: "{{ storage_mountpoint }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ storage_directory_mode }}"
+  when: storage_enabled | bool
+
+- name: Inspect the configured storage device
+  ansible.builtin.command: blkid -o value -s TYPE {{ storage_device }}
+  register: storage_device_type
+  changed_when: false
+  failed_when: false
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Refuse an unformatted device unless formatting is explicitly enabled
+  ansible.builtin.assert:
+    that:
+      - storage_device_type.rc == 0 or (storage_manage_device | bool and storage_allow_format | bool)
+    fail_msg: >-
+      {{ storage_device }} has no filesystem. Set storage_allow_format=true only
+      after the device has passed the storage safety gate; formatting is destructive.
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Format the storage device after an explicit safety gate
+  ansible.builtin.command: mkfs.{{ storage_filesystem }} -F {{ storage_device }}
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+    - storage_device_type.rc != 0
+    - storage_manage_device | bool
+    - storage_allow_format | bool
+
+- name: Read the storage device UUID
+  ansible.builtin.command: blkid -o value -s UUID {{ storage_device }}
+  register: storage_device_uuid_command
+  changed_when: false
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Save the storage UUID
+  ansible.builtin.set_fact:
+    storage_device_uuid: "{{ storage_device_uuid_command.stdout | trim }}"
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Require a UUID before touching mount state
+  ansible.builtin.assert:
+    that:
+      - storage_device_uuid | default('') | length > 0
+    fail_msg: "Could not read a UUID from {{ storage_device }} after filesystem preparation."
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+# findmnt --mountpoint matches only an exact mount at the path. --target would
+# match the parent filesystem that merely contains the directory and must not
+# be used here.
+- name: Check for an exact mount at the local-path mountpoint
+  ansible.builtin.command: findmnt --noheadings --output UUID --mountpoint {{ storage_mountpoint }}
+  register: storage_exact_mount
+  changed_when: false
+  failed_when: false
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Refuse to replace an exact mount backed by a different device
+  ansible.builtin.assert:
+    that:
+      - storage_exact_mount.rc != 0
+        or (storage_exact_mount.stdout | trim) == storage_device_uuid
+    fail_msg: >-
+      {{ storage_mountpoint }} is already mounted from UUID
+      {{ storage_exact_mount.stdout | trim }}, not {{ storage_device_uuid }}.
+      Unmount and migrate it explicitly before changing the managed storage
+      device. Nothing persistent has been changed by this run.
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Persist and mount the local-path device
+  ansible.posix.mount:
+    path: "{{ storage_mountpoint }}"
+    src: "UUID={{ storage_device_uuid }}"
+    fstype: "{{ storage_filesystem }}"
+    opts: "{{ storage_mount_options }}"
+    state: mounted
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Verify the exact mount after convergence
+  ansible.builtin.command: findmnt --noheadings --output UUID --mountpoint {{ storage_mountpoint }}
+  register: storage_verify_mount
+  changed_when: false
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0
+
+- name: Require the managed device to be mounted at the local-path mountpoint
+  ansible.builtin.assert:
+    that:
+      - storage_verify_mount.rc == 0
+      - (storage_verify_mount.stdout | trim) == storage_device_uuid
+    fail_msg: >-
+      {{ storage_mountpoint }} is not mounted from {{ storage_device_uuid }}
+      after convergence; inspect fstab and the mount unit state before use.
+  when:
+    - storage_enabled | bool
+    - storage_device | length > 0

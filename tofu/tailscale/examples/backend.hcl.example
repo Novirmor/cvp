@@ -1,0 +1,15 @@
+# Backend configuration example only. Do not commit real bucket credentials.
+# Use a private bucket with encryption and versioning enabled.
+
+bucket       = "replace-with-encrypted-state-bucket"
+key          = "cvp/tofu/tailscale/terraform.tfstate"
+region       = "replace-with-state-region"
+encrypt      = true
+use_lockfile  = true
+
+# For an S3-compatible backend, add the endpoint and the provider-specific
+# validation flags here. Supply credentials through the backend's environment.
+# Note: use_lockfile locking requires S3 conditional writes (If-None-Match);
+# if the store does not implement them, set use_lockfile = false and use a
+# lock-table-capable endpoint instead.
+# endpoint = "https://replace-with-s3-compatible-endpoint"

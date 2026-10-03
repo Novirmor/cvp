@@ -1,0 +1,5 @@
+---
+ingress_v6_ports:
+  - 80
+  - 443
+ingress_v6_target_host: 127.0.0.1

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run encrypted off-host K3s backup
+
+[Timer]
+OnCalendar={{ k3s_backup_schedule }}
+Persistent=true
+RandomizedDelaySec=15m
+Unit={{ k3s_backup_service_name }}
+
+[Install]
+WantedBy=timers.target

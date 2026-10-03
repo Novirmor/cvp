@@ -1,0 +1,19 @@
+[Interface]
+Address = {{ wireguard_address }}/24
+ListenPort = {{ wireguard_port }}
+MTU = {{ wireguard_mtu }}
+PrivateKey = {{ wireguard_private_key_material | trim }}
+SaveConfig = false
+
+{% for peer in groups[wireguard_peers_group] if peer != inventory_hostname %}
+[Peer]
+PublicKey = {{ hostvars[peer].wireguard_public_key }}
+AllowedIPs = {{ hostvars[peer].wireguard_address }}/32
+{% if hostvars[peer].wireguard_endpoint | default('') | length > 0 %}
+Endpoint = {{ hostvars[peer].wireguard_endpoint }}
+{% endif %}
+{% if wireguard_persistent_keepalive | int > 0 %}
+PersistentKeepalive = {{ wireguard_persistent_keepalive }}
+{% endif %}
+
+{% endfor %}

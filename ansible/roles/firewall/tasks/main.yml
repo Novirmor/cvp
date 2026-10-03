@@ -1,0 +1,69 @@
+---
+- name: Require CIDR allowlists to be lists
+  ansible.builtin.assert:
+    that:
+      - firewall_ssh_ipv4_source_cidrs is sequence
+      - firewall_ssh_ipv4_source_cidrs is not string
+      - firewall_ssh_ipv6_source_cidrs is sequence
+      - firewall_ssh_ipv6_source_cidrs is not string
+    fail_msg: >-
+      Firewall CIDR variables must be lists. Pass them as JSON, for example
+      -e '{"firewall_ssh_ipv4_source_cidrs":["203.0.113.10/32"]}'.
+  when: firewall_manage | bool
+
+- name: Require a real external interface before enabling the firewall
+  ansible.builtin.assert:
+    that:
+      - firewall_external_interface | length > 0
+      - firewall_external_interface in ansible_interfaces
+      - firewall_external_interface not in ['lo', wireguard_interface, 'tailscale0']
+    fail_msg: >-
+      Set firewall_external_interface to the real public uplink. Neither a
+      usable default-route interface nor the declared interface was found;
+      refusing to render or reload a firewall with an ineffective ingress rule.
+  when: firewall_manage | bool
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: true
+  when: firewall_manage | bool
+
+- name: Read Tailscale state before firewall activation
+  ansible.builtin.command: tailscale status --json
+  register: firewall_tailscale_status
+  changed_when: false
+  failed_when: false
+  when: firewall_manage | bool
+
+- name: Require a verified private or temporary bootstrap administration path
+  ansible.builtin.assert:
+    that:
+      - >-
+        firewall_ssh_ipv4_source_cidrs | length > 0
+        or firewall_ssh_ipv6_source_cidrs | length > 0
+        or (firewall_tailscale_status.rc == 0
+            and (firewall_tailscale_status.stdout | from_json).BackendState | default('') == 'Running')
+    fail_msg: >-
+      Refusing to activate a default-deny firewall without a temporary SSH
+      source CIDR or a Tailscale backend in state Running. An unenrolled or
+      stopped daemon is not an administration path.
+  when: firewall_manage | bool
+
+- name: Render the host firewall policy
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Validate and reload nftables
+  when: firewall_manage | bool
+
+- name: Enable the host firewall
+  ansible.builtin.systemd_service:
+    name: nftables.service
+    state: started
+    enabled: true
+  when: firewall_manage | bool

@@ -1,0 +1,69 @@
+#!/usr/sbin/nft -f
+
+# Recreate only the table owned by this role. The add/delete idiom is
+# compatible with nftables older than 1.0.7 (which lack `destroy`) and leaves
+# K3s/kube-proxy tables untouched during a reload.
+add table inet cvp_filter
+delete table inet cvp_filter
+
+table inet cvp_filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+
+    iifname "lo" accept
+    ct state invalid drop
+    ct state established,related accept
+    ip protocol icmp accept
+    ip6 nexthdr ipv6-icmp accept
+
+    # Administration is private by default: Tailscale, WireGuard, or an
+    # explicitly supplied bootstrap CIDR can reach SSH and the API.
+    iifname "tailscale0" tcp dport { {{ firewall_ssh_port }}, 6443 } accept
+    iifname "{{ wireguard_interface }}" tcp dport { {{ firewall_ssh_port }}, 6443, 10250 } accept
+{% if inventory_hostname in groups.get('k3s_servers', []) %}
+    ip saddr {{ k3s_cluster_cidr }} tcp dport 6443 accept
+{% endif %}
+{% if firewall_ssh_ipv4_source_cidrs | length > 0 %}
+    ip saddr { {{ firewall_ssh_ipv4_source_cidrs | join(', ') }} } tcp dport {{ firewall_ssh_port }} accept
+{% endif %}
+{% if firewall_ssh_ipv6_source_cidrs | length > 0 %}
+    ip6 saddr { {{ firewall_ssh_ipv6_source_cidrs | join(', ') }} } tcp dport {{ firewall_ssh_port }} accept
+{% endif %}
+
+    # WireGuard is authenticated by its peer keys. Restrict these sets to
+    # stable provider endpoint CIDRs when those are available.
+{% if firewall_wireguard_ipv4_source_cidrs | length > 0 %}
+    iifname "{{ firewall_external_interface }}" udp dport {{ wireguard_port }} ip saddr { {{ firewall_wireguard_ipv4_source_cidrs | join(', ') }} } accept
+{% endif %}
+{% if firewall_wireguard_ipv6_source_cidrs | length > 0 %}
+    iifname "{{ firewall_external_interface }}" udp dport {{ wireguard_port }} ip6 saddr { {{ firewall_wireguard_ipv6_source_cidrs | join(', ') }} } accept
+{% endif %}
+
+    # Flannel VXLAN and kubelet traffic are underlay-only.
+    iifname "{{ wireguard_interface }}" udp dport 8472 accept
+{% if inventory_hostname in groups.get('k3s_servers', []) %}
+    # Embedded etcd client and peer ports between the multi-master servers.
+    iifname "{{ wireguard_interface }}" tcp dport { 2379, 2380 } accept
+{% endif %}
+{% if inventory_hostname in groups.get('k3s_servers', []) or inventory_hostname in groups.get('k3s_agents', []) %}
+    # In-cluster pods (for example metrics-server) reach the local kubelet
+    # through the pod bridge rather than the underlay interface.
+    ip saddr {{ k3s_cluster_cidr }} tcp dport 10250 accept
+{% endif %}
+{% if inventory_hostname in groups.get('ingress', []) %}
+    iifname "{{ firewall_external_interface }}" tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endif %}
+  }
+
+  # K3s and Flannel install their own pod/service rules. Do not block their
+  # forwarding path with a second, competing policy table.
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state invalid drop
+    ct state established,related accept
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+  }
+}

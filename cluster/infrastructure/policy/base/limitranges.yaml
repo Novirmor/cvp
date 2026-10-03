@@ -1,0 +1,100 @@
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: platform-system
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        ephemeral-storage: 512Mi
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        ephemeral-storage: 64Mi
+        memory: 128Mi
+      max:
+        cpu: "1"
+        ephemeral-storage: 1Gi
+        memory: 1Gi
+      min:
+        cpu: 10m
+        ephemeral-storage: 16Mi
+        memory: 16Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: example
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        ephemeral-storage: 512Mi
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        ephemeral-storage: 64Mi
+        memory: 128Mi
+      max:
+        cpu: "1"
+        ephemeral-storage: 1Gi
+        memory: 1Gi
+      min:
+        cpu: 10m
+        ephemeral-storage: 16Mi
+        memory: 16Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: operations
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        ephemeral-storage: 512Mi
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        ephemeral-storage: 64Mi
+        memory: 128Mi
+      max:
+        cpu: "1"
+        ephemeral-storage: 1Gi
+        memory: 1Gi
+      min:
+        cpu: 10m
+        ephemeral-storage: 16Mi
+        memory: 16Mi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: container-defaults
+  namespace: data-services
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 1
+        ephemeral-storage: 1Gi
+        memory: 1Gi
+      defaultRequest:
+        cpu: 250m
+        ephemeral-storage: 128Mi
+        memory: 256Mi
+      max:
+        cpu: "2"
+        ephemeral-storage: 2Gi
+        memory: 2Gi
+      min:
+        cpu: 10m
+        ephemeral-storage: 16Mi
+        memory: 16Mi

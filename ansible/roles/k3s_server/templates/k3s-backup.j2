@@ -1,0 +1,75 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+BACKUP_DIR={{ k3s_backup_dir | quote }}
+K3S_BINARY={{ k3s_bin_path | quote }}
+DATASTORE={{ k3s_datastore | quote }}
+DATABASE={{ (k3s_data_dir ~ '/server/db/state.db') | quote }}
+TOKEN={{ k3s_server_token_path | quote }}
+AGENT_TOKEN={{ k3s_agent_token_server_path | quote }}
+AGE_RECIPIENT={{ k3s_backup_age_recipient | quote }}
+# The upload command is evaluated by the child bash below, so its variables
+# intentionally expand there rather than in this assignment.
+# shellcheck disable=SC2016
+UPLOAD_COMMAND={{ k3s_backup_upload_command | quote }}
+RETENTION_DAYS={{ k3s_backup_retention_days | int }}
+
+umask 077
+mkdir -p "$BACKUP_DIR"
+WORK_DIR=$(mktemp -d "$BACKUP_DIR/.work.XXXXXX")
+# One stamp for both names: separate date calls could straddle a second
+# boundary and mismatch the .tmp and final names.
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUTPUT_TMP="$BACKUP_DIR/.k3s-${STAMP}.tar.gz.age.tmp"
+OUTPUT="$BACKUP_DIR/k3s-${STAMP}.tar.gz.age"
+cleanup() {
+  rm -rf "$WORK_DIR" "$OUTPUT_TMP"
+}
+trap cleanup EXIT
+
+[[ -s "$TOKEN" ]] || { printf '%s\n' 'K3s server token is missing or empty' >&2; exit 1; }
+[[ -s "$AGENT_TOKEN" ]] || { printf '%s\n' 'K3s agent token is missing or empty' >&2; exit 1; }
+
+STATE_FILE=
+if [[ "$DATASTORE" == "etcd" ]]; then
+  # etcd snapshot save contacts the local embedded etcd while K3s is serving.
+  # An explicit --name is required: on-demand snapshots otherwise start with
+  # "on-demand-" and the archive glob below would never match.
+  "$K3S_BINARY" etcd-snapshot save --name k3s-etcd-snapshot --etcd-snapshot-dir "$WORK_DIR"
+  # || true keeps the assignment alive under pipefail so the guard below can
+  # emit the diagnostic instead of the script dying on an empty ls.
+  SNAPSHOT=$(ls -t "$WORK_DIR"/k3s-etcd-snapshot-* 2>/dev/null | head -n 1 || true)
+  [[ -n "$SNAPSHOT" && -s "$SNAPSHOT" ]] || { printf '%s\n' 'K3s etcd snapshot is missing or empty' >&2; exit 1; }
+  # Drop the ETCDSnapshotFile catalog entry for the archived copy so on-demand
+  # records do not accumulate in the datastore; the file itself is archived.
+  "$K3S_BINARY" etcd-snapshot delete "$(basename "$SNAPSHOT")" >/dev/null 2>&1 || true
+  mv "$SNAPSHOT" "$WORK_DIR/etcd-snapshot"
+  STATE_FILE=etcd-snapshot
+else
+  # SQLite .backup produces a consistent copy while K3s is serving requests.
+  [[ -s "$DATABASE" ]] || { printf '%s\n' 'K3s SQLite database is missing or empty' >&2; exit 1; }
+  sqlite3 "$DATABASE" ".backup '$WORK_DIR/state.db'"
+  STATE_FILE=state.db
+fi
+
+install -m 0600 "$TOKEN" "$WORK_DIR/server.token"
+install -m 0600 "$AGENT_TOKEN" "$WORK_DIR/agent.token"
+printf '%s\n' "{{ inventory_hostname }}" > "$WORK_DIR/node"
+# Record the version of the binary that produced this datastore, not the
+# version pinned in Ansible configuration; they can drift.
+K3S_RUNTIME_VERSION=$("$K3S_BINARY" --version | awk 'NR==1 {print $3}')
+printf '%s\n' "$K3S_RUNTIME_VERSION" > "$WORK_DIR/k3s.version"
+
+tar -C "$WORK_DIR" -czf - "$STATE_FILE" server.token agent.token node k3s.version | age -r "$AGE_RECIPIENT" -o "$OUTPUT_TMP" -
+install -m 0600 "$OUTPUT_TMP" "$OUTPUT"
+(
+  cd "$BACKUP_DIR"
+  sha256sum "$(basename "$OUTPUT")" > "$(basename "$OUTPUT").sha256"
+)
+
+export BACKUP_FILE="$OUTPUT"
+export BACKUP_CHECKSUM_FILE="$OUTPUT.sha256"
+/bin/bash -o errexit -o nounset -o pipefail -c "$UPLOAD_COMMAND"
+
+find "$BACKUP_DIR" -maxdepth 1 -type f -name 'k3s-*.tar.gz.age' -mtime +"$RETENTION_DAYS" -delete
+find "$BACKUP_DIR" -maxdepth 1 -type f -name 'k3s-*.tar.gz.age.sha256' -mtime +"$RETENTION_DAYS" -delete

@@ -1,0 +1,76 @@
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: platform-system
+spec:
+  hard:
+    count/configmaps: "20"
+    count/secrets: "20"
+    limits.cpu: "1"
+    limits.ephemeral-storage: 2Gi
+    limits.memory: 1Gi
+    pods: "10"
+    requests.cpu: 500m
+    requests.ephemeral-storage: 1Gi
+    requests.memory: 512Mi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: example
+spec:
+  hard:
+    count/configmaps: "20"
+    count/persistentvolumeclaims: "2"
+    count/secrets: "20"
+    count/services: "5"
+    limits.cpu: "1"
+    limits.ephemeral-storage: 2Gi
+    limits.memory: 1Gi
+    pods: "10"
+    requests.cpu: 500m
+    requests.ephemeral-storage: 1Gi
+    requests.memory: 512Mi
+    requests.storage: 10Gi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: operations
+spec:
+  hard:
+    count/configmaps: "20"
+    count/secrets: "20"
+    count/cronjobs.batch: "10"
+    count/jobs.batch: "20"
+    limits.cpu: "1"
+    limits.ephemeral-storage: 2Gi
+    limits.memory: 1Gi
+    pods: "20"
+    requests.cpu: 500m
+    requests.ephemeral-storage: 1Gi
+    requests.memory: 512Mi
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: namespace-quota
+  namespace: data-services
+spec:
+  hard:
+    count/configmaps: "20"
+    count/persistentvolumeclaims: "4"
+    count/secrets: "20"
+    count/services: "10"
+    limits.cpu: "2"
+    limits.ephemeral-storage: 4Gi
+    limits.memory: 2Gi
+    pods: "10"
+    requests.cpu: "1"
+    requests.ephemeral-storage: 2Gi
+    requests.memory: 1Gi
+    requests.storage: 50Gi

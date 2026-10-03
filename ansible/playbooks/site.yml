@@ -1,0 +1,237 @@
+---
+- name: Validate node tags before configuring hosts
+  hosts: wireguard
+  connection: local
+  become: false
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Validate selected inventory nodes
+      ansible.builtin.include_tasks: tasks/validate-node-tags.yml
+      vars:
+        node_tag_validation_hosts: "{{ ansible_play_hosts_all }}"
+
+- name: Configure K3s hosts
+  hosts: wireguard
+  serial: 1
+  become: true
+  gather_facts: true
+  roles:
+    - role: base
+    - role: tailscale
+    - role: wireguard
+    - role: firewall
+    - role: storage
+
+- name: Install the IPv6 ingress frontend
+  hosts: ingress
+  become: true
+  gather_facts: false
+  roles:
+    - role: ingress_v6
+      when: ingress_v6_enabled | bool
+
+- name: Initialize the K3s cluster-init server
+  hosts: k3s_servers
+  become: true
+  gather_facts: true
+  roles:
+    - role: k3s_server
+      when: k3s_server_init | bool
+
+# A separate play guarantees the init server has started K3s and published its
+# tokens before any joining server waits for them; parallel execution of one
+# play would deadlock the joiners against the task barrier.
+- name: Install the joining K3s servers
+  hosts: k3s_servers
+  serial: 1
+  become: true
+  gather_facts: true
+  roles:
+    - role: k3s_server
+      when: not k3s_server_init | bool
+
+- name: Install K3s agents
+  hosts: k3s_agents
+  serial: 1
+  become: true
+  gather_facts: true
+  roles:
+    - role: k3s_agent
+
+- name: Reconcile K3s node labels and taints through the Kubernetes API
+  hosts: wireguard
+  become: true
+  gather_facts: false
+  run_once: true
+  vars:
+    managed_label_prefixes: "{{ k3s_managed_label_domains | join('|') }}"
+    tag_target_nodes: "{{ ansible_play_hosts_all }}"
+    taint_ownership_key: cvp.io/managed-taints
+  tasks:
+    # Delegation works even when --limit selects only agents. A newly joined
+    # node may take a short time to register after its role has completed.
+    - name: Wait for selected nodes to register in the Kubernetes API
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+        api_version: v1
+        kind: Node
+        name: "{{ item }}"
+      delegate_to: "{{ k3s_server_host }}"
+      register: node_registration
+      until: node_registration.resources | default([]) | length == 1
+      retries: 12
+      delay: 5
+      loop: "{{ tag_target_nodes }}"
+
+    - name: Read the selected cluster nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+        api_version: v1
+        kind: Node
+        name: "{{ item }}"
+      delegate_to: "{{ k3s_server_host }}"
+      register: selected_nodes
+      loop: "{{ tag_target_nodes }}"
+
+    # The annotation is the ownership ledger: only a key/effect recorded by
+    # a previous successful run may be removed. A matching unowned taint is
+    # a conflict, not permission to adopt a controller's taint.
+    - name: Refuse to adopt unowned taints
+      ansible.builtin.assert:
+        that:
+          - desired_identities | difference(owned_identities) | intersect(existing_identities) | length == 0
+          - owned_identities | difference(existing_identities) | length == 0
+          - owned_taints | selectattr('key', 'defined') | list | length == owned_taints | length
+          - owned_taints | selectattr('effect', 'defined') | list | length == owned_taints | length
+          - owned_identities | unique | length == owned_identities | length
+          - unowned_matching_taints | length == 0
+        fail_msg: >-
+          {{ item.item }} has an unowned inventory taint or a stale taint
+          ownership ledger; resolve it before reconciling.
+      loop: "{{ selected_nodes.results }}"
+      vars:
+        existing_identities: >-
+          {{ item.resources[0].spec.taints | default([])
+             | map(attribute='key') | list }}
+        # Check by key (stronger than key/effect): do not commandeer another
+        # effect for the same key. The ledger retains full key/effect pairs.
+        owned_identities: >-
+          {{ owned_taints | map(attribute='key') | list }}
+        owned_taints: >-
+          {{ (item.resources[0].metadata.annotations | default({})).get(taint_ownership_key, '[]') | from_json }}
+        desired_identities: >-
+          {{ hostvars[item.item]['k3s_node_taints']
+             | map('regex_replace', '[=:].*$', '') | list }}
+        unowned_matching_taints: >-
+          {%- set ns = namespace(keys=[]) -%}
+          {%- for taint in item.resources[0].spec.taints | default([]) -%}
+            {%- if taint.key in desired_identities and
+                   not (owned_taints | selectattr('key', 'equalto', taint.key)
+                       | selectattr('effect', 'equalto', taint.effect) | list) -%}
+              {%- set ns.keys = ns.keys + [taint.key] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.keys }}
+
+    # Construct Python/Jinja dictionaries, never JSON text interpolated from
+    # inventory. A test on the taint array makes concurrent edits fail cleanly.
+    - name: Compute patches for selected inventory nodes
+      ansible.builtin.set_fact:
+        k8s_node_patches: "{{ k8s_node_patches | default({}) | combine({item.item: node_patch}) }}"
+      loop: "{{ selected_nodes.results }}"
+      vars:
+        node_res: "{{ item.resources[0] }}"
+        current_labels: "{{ node_res.metadata.labels | default({}) }}"
+        node_role_label: >-
+          {{ 'cvp.io/role=control-plane'
+             if hostvars[item.item]['k3s_role'] | default('agent') == 'server'
+             else 'cvp.io/role=agent' }}
+        node_labels: "{{ [node_role_label] + hostvars[item.item]['k3s_node_labels'] }}"
+        node_taints: "{{ hostvars[item.item]['k3s_node_taints'] }}"
+        desired_keys: "{{ node_labels | map('regex_replace', '=.*$', '') | list }}"
+        obsolete_keys: >-
+          {{ current_labels.keys() | map('string') | select('match', managed_label_prefixes)
+               | difference(desired_keys) }}
+        # yamllint disable rule:line-length
+        node_patch: >-
+          {%- set ns = namespace(ops=[], desired=[], owned=[], retained=[], additions=[]) -%}
+          {%- set old_taints = node_res.spec.taints | default([]) -%}
+          {%- set annotations = node_res.metadata.annotations | default({}) -%}
+          {%- set ns.owned = annotations.get(taint_ownership_key, '[]') | from_json -%}
+          {%- for label in node_labels -%}
+            {%- set key = label.split('=', 1)[0] -%}
+            {%- set value = label.split('=', 1)[-1] -%}
+            {%- if current_labels.get(key) != value -%}
+              {%- set ns.ops = ns.ops + [dict(op='add', path='/metadata/labels/' ~ (key | replace('~', '~0') | replace('/', '~1')), value=value)] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for key in obsolete_keys -%}
+            {%- set ns.ops = ns.ops + [dict(op='remove', path='/metadata/labels/' ~ (key | replace('~', '~0') | replace('/', '~1')))] -%}
+          {%- endfor -%}
+          {%- for taint in node_taints -%}
+            {%- set key_value = taint.rsplit(':', 1)[0] -%}
+            {%- set effect = taint.rsplit(':', 1)[-1] -%}
+            {%- set key = key_value.split('=', 1)[0] -%}
+            {%- set value = key_value.split('=', 1)[-1] if '=' in key_value else '' -%}
+            {%- set ns.desired = ns.desired + [dict(key=key, value=value, effect=effect)] -%}
+          {%- endfor -%}
+          {%- for taint in old_taints -%}
+            {%- if not (ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list) or
+                   (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list) -%}
+              {%- set ns.retained = ns.retained + [taint] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for taint in ns.desired -%}
+            {%- if not (ns.retained | selectattr('key', 'equalto', taint.key) | list) -%}
+              {%- set ns.additions = ns.additions + [taint] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if (old_taints | length > 0 or ns.additions | length > 0) and
+                 (old_taints != ns.retained + ns.additions) -%}
+            {%- if node_res.spec.taints is defined -%}
+              {%- set ns.ops = ns.ops + [dict(op='test', path='/spec/taints', value=old_taints)] -%}
+              {%- if taint_ownership_key in annotations -%}
+                {%- set ns.ops = ns.ops + [dict(op='test', path='/metadata/annotations/' ~ (taint_ownership_key | replace('/', '~1')), value=annotations[taint_ownership_key])] -%}
+              {%- endif -%}
+              {%- for taint in old_taints | reverse | list -%}
+                {%- set index = (old_taints | length - 1) - loop.index0 -%}
+                {%- if ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list and
+                       not (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list) -%}
+                  {%- set ns.ops = ns.ops + [dict(op='remove', path='/spec/taints/' ~ index)] -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- for taint in ns.additions -%}
+                {%- set ns.ops = ns.ops + [dict(op='add', path='/spec/taints/-', value=taint)] -%}
+              {%- endfor -%}
+            {%- else -%}
+              {%- set ns.ops = ns.ops + [dict(op='add', path='/spec/taints', value=ns.additions)] -%}
+            {%- endif -%}
+          {%- endif -%}
+          {%- if ns.desired != ns.owned or (ns.desired | length > 0 and taint_ownership_key not in annotations) -%}
+            {%- if node_res.metadata.annotations is not defined -%}
+              {%- set ns.ops = ns.ops + [dict(op='add', path='/metadata/annotations', value={taint_ownership_key: ns.desired | to_json})] -%}
+            {%- else -%}
+              {%- if taint_ownership_key in annotations and not (ns.ops | selectattr('op', 'equalto', 'test') | selectattr('path', 'equalto', '/metadata/annotations/' ~ (taint_ownership_key | replace('/', '~1'))) | list) -%}
+                {%- set ns.ops = ns.ops + [dict(op='test', path='/metadata/annotations/' ~ (taint_ownership_key | replace('/', '~1')), value=annotations[taint_ownership_key])] -%}
+              {%- endif -%}
+              {%- set ns.ops = ns.ops + [dict(op='add', path='/metadata/annotations/' ~ (taint_ownership_key | replace('/', '~1')), value=ns.desired | to_json)] -%}
+            {%- endif -%}
+          {%- endif -%}
+          {%- if ns.ops | length > 0 -%}
+            {%- set ns.ops = [dict(op='test', path='/metadata/resourceVersion', value=node_res.metadata.resourceVersion)] + ns.ops -%}
+          {%- endif -%}
+          {{ ns.ops }}
+        # yamllint enable rule:line-length
+
+    - name: Apply the node label and taint patches
+      kubernetes.core.k8s_json_patch:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+        api_version: v1
+        kind: Node
+        name: "{{ item }}"
+        patch: "{{ k8s_node_patches[item] }}"
+      delegate_to: "{{ k3s_server_host }}"
+      loop: "{{ tag_target_nodes }}"
+      when:
+        - k8s_node_patches[item] | length > 0

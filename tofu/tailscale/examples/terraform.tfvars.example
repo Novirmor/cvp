@@ -1,0 +1,39 @@
+# Copy this file to an ignored local *.tfvars file and replace placeholders.
+# Provider credentials must come from TAILSCALE_API_KEY or OAuth environment
+# variables; no credential is read from this file.
+
+tailnet     = "replace-with-tailnet-id-or-domain"
+admin_users = ["admin@example.invalid"]
+ci_users    = ["ci@example.invalid"]
+
+magic_dns          = true
+override_local_dns = true
+
+# These are example public resolvers. Use the resolvers approved for the
+# tailnet, and set use_with_exit_node only when that behavior is intended.
+dns_nameservers = [
+  {
+    address            = "1.1.1.1"
+    use_with_exit_node = false
+  },
+  {
+    address            = "1.0.0.1"
+    use_with_exit_node = false
+  },
+]
+
+# Leave empty unless a resolver reachable from Tailscale should handle the
+# named domain. Do not point this at a Kubernetes ClusterIP: split DNS targets
+# must be reachable from the Tailscale clients themselves.
+split_dns   = {}
+search_paths = []
+
+# Example split-DNS rule:
+# split_dns = {
+#   internal = {
+#     domain = "internal.example.com"
+#     nameservers = [
+#       { address = "192.0.2.53" }
+#     ]
+#   }
+# }

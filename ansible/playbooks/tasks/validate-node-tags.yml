@@ -1,0 +1,74 @@
+---
+# Runs on the controller before any site role. Domain entries are canonical
+# escaped literal DNS prefixes, never arbitrary regular expressions.
+- name: Validate managed label prefixes
+  ansible.builtin.assert:
+    that:
+      - item is string
+      - item.startswith('^') and item.endswith('/')
+      - domain | length <= 253
+      - domain is match(dns_pattern)
+      - item == '^' ~ (domain | regex_escape) ~ '/'
+    fail_msg: "Invalid managed label prefix {{ item }} (expected e.g. ^example\\.com/)."
+  loop: "{{ k3s_managed_label_domains }}"
+  vars:
+    domain: "{{ item[1:-1] | replace('\\.', '.') }}"
+    dns_pattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\Z'
+
+- name: Require distinct managed label prefixes
+  ansible.builtin.assert:
+    that:
+      - k3s_managed_label_domains | length > 0
+      - k3s_managed_label_domains | unique | length == k3s_managed_label_domains | length
+
+- name: Validate inventory node names and tag declarations
+  ansible.builtin.assert:
+    that:
+      - hostvars[item]['node_name'] is defined
+      - hostvars[item]['node_name'] == item
+      - hostvars[item]['k3s_node_labels'] is sequence
+      - hostvars[item]['k3s_node_labels'] is not string
+      - hostvars[item]['k3s_node_taints'] is sequence
+      - hostvars[item]['k3s_node_taints'] is not string
+      - >-
+        hostvars[item]['k3s_node_labels'] | select('match', label_pattern) | list | length
+        == hostvars[item]['k3s_node_labels'] | length
+      - >-
+        hostvars[item]['k3s_node_labels'] | map('regex_replace', '=.*$', '') | list | unique | length
+        == hostvars[item]['k3s_node_labels'] | length
+      - >-
+        hostvars[item]['k3s_node_labels'] | reject('match', reserved_pattern) | list | length
+        == hostvars[item]['k3s_node_labels'] | length
+      - >-
+        hostvars[item]['k3s_node_labels'] | reject('match', '^cvp\.io/role=') | list | length
+        == hostvars[item]['k3s_node_labels'] | length
+      - >-
+        hostvars[item]['k3s_node_labels'] | select('match', '^cvp\.io/')
+        | reject('match', catalog_pattern) | list | length == 0
+      - >-
+        hostvars[item]['k3s_node_labels'] | map('regex_replace', '=.*$', '')
+        | select('match', managed_domains_pattern) | list | length
+        == hostvars[item]['k3s_node_labels'] | length
+      - >-
+        hostvars[item]['k3s_node_taints'] | select('match', taint_pattern) | list | length
+        == hostvars[item]['k3s_node_taints'] | length
+      - >-
+        hostvars[item]['k3s_node_taints'] | reject('match', reserved_pattern) | list | length
+        == hostvars[item]['k3s_node_taints'] | length
+      - >-
+        hostvars[item]['k3s_node_taints'] | map('regex_replace', '[=:].*$', '') | list | unique | length
+        == hostvars[item]['k3s_node_taints'] | length
+    fail_msg: "{{ item }} has an invalid node_name, label, or taint declaration."
+  loop: "{{ node_tag_validation_hosts | default(groups['wireguard']) }}"
+  vars:
+    # Kubernetes qualified key: DNS subdomain (max 253 bytes), optional /name
+    # (max 63); values are empty or a 63-character label value.
+    dns: '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*'
+    tag_name_pattern: '[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?'
+    key: "{{ '(?:(?=[^/]{1,253}/)' ~ dns ~ '/)?' ~ tag_name_pattern }}"
+    value: "{{ '(?:' ~ tag_name_pattern ~ ')?' }}"
+    label_pattern: "{{ '^' ~ key ~ '=' ~ value ~ '\\Z' }}"
+    taint_pattern: "{{ '^' ~ key ~ '(?:=' ~ value ~ ')?:' ~ '(?:NoSchedule|PreferNoSchedule|NoExecute)\\Z' }}"
+    reserved_pattern: '^(?:[a-z0-9-]+\.)*(?:kubernetes\.io|k8s\.io)/'
+    catalog_pattern: '^cvp\.io/(compute|storage|stateful|ingress|gpu|system)=(true|false)\Z'
+    managed_domains_pattern: "{{ k3s_managed_label_domains | join('|') }}"

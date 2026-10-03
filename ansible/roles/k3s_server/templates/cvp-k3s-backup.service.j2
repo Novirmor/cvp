@@ -1,0 +1,24 @@
+[Unit]
+Description=Encrypted off-host K3s datastore and token backup
+# Deliberately no Requires=: starting this unit must never pull in a K3s
+# server that an operator deliberately stopped (for example during a restore
+# drill). ExecCondition skips the backup instead.
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet k3s.service
+ExecStart={{ k3s_backup_script_path }}
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths={{ k3s_backup_dir }}
+{% for path in k3s_backup_writable_paths %}
+ReadWritePaths={{ path }}
+{% endfor %}
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

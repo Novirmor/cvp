@@ -1,0 +1,27 @@
+---
+- name: Render templates that depend on loop-local variables
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ingress_v6_target_host: 127.0.0.1
+  tasks:
+    - name: Render every IPv6 ingress forwarder unit
+      ansible.builtin.set_fact:
+        ingress_v6_units: >-
+          {{ ingress_v6_units | default([]) +
+             [lookup('ansible.builtin.template',
+                     playbook_dir + '/../roles/ingress_v6/templates/cvp-ingress-v6.service.j2')] }}
+      loop:
+        - 80
+        - 443
+      loop_control:
+        loop_var: ingress_v6_port
+
+    - name: Verify rendered ports and target
+      ansible.builtin.assert:
+        that:
+          - "'TCP6-LISTEN:80' in ingress_v6_units[0]"
+          - "'TCP4:127.0.0.1:80' in ingress_v6_units[0]"
+          - "'TCP6-LISTEN:443' in ingress_v6_units[1]"
+          - "'TCP4:127.0.0.1:443' in ingress_v6_units[1]"

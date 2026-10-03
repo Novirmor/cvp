@@ -1,0 +1,9 @@
+---
+storage_enabled: true
+storage_device: ""
+storage_filesystem: ext4
+storage_mountpoint: /var/lib/rancher/k3s/storage
+storage_mount_options: defaults,noatime
+storage_manage_device: false
+storage_allow_format: false
+storage_directory_mode: "0750"

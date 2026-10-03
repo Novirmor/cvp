@@ -1,0 +1,40 @@
+write-kubeconfig-mode: "{{ k3s_write_kubeconfig_mode }}"
+data-dir: "{{ k3s_data_dir }}"
+node-name: "{{ node_name }}"
+node-ip: "{{ wireguard_address }}"
+advertise-address: "{{ wireguard_address }}"
+{% if not k3s_server_init | bool %}
+# Joining servers connect to the init server, which initialized the embedded
+# etcd quorum, and authenticate with the shared server token.
+server: "https://{{ hostvars[k3s_cluster_init_host].wireguard_address }}:6443"
+token-file: "{{ k3s_server_token_path }}"
+{% elif k3s_datastore == 'etcd' %}
+# The init server bootstraps the embedded etcd datastore.
+cluster-init: true
+{% endif %}
+flannel-iface: "{{ k3s_flannel_iface }}"
+flannel-backend: "{{ k3s_flannel_backend }}"
+cluster-cidr: "{{ k3s_cluster_cidr }}"
+service-cidr: "{{ k3s_service_cidr }}"
+cluster-dns: "{{ k3s_cluster_dns }}"
+cluster-domain: "{{ k3s_cluster_domain }}"
+default-local-storage-path: "{{ k3s_default_local_storage_path }}"
+secrets-encryption: true
+# The agent token is shared with every server so agents can join through any
+# supervisor. The role pre-populates the file on every server.
+agent-token-file: "{{ k3s_agent_token_server_path }}"
+tls-san-security: true
+tls-san:
+{% for san in k3s_tls_sans %}
+  - "{{ san }}"
+{% endfor %}
+node-label:
+{% for label in k3s_node_labels %}
+  - "{{ label }}"
+{% endfor %}
+{% if k3s_disable_components | length > 0 %}
+disable:
+{% for component in k3s_disable_components %}
+  - "{{ component }}"
+{% endfor %}
+{% endif %}

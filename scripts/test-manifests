@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root_dir"
+
+policy_dir=tests/policy
+expected_violations=(
+  hostNetwork
+  hostIPC
+  hostPID
+  hostPath
+  privileged
+  allowPrivilegeEscalation
+  "run as non-root"
+  "uid 0"
+  seccompProfile
+  capabilities
+  readOnlyRootFilesystem
+  ":latest"
+  "pinned by digest"
+  "must set requests"
+  "must set limits"
+  "ephemeral storage"
+)
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+for overlay in \
+  cluster \
+  cluster/infrastructure/policy/overlays/cluster \
+  cluster/infrastructure/ingress/overlays/k3s \
+  cluster/apps/overlays/smoke \
+  cluster/operations/overlays/cluster \
+  cluster/data/overlays/cluster; do
+  printf 'rendering %s\n' "$overlay"
+  render="$tmp_dir/$(printf '%s' "$overlay" | tr '/' '_').render.yaml"
+  kustomize build "$overlay" > "$render"
+  kubeconform \
+    -ignore-missing-schemas \
+    -schema-location 'default' \
+    -schema-location 'https://schemas.fluxoperator.dev/catalog/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+    -kubernetes-version 1.35.0 \
+    -strict \
+    -summary \
+    < "$render"
+  conftest test "$render" --policy "$policy_dir"
+done
+
+printf 'checking policy fixtures\n'
+conftest test "$policy_dir/fixtures/compliant-workload.yaml" --policy "$policy_dir"
+
+violations="$tmp_dir/noncompliant.out"
+if conftest test "$policy_dir/fixtures/noncompliant-workload.yaml" \
+  --policy "$policy_dir" > "$violations" 2>&1; then
+  echo "non-compliant fixture unexpectedly passed the policy tests" >&2
+  exit 1
+fi
+for marker in "${expected_violations[@]}"; do
+  if ! grep -q "$marker" "$violations"; then
+    echo "policy tests did not report the expected violation: $marker" >&2
+    exit 1
+  fi
+done
+printf 'non-compliant fixture rejected with all %d expected violation types\n' \
+  "${#expected_violations[@]}"

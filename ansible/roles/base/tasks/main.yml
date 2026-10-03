@@ -1,0 +1,388 @@
+---
+- name: Require a supported Debian-family host
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family == 'Debian'
+      - ansible_service_mgr == 'systemd'
+    fail_msg: >-
+      This host layer targets Debian-family systemd hosts, including supported
+      LXC guests. Refusing to guess package or service behavior.
+
+# The fleet is mixed: LXC guests share the host kernel and cannot load
+# modules, while VM and metal hosts own theirs. Classify the environment the
+# same way the probe does so convergence behaves correctly without a prior
+# probe run.
+- name: Detect the virtualization environment
+  ansible.builtin.command: systemd-detect-virt
+  register: base_virt
+  changed_when: false
+  failed_when: false
+
+- name: Require a conclusive virtualization detection
+  ansible.builtin.assert:
+    that:
+      - base_virt.rc in [0, 1]
+      - >-
+        (base_virt.rc == 1 and base_virt.stdout | trim == 'none')
+        or (base_virt.rc == 0 and base_virt.stdout | trim in
+            (node_container_ids + node_vm_ids))
+    fail_msg: >-
+      systemd-detect-virt failed or returned an unknown environment
+      (rc={{ base_virt.rc }}, output='{{ base_virt.stdout | trim }}').
+      Refusing to assume this host owns its kernel.
+
+- name: Classify the detected environment
+  ansible.builtin.set_fact:
+    base_detected_env: >-
+      {{ 'lxc' if base_virt.stdout | trim in node_container_ids
+         else 'vm' if base_virt.stdout | trim in node_vm_ids
+         else 'metal' }}
+
+- name: Require a declared environment to match the detected one
+  ansible.builtin.assert:
+    that:
+      - node_virtualization == base_detected_env
+    fail_msg: >-
+      node_virtualization declares {{ node_virtualization }} but
+      systemd-detect-virt reports '{{ base_virt.stdout | trim | default('none', true) }}'
+      ({{ base_detected_env }}). Correct the inventory or keep auto.
+  when: node_virtualization != 'auto'
+
+- name: Select the effective environment
+  ansible.builtin.set_fact:
+    base_env: "{{ node_virtualization if node_virtualization != 'auto' else base_detected_env }}"
+
+- name: Install host prerequisites
+  ansible.builtin.apt:
+    name: "{{ base_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Persist required kernel modules
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/cvp-k3s.conf
+    content: "{{ base_kernel_modules | join('\n') }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  when: base_env != 'lxc'
+
+- name: Remove obsolete guest module-load drop-in on LXC
+  ansible.builtin.file:
+    path: /etc/modules-load.d/cvp-k3s.conf
+    state: absent
+  when: base_env == 'lxc'
+
+- name: Inspect provided modules including built-ins
+  ansible.builtin.stat:
+    path: /sys/module/{{ item }}
+  loop: "{{ base_kernel_modules }}"
+  register: base_module_paths
+
+- name: Load required kernel modules now
+  ansible.builtin.command: "modprobe {{ item }}"
+  loop: "{{ base_kernel_modules }}"
+  loop_control:
+    index_var: module_index
+  register: base_modprobe
+  changed_when: false
+  failed_when: base_modprobe.rc != 0
+  when:
+    - base_env != 'lxc'
+    - not base_module_paths.results[module_index].stat.exists
+
+- name: Read overlay filesystem registration
+  ansible.builtin.command:
+    argv: [grep, -qw, overlay, /proc/filesystems]
+  register: base_overlay_fs
+  changed_when: false
+  failed_when: false
+  when: base_env == 'lxc'
+
+# An LXC guest cannot load modules or persist module loads; the host kernel
+# must already provide everything, exactly as the probe gate requires. Writing
+# modules-load.d here would promise a reboot persistence the guest cannot
+# deliver, so convergence only verifies the host-provided state.
+- name: Require host-provided kernel facilities on LXC guests
+  ansible.builtin.assert:
+    that:
+      - base_overlay_fs.rc == 0
+      - base_module_paths.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      This LXC guest needs a host kernel that already provides overlay as a
+      registered filesystem and required modules (loaded or built in).
+      Run task probe first and resolve the hosting decision; convergence
+      cannot fix a guest that shares an underprovisioned kernel.
+  when: base_env == 'lxc'
+
+- name: Read cgroup v2 marker
+  ansible.builtin.stat:
+    path: /sys/fs/cgroup/cgroup.controllers
+  register: base_cgroup_v2
+
+- name: Read available cgroup v2 controllers
+  ansible.builtin.slurp:
+    src: /sys/fs/cgroup/cgroup.controllers
+  register: base_cgroup_controllers
+  when: base_cgroup_v2.stat.exists
+
+- name: Read the LXC WireGuard device
+  ansible.builtin.stat:
+    path: /dev/net/tun
+  register: base_tun_device
+
+- name: Check cgroup delegation and TUN access in LXC
+  ansible.builtin.command:
+    argv: [test, -w, "{{ item }}"]
+  loop:
+    - /sys/fs/cgroup/cgroup.subtree_control
+    - /dev/net/tun
+  register: base_lxc_access
+  changed_when: false
+  failed_when: false
+  when: base_env == 'lxc'
+
+- name: Refuse unsupported container capabilities
+  ansible.builtin.assert:
+    that:
+      - base_cgroup_v2.stat.exists
+      - >-
+        ['cpu', 'memory', 'pids']
+        | difference((base_cgroup_controllers.content | b64decode).split())
+        | length == 0
+      - base_tun_device.stat.exists
+      - base_tun_device.stat.ischr | default(false)
+      - >-
+        base_env != 'lxc' or
+        (base_lxc_access.results | selectattr('rc', 'equalto', 0) | list | length == 2)
+    fail_msg: >-
+      K3s requires cgroup v2 with cpu, memory, and pids controllers and a
+      character /dev/net/tun device. LXC also needs delegated writable
+      cgroup subtree and TUN access; ask the provider to expose them.
+
+- name: Check LXC sysctl values and writable guest controls
+  ansible.builtin.command:
+    argv: [sysctl, -n, "{{ item.key }}"]
+  loop: "{{ base_sysctls | dict2items }}"
+  register: base_lxc_sysctl_values
+  changed_when: false
+  failed_when: false
+  when: base_env == 'lxc'
+
+- name: Check LXC guest sysctl writability without changing values
+  ansible.builtin.command:
+    argv: [test, -w, "/proc/sys/{{ item.key | replace('.', '/') }}"]
+  loop: "{{ base_sysctls | dict2items }}"
+  register: base_lxc_sysctl_writable
+  changed_when: false
+  failed_when: false
+  when:
+    - base_env == 'lxc'
+    - item.key not in base_lxc_host_sysctls
+
+- name: Require LXC provider sysctls and writable guest sysctls
+  ansible.builtin.assert:
+    that:
+      - >-
+        base_lxc_sysctl_values.results | rejectattr('skipped', 'defined')
+        | rejectattr('rc', 'equalto', 0) | list | length == 0
+      - >-
+        base_lxc_sysctl_values.results
+        | selectattr('item.key', 'in', base_lxc_host_sysctls)
+        | rejectattr('stdout', 'equalto', '1') | list | length == 0
+      - >-
+        base_lxc_sysctl_writable.results | rejectattr('skipped', 'defined')
+        | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      LXC needs readable network sysctls, host-provided bridge netfilter
+      switches set to 1, and writable guest network sysctls. Ask the
+      provider to expose/configure these facilities before convergence.
+  when: base_env == 'lxc'
+
+- name: Require known uplinks for IPv6 router advertisements
+  ansible.builtin.assert:
+    that:
+      - base_ra_interfaces | length > 0
+      - base_ra_interfaces | difference(ansible_interfaces) | length == 0
+    fail_msg: >-
+      Declare firewall_external_interface as a real uplink; IPv6 forwarding
+      requires accept_ra=2 on each uplink receiving router advertisements.
+  when: base_sysctls['net.ipv6.conf.all.forwarding'] | string == '1'
+
+- name: Check IPv6 router advertisement controls in LXC
+  ansible.builtin.command:
+    argv: [test, -w, "/proc/sys/net/ipv6/conf/{{ item }}/accept_ra"]
+  loop: "{{ base_ra_interfaces }}"
+  register: base_ra_writable
+  changed_when: false
+  failed_when: false
+  when: base_env == 'lxc'
+
+- name: Require writable IPv6 router advertisement controls in LXC
+  ansible.builtin.assert:
+    that:
+      - base_ra_writable.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+    fail_msg: >-
+      LXC needs writable per-uplink IPv6 accept_ra controls to preserve its
+      IPv6 default route with forwarding enabled; request provider support.
+  when: base_env == 'lxc'
+
+- name: Read active swap devices
+  ansible.builtin.command: swapon --show --noheadings
+  register: base_swap_devices
+  changed_when: false
+  when: base_disable_swap | bool
+
+- name: Require LXC host to provide swap-free operation
+  ansible.builtin.assert:
+    that:
+      - base_swap_devices.stdout | trim | length == 0
+    fail_msg: >-
+      Active swap is visible inside LXC. The guest must not run swapoff on
+      host-owned devices; ask the provider to disable swap for this container.
+  when: base_env == 'lxc' and base_disable_swap | bool
+
+- name: Inspect existing K3s sysctl drop-in on LXC
+  ansible.builtin.stat:
+    path: /etc/sysctl.d/90-cvp-k3s.conf
+  register: base_lxc_sysctl_file
+  when: base_env == 'lxc'
+
+- name: Remove host-owned bridge switches from old LXC drop-ins
+  ansible.builtin.lineinfile:
+    path: /etc/sysctl.d/90-cvp-k3s.conf
+    regexp: '^\s*net\.bridge\.bridge-nf-call-(ip6tables|iptables)\s*='
+    state: absent
+  when:
+    - base_env == 'lxc'
+    - base_lxc_sysctl_file.stat.exists
+
+- name: Preserve router advertisements on forwarding-enabled uplinks
+  ansible.posix.sysctl:
+    name: net.ipv6.conf.{{ item }}.accept_ra
+    value: "2"
+    state: present
+    sysctl_file: /etc/sysctl.d/90-cvp-k3s.conf
+    reload: true
+  loop: "{{ base_ra_interfaces }}"
+  when: base_sysctls['net.ipv6.conf.all.forwarding'] | string == '1'
+
+- name: Apply guest-owned kernel networking settings
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: /etc/sysctl.d/90-cvp-k3s.conf
+    reload: true
+  loop: "{{ base_sysctls | dict2items }}"
+  when: base_env != 'lxc' or item.key not in base_lxc_host_sysctls
+
+- name: Disable active swap
+  ansible.builtin.command: swapoff -a
+  when:
+    - base_disable_swap | bool
+    - base_swap_devices.stdout | trim | length > 0
+    - base_env != 'lxc'
+
+- name: Keep swap disabled after reboot
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(?P<entry>\s*[^#].*\s+swap\s+.*)$'
+    replace: '# Disabled for K3s: \g<entry>'
+  when: base_disable_swap | bool and base_env != 'lxc'
+
+- name: Enable time synchronization
+  ansible.builtin.systemd_service:
+    name: systemd-timesyncd.service
+    state: started
+    enabled: true
+
+- name: Create the operator account
+  ansible.builtin.user:
+    name: "{{ base_admin_user }}"
+    shell: /bin/bash
+    create_home: true
+    groups: sudo
+    append: true
+    state: present
+  when: base_manage_admin_user | bool
+
+- name: Require an external SSH key when managing the operator account
+  ansible.builtin.assert:
+    that:
+      - base_admin_authorized_keys | length > 0
+      - >-
+        base_admin_authorized_keys
+        | select('match', '^ssh-(rsa|ed25519|ecdsa) ')
+        | list | length == base_admin_authorized_keys | length
+    fail_msg: >-
+      Set base_admin_authorized_keys to one or more externally supplied public
+      keys before enabling base_manage_admin_user.
+  when: base_manage_admin_user | bool
+
+- name: Install operator SSH keys
+  ansible.posix.authorized_key:
+    user: "{{ base_admin_user }}"
+    key: "{{ item }}"
+    state: present
+    manage_dir: true
+  loop: "{{ base_admin_authorized_keys }}"
+  when: base_manage_admin_user | bool
+
+- name: Grant passwordless administrative access
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/{{ base_admin_user }}"
+    content: "{{ base_admin_user }} ALL=(ALL:ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: visudo -cf %s
+  when: base_manage_admin_user | bool
+
+- name: Install SSH hardening drop-in
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: base_manage_sshd | bool
+
+- name: Install SSH hardening drop-in
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/50-cvp-hardening.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+      X11Forwarding no
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      MaxAuthTries 4
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload SSH
+  when: base_manage_sshd | bool
+
+- name: Create the journald drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure bounded journald retention
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/30-cvp-retention.conf
+    content: |
+      [Journal]
+      SystemMaxUse={{ base_journal_max_use }}
+      SystemMaxFileSize={{ base_journal_max_file_size }}
+      MaxRetentionSec=14day
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart journald

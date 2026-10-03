@@ -1,0 +1,149 @@
+---
+- name: Require WireGuard inventory data
+  ansible.builtin.assert:
+    that:
+      - wireguard_address | length > 0
+      - wireguard_peers_group in groups
+    fail_msg: >-
+      Each WireGuard host needs a node address and the inventory must define
+       the complete peer group before the mesh can be rendered.
+
+- name: Require persisted public keys for every peer
+  ansible.builtin.assert:
+    that:
+      - hostvars[item].wireguard_public_key | default('') | trim | length > 0
+    fail_msg: >-
+      WireGuard peer {{ item }} has no persisted wireguard_public_key in
+      inventory. Add its public key before using --limit or recovering one node.
+  loop: "{{ groups[wireguard_peers_group] | difference([inventory_hostname]) }}"
+  no_log: true
+
+- name: Install WireGuard tools
+  ansible.builtin.apt:
+    name: wireguard-tools
+    state: present
+    update_cache: true
+
+- name: Create WireGuard directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/wireguard, mode: "0700" }
+    - { path: "{{ wireguard_private_key_file | dirname }}", mode: "0700" }
+
+- name: Check for an existing private key
+  ansible.builtin.stat:
+    path: "{{ wireguard_private_key_file }}"
+  register: wireguard_private_key_stat
+
+- name: Read an existing private key
+  ansible.builtin.slurp:
+    src: "{{ wireguard_private_key_file }}"
+  register: wireguard_private_key_slurp
+  no_log: true
+  when: wireguard_private_key_stat.stat.exists
+
+- name: Reuse a key from an already running owner-managed interface
+  ansible.builtin.command: "wg show {{ wireguard_interface }} private-key"
+  register: wireguard_existing_interface_key
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: not wireguard_private_key_stat.stat.exists
+
+- name: Start with an externally supplied key when present
+  ansible.builtin.set_fact:
+    wireguard_private_key_material: "{{ wireguard_private_key | default('') | trim }}"
+  no_log: true
+
+- name: Prefer the persisted host key
+  ansible.builtin.set_fact:
+    wireguard_private_key_material: "{{ wireguard_private_key_slurp.content | b64decode | trim }}"
+  no_log: true
+  when:
+    - wireguard_private_key_stat.stat.exists
+    - wireguard_private_key_slurp.content | default('') | length > 0
+
+- name: Prefer the key from the active interface
+  ansible.builtin.set_fact:
+    wireguard_private_key_material: "{{ wireguard_existing_interface_key.stdout | trim }}"
+  no_log: true
+  when:
+    - not wireguard_private_key_stat.stat.exists
+    - wireguard_existing_interface_key.stdout | default('') | trim | length > 0
+
+- name: Generate a host-local key only when no owner key exists
+  ansible.builtin.command: wg genkey
+  register: wireguard_generated_key
+  changed_when: true
+  no_log: true
+  when: wireguard_private_key_material | default('') | trim | length == 0
+
+- name: Keep the generated key for this convergence
+  ansible.builtin.set_fact:
+    wireguard_private_key_material: "{{ wireguard_generated_key.stdout | trim }}"
+  no_log: true
+  when: wireguard_generated_key is defined and wireguard_generated_key.stdout | default('') | trim | length > 0
+
+- name: Require usable private key material
+  ansible.builtin.assert:
+    that:
+      - wireguard_private_key_material | default('') | trim | length > 0
+    fail_msg: >-
+      No WireGuard private key was found or generated. Supply wireguard_private_key
+      from an external secret source or permit host-local key generation.
+  no_log: true
+
+- name: Persist a newly selected private key without exposing it
+  ansible.builtin.copy:
+    dest: "{{ wireguard_private_key_file }}"
+    content: "{{ wireguard_private_key_material | trim }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: not wireguard_private_key_stat.stat.exists
+
+- name: Derive the public key
+  ansible.builtin.command: wg pubkey
+  args:
+    stdin: "{{ wireguard_private_key_material | trim }}"
+  register: wireguard_public_key_command
+  changed_when: false
+  no_log: true
+
+- name: Require the derived public key to match the persisted inventory key
+  ansible.builtin.assert:
+    that:
+      - wireguard_public_key | default('') | trim | length == 0
+        or wireguard_public_key_command.stdout | trim == wireguard_public_key | trim
+    fail_msg: >-
+      The private key selected on {{ inventory_hostname }} derives public key
+      {{ wireguard_public_key_command.stdout | trim }}, but inventory records
+      {{ wireguard_public_key | default('') | trim }}. Restore the matching
+      private key on the host, update the inventory key from an approved
+      rotation, or run a coordinated mesh-wide key rotation. Peers authenticate
+      the inventory key, so a silent mismatch would partition the mesh.
+  no_log: true
+
+- name: Render the owner-managed WireGuard mesh
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: "/etc/wireguard/{{ wireguard_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart WireGuard
+  when: wireguard_manage_config | bool
+
+- name: Enable the WireGuard interface
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ wireguard_interface }}.service"
+    state: started
+    enabled: true
+  when: wireguard_manage_config | bool

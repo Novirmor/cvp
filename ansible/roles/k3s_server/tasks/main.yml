@@ -1,0 +1,171 @@
+---
+- name: Require the server inventory role
+  ansible.builtin.assert:
+    that:
+      - k3s_role == 'server'
+      - k3s_version | length > 0
+      - wireguard_address | length > 0
+      - k3s_server_init is defined
+      - k3s_datastore in ['etcd', 'sqlite']
+    fail_msg: >-
+      The K3s server needs k3s_role=server, a pinned k3s_version, a WireGuard
+      node address, an explicit k3s_server_init flag, and a supported
+      k3s_datastore (etcd or sqlite).
+
+- name: Install K3s host dependencies
+  ansible.builtin.apt:
+    name:
+      - conntrack
+      - socat
+    state: present
+    update_cache: true
+
+- name: Create K3s configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/rancher/k3s
+    - "{{ k3s_data_dir }}"
+    # The joining-server token install writes server/token before K3s ever
+    # creates the directory itself.
+    - "{{ k3s_data_dir }}/server"
+
+- name: Download the pinned K3s server artifact with release checksum verification
+  ansible.builtin.get_url:
+    url: "{{ k3s_binary_url }}"
+    checksum: "sha256:{{ k3s_checksum_url }}"
+    dest: "{{ k3s_bin_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart K3s server
+
+- name: Check for a dedicated agent join token on the init server
+  ansible.builtin.stat:
+    path: "{{ k3s_agent_token_server_path }}"
+  register: k3s_agent_token_stat
+  when: k3s_server_init | bool
+
+- name: Generate a dedicated agent join token on the init server
+  ansible.builtin.command: openssl rand -base64 48
+  register: k3s_agent_token_generated
+  changed_when: true
+  no_log: true
+  when:
+    - k3s_server_init | bool
+    - not k3s_agent_token_stat.stat.exists
+
+- name: Persist the dedicated agent join token on the init server
+  ansible.builtin.copy:
+    dest: "{{ k3s_agent_token_server_path }}"
+    content: "{{ k3s_agent_token_generated.stdout | trim }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when:
+    - k3s_server_init | bool
+    - not k3s_agent_token_stat.stat.exists
+
+- name: Link the K3s client tools
+  ansible.builtin.file:
+    src: "{{ k3s_bin_path }}"
+    dest: "/usr/local/bin/{{ item }}"
+    state: link
+    owner: root
+    group: root
+    force: true
+  loop:
+    - kubectl
+    - crictl
+    - ctr
+
+- name: Wait for the init server to publish its tokens
+  ansible.builtin.wait_for:
+    path: "{{ k3s_server_token_path }}"
+    state: present
+    timeout: 300
+  delegate_to: "{{ k3s_cluster_init_host }}"
+  when: not k3s_server_init | bool
+
+- name: Read the server token from the init server
+  ansible.builtin.slurp:
+    src: "{{ k3s_server_token_path }}"
+  delegate_to: "{{ k3s_cluster_init_host }}"
+  register: k3s_join_server_token
+  no_log: true
+  when: not k3s_server_init | bool
+
+- name: Read the agent token from the init server
+  ansible.builtin.slurp:
+    src: "{{ k3s_agent_token_server_path }}"
+  delegate_to: "{{ k3s_cluster_init_host }}"
+  register: k3s_join_agent_token
+  no_log: true
+  when: not k3s_server_init | bool
+
+# No secrets-encryption key copy: K3s distributes the encryption config to
+# joining servers as part of the datastore bootstrap data, and in v1.35 the
+# file is server/cred/encryption-config.json, managed by K3s itself.
+
+- name: Install the server token on the joining server
+  ansible.builtin.copy:
+    dest: "{{ k3s_server_token_path }}"
+    content: "{{ k3s_join_server_token.content | b64decode }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: not k3s_server_init | bool
+
+- name: Install the agent token on the joining server
+  ansible.builtin.copy:
+    dest: "{{ k3s_agent_token_server_path }}"
+    content: "{{ k3s_join_agent_token.content | b64decode }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: not k3s_server_init | bool
+
+- name: Render the K3s server configuration
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ k3s_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart K3s server
+
+- name: Install the K3s server systemd unit
+  ansible.builtin.template:
+    src: k3s.service.j2
+    dest: /etc/systemd/system/k3s.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart K3s server
+
+- name: Enable and start the K3s server
+  ansible.builtin.systemd_service:
+    name: k3s.service
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for the server token to exist
+  ansible.builtin.wait_for:
+    path: "{{ k3s_server_token_path }}"
+    state: present
+    timeout: 180
+
+- name: Configure the host backup unit
+  ansible.builtin.include_tasks: backup.yml
+
+...

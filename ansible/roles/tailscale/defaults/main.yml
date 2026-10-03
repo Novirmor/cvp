@@ -1,0 +1,9 @@
+---
+tailscale_package_version: ""
+tailscale_auth_key: ""
+tailscale_login_server: ""
+tailscale_accept_dns: false
+tailscale_advertise_tags: []
+tailscale_extra_up_args: []
+tailscale_keyring_path: /usr/share/keyrings/tailscale-archive-keyring.gpg
+tailscale_repo_url: https://pkgs.tailscale.com/stable

@@ -1,0 +1,106 @@
+---
+- name: Require the agent inventory role
+  ansible.builtin.assert:
+    that:
+      - k3s_role == 'agent'
+      - k3s_version | length > 0
+      - wireguard_address | length > 0
+      - k3s_server_host in hostvars
+      - hostvars[k3s_server_host].wireguard_address | default('') | length > 0
+    fail_msg: >-
+      The K3s agent needs k3s_role=agent, a pinned version, a WireGuard node
+      address, and a reachable server host in inventory.
+
+- name: Install K3s agent dependencies
+  ansible.builtin.apt:
+    name:
+      - conntrack
+      - socat
+    state: present
+    update_cache: true
+
+- name: Create K3s agent directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/rancher/k3s
+    - "{{ k3s_data_dir }}"
+
+- name: Download the pinned K3s agent artifact with release checksum verification
+  ansible.builtin.get_url:
+    url: "{{ k3s_binary_url }}"
+    checksum: "sha256:{{ k3s_checksum_url }}"
+    dest: "{{ k3s_bin_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart K3s agent
+
+- name: Link the K3s client tools
+  ansible.builtin.file:
+    src: "{{ k3s_bin_path }}"
+    dest: "/usr/local/bin/{{ item }}"
+    state: link
+    owner: root
+    group: root
+    force: true
+  loop:
+    - kubectl
+    - crictl
+    - ctr
+
+- name: Read the server token from the control-plane host
+  ansible.builtin.slurp:
+    src: "{{ k3s_agent_token_server_path }}"
+  delegate_to: "{{ k3s_server_host }}"
+  register: k3s_server_token_slurp
+  no_log: true
+
+- name: Require a non-empty server token
+  ansible.builtin.assert:
+    that:
+      - k3s_server_token_slurp.content | b64decode | trim | length > 0
+    fail_msg: >-
+      The K3s agent token was not readable. The server must be healthy before
+      agents are joined.
+  no_log: true
+
+- name: Install the agent token without exposing it in config or logs
+  ansible.builtin.copy:
+    dest: "{{ k3s_agent_token_path }}"
+    content: "{{ k3s_server_token_slurp.content | b64decode | trim }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Render the K3s agent configuration
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ k3s_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart K3s agent
+
+- name: Install the K3s agent systemd unit
+  ansible.builtin.template:
+    src: k3s-agent.service.j2
+    dest: /etc/systemd/system/k3s-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart K3s agent
+
+- name: Enable and start the K3s agent
+  ansible.builtin.systemd_service:
+    name: k3s-agent.service
+    state: started
+    enabled: true
+    daemon_reload: true

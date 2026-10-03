@@ -1,0 +1,170 @@
+---
+# These values are deliberately ordinary variables. Secret material is supplied
+# through an external vars file, environment lookup, or the host itself.
+
+base_packages:
+  - ca-certificates
+  - conntrack
+  - curl
+  - age
+  - findutils
+  - iproute2
+  - iptables
+  - iputils-ping
+  - kmod
+  - nftables
+  - python3
+  - python3-apt
+  - python3-jsonpatch
+  - python3-kubernetes
+  - procps
+  - socat
+  - openssl
+  - sqlite3
+  - sudo
+  - systemd-timesyncd
+  - tar
+  - util-linux
+  - wireguard-tools
+
+base_disable_swap: true
+
+# Network-namespace sysctls that the guest may manage. The bridge netfilter
+# switches can be host-owned in LXC and must already be set by the provider.
+base_lxc_host_sysctls:
+  - net.bridge.bridge-nf-call-iptables
+  - net.bridge.bridge-nf-call-ip6tables
+base_sysctls:
+  net.ipv4.ip_forward: "1"
+  net.ipv6.conf.all.forwarding: "1"
+  net.bridge.bridge-nf-call-iptables: "1"
+  net.bridge.bridge-nf-call-ip6tables: "1"
+  net.ipv4.conf.all.src_valid_mark: "1"
+
+# Shared with playbooks/probe.yml, which cannot load role defaults.
+base_kernel_modules:
+  - br_netfilter
+  - overlay
+  - vxlan
+
+# Host environment classification: lxc, vm, metal, or auto (detected by the
+# probe and the base role via systemd-detect-virt). A declared value that
+# disagrees with the detected one fails the probe and convergence. LXC guests
+# share the host kernel and cannot load
+# kernel modules themselves, so the required facilities must be provided by
+# the host; VM and metal hosts load and persist the modules themselves.
+node_virtualization: auto
+
+# systemd-detect-virt identifiers grouped into the three environments the
+# host layer distinguishes. Shared by playbooks/probe.yml, the base role,
+# and playbooks/verify.yml so every layer classifies identically.
+node_container_ids: [lxc, lxc-libvirt, systemd-nspawn, docker, podman, openvz]
+node_vm_ids: [kvm, qemu, xen, vmware, microsoft, virtualbox, parallels, bhyve, amazon, zvm, qnx]
+
+# Label namespaces Ansible reconciles on cluster nodes. Every declared label
+# must match at least one of these anchored regular expressions; validation
+# fails otherwise, so a label can never be applied without also becoming
+# eligible for removal when it disappears from inventory. Labels already
+# present on a node outside these domains are never managed or removed.
+# Extend the list to bring custom tag domains under reconciliation.
+k3s_managed_label_domains:
+  - '^cvp\.io/'
+  - '^svccontroller\.k3s\.cattle\.io/'
+
+# The IPv6-to-IPv4 ingress frontend is managed on hosts in the ingress group.
+ingress_v6_enabled: true
+
+base_manage_admin_user: false
+base_admin_user: cvp-admin
+base_admin_authorized_keys: []
+base_manage_sshd: false
+base_ssh_service_name: ssh
+base_ssh_port: 22
+base_journal_max_use: 500M
+base_journal_max_file_size: 50M
+
+tailscale_package_version: ""
+tailscale_auth_key: ""
+tailscale_login_server: ""
+tailscale_accept_dns: false
+tailscale_advertise_tags: []
+tailscale_extra_up_args: []
+tailscale_extra_set_args: []
+
+wireguard_private_key_file: /etc/wireguard/privatekey
+wireguard_mtu: 1420
+wireguard_persistent_keepalive: 25
+wireguard_manage_config: true
+wireguard_mtu_probe_payload: 1392
+
+firewall_manage: true
+# Prefer the IPv4 default-route uplink, then the IPv6 one. If neither exists,
+# declare the interface explicitly; never guess an interface for a firewall.
+firewall_external_interface: >-
+  {{ ansible_default_ipv4.interface
+     | default(ansible_default_ipv6.interface | default(''), true) }}
+# IPv6 router advertisements must still be accepted when forwarding is on.
+# Include the IPv6 default-route uplink when it differs from the IPv4 one.
+base_ra_interfaces: >-
+  {{ ([firewall_external_interface, ansible_default_ipv6.interface | default('')]
+      | reject('equalto', '') | unique) | list }}
+firewall_public_ingress_ports:
+  - 80
+  - 443
+firewall_ssh_ipv4_source_cidrs: []
+firewall_ssh_ipv6_source_cidrs: []
+# WireGuard authenticates peers cryptographically. Narrow these to stable peer
+# endpoint CIDRs when the provider exposes them; the default keeps mesh reachability.
+firewall_wireguard_ipv4_source_cidrs:
+  - 0.0.0.0/0
+firewall_wireguard_ipv6_source_cidrs:
+  - ::/0
+
+storage_enabled: true
+storage_device: ""
+storage_filesystem: ext4
+storage_mountpoint: /var/lib/rancher/k3s/storage
+storage_mount_options: defaults,noatime
+storage_manage_device: false
+storage_allow_format: false
+storage_directory_mode: "0750"
+
+k3s_version: v1.35.4+k3s1
+k3s_arch: amd64
+k3s_binary_name: k3s
+k3s_bin_path: /usr/local/bin/k3s
+k3s_binary_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/{{ k3s_binary_name }}"
+k3s_checksum_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/sha256sum-{{ k3s_arch }}.txt"
+k3s_data_dir: /var/lib/rancher/k3s
+k3s_config_path: /etc/rancher/k3s/config.yaml
+k3s_datastore: etcd
+k3s_cluster_init_host: ""
+k3s_node_taints: []
+k3s_cluster_cidr: 10.42.0.0/16
+k3s_service_cidr: 10.43.0.0/16
+k3s_cluster_dns: 10.43.0.10
+k3s_cluster_domain: cluster.local
+k3s_flannel_backend: vxlan
+k3s_flannel_iface: wg0
+k3s_expected_pod_mtu: 1370
+k3s_default_local_storage_path: /var/lib/rancher/k3s/storage
+k3s_tls_sans: []
+k3s_write_kubeconfig_mode: "0640"
+k3s_node_labels: []
+k3s_disable_components: []
+k3s_server_token_path: /var/lib/rancher/k3s/server/token
+k3s_agent_token_server_path: /etc/rancher/k3s/agent-token
+k3s_agent_token_path: /etc/rancher/k3s/agent-token
+
+# Backup is opt-in until the operator supplies an age recipient and an upload
+# command for the selected off-host store. The recipient is public key material.
+k3s_backup_enabled: false
+k3s_backup_dir: /var/backups/k3s
+k3s_backup_script_path: /usr/local/sbin/k3s-backup
+k3s_backup_service_name: cvp-k3s-backup.service
+k3s_backup_timer_name: cvp-k3s-backup.timer
+k3s_backup_schedule: "*-*-* 03:15:00"
+k3s_backup_retention_days: 14
+k3s_backup_age_recipient: "{{ lookup('ansible.builtin.env', 'K3S_BACKUP_AGE_RECIPIENT') }}"
+k3s_backup_upload_command: ""
+k3s_backup_writable_paths: []

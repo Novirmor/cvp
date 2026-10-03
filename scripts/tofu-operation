@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 2
+}
+
+usage() {
+  fail "usage: $0 <cloudflare|tailscale> <plan|drift-plan|apply|show|import|state-list|state-pull> [arguments]"
+}
+
+require_external_absolute_path() {
+  local path="$1"
+  [[ "$path" == /* ]] || fail "artifact path must be absolute: $path"
+  case "$path" in
+    "$root_dir" | "$root_dir"/*)
+      fail "sensitive artifacts must be stored outside the repository: $path"
+      ;;
+  esac
+}
+
+find_plan_output() {
+  local expect_value=false
+  local argument
+
+  PLAN_OUTPUT=""
+  for argument in "$@"; do
+    if [[ "$expect_value" == true ]]; then
+      PLAN_OUTPUT="$argument"
+      expect_value=false
+      continue
+    fi
+
+    case "$argument" in
+      -out)
+        expect_value=true
+        ;;
+      -out=*)
+        PLAN_OUTPUT="${argument#-out=}"
+        ;;
+    esac
+  done
+
+  [[ "$expect_value" == false ]] || fail "-out requires a path"
+  [[ -n "$PLAN_OUTPUT" ]] || fail "plan operations require -out=/absolute/path/to/reviewed.tfplan"
+  require_external_absolute_path "$PLAN_OUTPUT"
+}
+
+(($# >= 2)) || usage
+root="$1"
+operation="$2"
+shift 2
+
+case "$root" in
+  cloudflare | tailscale)
+    tofu_root="tofu/$root"
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+case "$operation" in
+  plan)
+    find_plan_output "$@"
+    exec tofu -chdir="$tofu_root" plan -input=false "$@"
+    ;;
+  drift-plan)
+    find_plan_output "$@"
+    exec tofu -chdir="$tofu_root" plan -input=false -refresh-only "$@"
+    ;;
+  apply)
+    (($# == 1)) || fail "apply requires exactly one reviewed plan artifact"
+    [[ "$1" != -* ]] || fail "apply accepts a plan artifact, not flags"
+    require_external_absolute_path "$1"
+    [[ -f "$1" ]] || fail "reviewed plan artifact does not exist: $1"
+    exec tofu -chdir="$tofu_root" apply -input=false "$1"
+    ;;
+  show)
+    (($# == 1)) || fail "show requires exactly one plan artifact"
+    require_external_absolute_path "$1"
+    [[ -f "$1" ]] || fail "plan artifact does not exist: $1"
+    exec tofu -chdir="$tofu_root" show -no-color "$1"
+    ;;
+  import)
+    (($# >= 2)) || fail "import requires a resource address and provider ID"
+    exec tofu -chdir="$tofu_root" import "$@"
+    ;;
+  state-list)
+    (($# == 0)) || fail "state-list does not accept arguments"
+    exec tofu -chdir="$tofu_root" state list
+    ;;
+  state-pull)
+    (($# == 1)) || fail "state-pull requires exactly one output path"
+    require_external_absolute_path "$1"
+    umask 077
+    temporary_file="${1}.tmp.$$"
+    trap 'rm -f -- "$temporary_file"' EXIT
+    tofu -chdir="$tofu_root" state pull >"$temporary_file"
+    mv -- "$temporary_file" "$1"
+    trap - EXIT
+    ;;
+  *)
+    usage
+    ;;
+esac

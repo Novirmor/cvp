@@ -1,0 +1,7 @@
+---
+k3s_version: ""
+k3s_arch: amd64
+k3s_binary_name: "{{ 'k3s' if k3s_arch == 'amd64' else 'k3s-' ~ k3s_arch }}"
+k3s_bin_path: /usr/local/bin/k3s
+k3s_binary_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/{{ k3s_binary_name }}"
+k3s_checksum_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/sha256sum-{{ k3s_arch }}.txt"

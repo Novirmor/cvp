@@ -1,0 +1,27 @@
+---
+- name: Register the invalid case
+  ansible.builtin.add_host:
+    name: "{{ case.name }}"
+    node_name: "{{ case.node_name | default(case.name) }}"
+    k3s_node_labels: "{{ case.labels }}"
+    k3s_node_taints: "{{ case.taints }}"
+
+- name: Prove the invalid case fails
+  block:
+    - name: Validate the invalid case
+      ansible.builtin.include_tasks: tasks/validate-node-tags.yml
+      vars:
+        node_tag_validation_hosts: "{{ [case.name] }}"
+        k3s_managed_label_domains: "{{ case.domains | default(['^cvp\\.io/', '^svccontroller\\.k3s\\.cattle\\.io/']) }}"
+    - name: Fail if validation accepted the invalid case
+      ansible.builtin.fail:
+        msg: "{{ case.name }} was accepted"
+  rescue:
+    - name: Ensure validation, rather than the sentinel, rejected the case
+      ansible.builtin.assert:
+        that:
+          - ansible_failed_result.msg != case.name ~ ' was accepted'
+          - >-
+            case.expected is not defined or
+            (ansible_failed_result.results | default([]) | selectattr('assertion', 'defined')
+             | map(attribute='assertion') | select('search', case.expected) | list | length > 0)

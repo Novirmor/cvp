@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
+mkdir "$work_dir/bin"
+
+tee "$work_dir/bin/mise" > /dev/null <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf '%s\n' "$*" >> "$CVP_ACCESS_TEST_CALLS"
+if [[ "$*" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]; then
+  printf '%s\n' "$CVP_ACCESS_TEST_INVENTORY"
+fi
+STUB
+tee "$work_dir/bin/ssh-keygen" > /dev/null <<'STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$1" == -lf && -f "$2" ]]
+STUB
+chmod +x "$work_dir/bin/mise" "$work_dir/bin/ssh-keygen"
+
+export PATH="$work_dir/bin:$PATH"
+export CVP_ACCESS_TEST_CALLS="$work_dir/calls"
+export CVP_ACCESS_TEST_INVENTORY='{"wireguard":{"hosts":["worker1"]},"_meta":{"hostvars":{"worker1":{"ansible_host":"worker1.example.com","node_name":"worker1"}}}}'
+export CVP_ACCESS_NODE=worker1
+export CVP_ACCESS_PUBLIC_KEY_FILE="$work_dir/operator.pub"
+printf '%s\n' 'ssh-ed25519 cHVibGljLWtleS1maXh0dXJl operator' > "$CVP_ACCESS_PUBLIC_KEY_FILE"
+
+if CVP_ACCESS_CONFIRM='' bash "$root_dir/scripts/prepare-node-access" > /dev/null 2>&1; then
+  printf '%s\n' 'access bootstrap proceeded without confirmation' >&2
+  exit 1
+fi
+[[ ! -s "$CVP_ACCESS_TEST_CALLS" ]] || {
+  printf '%s\n' 'access bootstrap ran commands without confirmation' >&2
+  exit 1
+}
+
+export CVP_ACCESS_CONFIRM=worker1
+bash "$root_dir/scripts/prepare-node-access" > /dev/null
+mapfile -t calls < "$CVP_ACCESS_TEST_CALLS"
+[[ "${#calls[@]}" -eq 5 ]] || {
+  printf 'expected five ordered calls, got %s\n' "${#calls[@]}" >&2
+  exit 1
+}
+[[ "${calls[0]}" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]
+[[ "${calls[1]}" == 'exec -- task deps' ]]
+[[ "${calls[2]}" == *'bootstrap-access.yml --limit worker1 -e ansible_user=root -e ansible_become=false'* ]]
+[[ "${calls[3]}" == *"-a test \"\$(id -un)\" = ops -e ansible_user=ops -e ansible_become=false"* ]]
+[[ "${calls[4]}" == *"-a test \"\$(id -un)\" = root -e ansible_user=ops -e ansible_become=true"* ]]
+
+: > "$CVP_ACCESS_TEST_CALLS"
+export CVP_ACCESS_TEST_INVENTORY='{"wireguard":{"hosts":[]},"_meta":{"hostvars":{}}}'
+if bash "$root_dir/scripts/prepare-node-access" > /dev/null 2>&1; then
+  printf '%s\n' 'access bootstrap accepted a missing inventory host' >&2
+  exit 1
+fi
+mapfile -t calls < "$CVP_ACCESS_TEST_CALLS"
+[[ "${#calls[@]}" -eq 1 ]] || {
+  printf '%s\n' 'access bootstrap proceeded past invalid inventory' >&2
+  exit 1
+}
+
+: > "$CVP_ACCESS_TEST_CALLS"
+export CVP_ACCESS_TEST_INVENTORY='{"_meta":{"hostvars":{},"profile":"inventory_legacy"},"all":{"children":["ungrouped","wireguard","k3s_servers","k3s_agents","storage_stateful","ingress"]}}'
+if bash "$root_dir/scripts/prepare-node-access" > "$work_dir/empty-inventory-output" 2>&1; then
+  printf '%s\n' 'access bootstrap accepted an empty inventory with missing groups' >&2
+  exit 1
+fi
+[[ "$(< "$work_dir/empty-inventory-output")" == *'worker1 must be in the wireguard inventory group'* ]]
+mapfile -t calls < "$CVP_ACCESS_TEST_CALLS"
+[[ "${#calls[@]}" -eq 1 ]] || {
+  printf '%s\n' 'access bootstrap proceeded past empty inventory' >&2
+  exit 1
+}
+[[ "${calls[0]}" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]
+
+printf '%s\n' 'access bootstrap guards and verification order passed'

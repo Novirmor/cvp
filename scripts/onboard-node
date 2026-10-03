@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root_dir"
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 2
+}
+
+node="${CVP_ONBOARD_NODE:-}"
+[[ -n "$node" && ${#node} -le 63 && "$node" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] ||
+  fail 'set CVP_ONBOARD_NODE to one lowercase inventory host name (letters, digits, hyphens)'
+[[ "${CVP_ONBOARD_CONFIRM:-}" == "$node" ]] ||
+  fail 'set CVP_ONBOARD_CONFIRM to the same node name after reviewing the host and deployment gates'
+
+site_args=()
+if [[ -n "${CVP_ONBOARD_SITE_VARS_FILE:-}" ]]; then
+  vars_file="$CVP_ONBOARD_SITE_VARS_FILE"
+  [[ "$vars_file" == /* && -f "$vars_file" && -r "$vars_file" ]] ||
+    fail 'CVP_ONBOARD_SITE_VARS_FILE must be a readable absolute path outside this repository'
+  case "$vars_file" in
+    "$root_dir"/*) fail 'site vars must not be stored inside the repository' ;;
+  esac
+  site_args=(-e "@$vars_file")
+fi
+
+inventory="$(ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-inventory \
+  -i ansible/inventory/hosts.yml --list)" || fail 'could not read the Ansible inventory'
+
+role="$(printf '%s\n' "$inventory" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+node = sys.argv[1]
+
+def registered(group):
+    return node in data.get(group, {}).get("hosts", [])
+
+def reject(message):
+    sys.exit("error: " + message)
+
+if not registered("wireguard"):
+    reject(f"{node} must be in the wireguard group")
+server = registered("k3s_servers")
+agent = registered("k3s_agents")
+if server == agent:
+    reject(f"{node} must be in exactly one of k3s_servers or k3s_agents")
+host = data.get("_meta", {}).get("hostvars", {}).get(node, {})
+if host.get("node_name") != node:
+    reject(f"{node}: node_name must match the inventory host key")
+if host.get("node_virtualization") not in ("lxc", "vm", "metal"):
+    reject(f"{node}: pin node_virtualization to lxc, vm, or metal before onboarding")
+if host.get("k3s_role") != ("server" if server else "agent"):
+    reject(f"{node}: k3s_role must match its server/agent inventory group")
+if host.get("k3s_server_init"):
+    reject(f"{node}: onboarding must not initialize a new control plane")
+if not host.get("wireguard_address") or not host.get("wireguard_public_key"):
+    reject(f"{node}: set the WireGuard address and public key before onboarding")
+print("server" if server else "agent")
+' "$node")" || fail 'correct the inventory before onboarding'
+
+[[ "$role" != server || "${CVP_ONBOARD_SERVER_CONFIRM:-}" == "$node" ]] ||
+  fail 'joining another etcd server changes quorum; set CVP_ONBOARD_SERVER_CONFIRM to the node after review'
+
+printf 'Checking repository and inventory for %s...\n' "$node"
+mise exec -- task test
+
+printf 'Probing host capabilities on %s (read-only)...\n' "$node"
+ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
+  -i ansible/inventory/hosts.yml ansible/playbooks/probe.yml --limit "$node"
+
+printf 'Converging the full fleet to distribute the new WireGuard peer...\n'
+ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
+  -i ansible/inventory/hosts.yml ansible/playbooks/site.yml "${site_args[@]}"
+
+printf 'Checking %s WireGuard peers and path MTU...\n' "$node"
+ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
+  -i ansible/inventory/hosts.yml ansible/playbooks/probe-wireguard.yml --limit "$node"
+
+printf 'Verifying all hosts and cluster nodes...\n'
+ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
+  -i ansible/inventory/hosts.yml ansible/playbooks/verify.yml
+
+printf 'Onboarding verified for %s.\n' "$node"

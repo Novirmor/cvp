@@ -1,0 +1,230 @@
+---
+- name: Probe the host and network prerequisites without changing state
+  hosts: wireguard
+  become: true
+  gather_facts: true
+  tasks:
+    # systemd-detect-virt exits 1 when it detects no virtualization.
+    - name: Detect the virtualization environment
+      ansible.builtin.command: systemd-detect-virt
+      register: probe_virt
+      changed_when: false
+      failed_when: false
+
+    - name: Require a conclusive virtualization detection
+      ansible.builtin.assert:
+        that:
+          - probe_virt.rc in [0, 1]
+          - >-
+            (probe_virt.rc == 1 and probe_virt.stdout | trim == 'none')
+            or (probe_virt.rc == 0 and probe_virt.stdout | trim in
+                (node_container_ids + node_vm_ids))
+        fail_msg: >-
+          systemd-detect-virt failed or returned an unknown environment
+          (rc={{ probe_virt.rc }}, output='{{ probe_virt.stdout | trim }}').
+          Refusing to assume this host owns its kernel.
+
+    - name: Classify the detected environment
+      ansible.builtin.set_fact:
+        probe_detected_env: >-
+          {{ 'lxc' if probe_virt.stdout | trim in node_container_ids
+             else 'vm' if probe_virt.stdout | trim in node_vm_ids
+             else 'metal' }}
+
+    - name: Require a declared environment to match the detected one
+      ansible.builtin.assert:
+        that:
+          - node_virtualization == probe_detected_env
+        fail_msg: >-
+          node_virtualization declares {{ node_virtualization }} but
+          systemd-detect-virt reports '{{ probe_virt.stdout | trim | default('none', true) }}'
+          ({{ probe_detected_env }}). Correct the inventory or keep auto.
+      when: node_virtualization != 'auto'
+
+    - name: Select the effective environment
+      ansible.builtin.set_fact:
+        probe_env: "{{ node_virtualization if node_virtualization != 'auto' else probe_detected_env }}"
+
+    - name: Report the effective environment
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is a {{ probe_env }} host
+          (systemd-detect-virt: '{{ probe_virt.stdout | trim | default('none', true) }}')
+
+    - name: Require cgroup v2
+      ansible.builtin.stat:
+        path: /sys/fs/cgroup/cgroup.controllers
+      register: probe_cgroup
+
+    - name: Read available cgroup v2 controllers
+      ansible.builtin.slurp:
+        src: /sys/fs/cgroup/cgroup.controllers
+      register: probe_cgroup_controllers
+      when: probe_cgroup.stat.exists
+
+    - name: Require the TUN device
+      ansible.builtin.stat:
+        path: /dev/net/tun
+      register: probe_tun
+
+    - name: Check overlay filesystem registration
+      ansible.builtin.command:
+        argv: [grep, -qw, overlay, /proc/filesystems]
+      register: probe_overlay_fs
+      changed_when: false
+      failed_when: false
+
+    - name: Check host-provided modules including built-ins
+      ansible.builtin.stat:
+        path: /sys/module/{{ item }}
+      loop: "{{ base_kernel_modules }}"
+      register: probe_module_paths
+
+    - name: Check loadability of missing VM and metal modules
+      ansible.builtin.command:
+        argv: [modprobe, -n, "{{ item }}"]
+      changed_when: false
+      loop: "{{ base_kernel_modules }}"
+      loop_control:
+        index_var: module_index
+      register: probe_modules
+      failed_when: false
+      when:
+        - probe_env != 'lxc'
+        - not probe_module_paths.results[module_index].stat.exists
+
+    # An LXC guest shares the host kernel and cannot load modules itself, so
+    # everything the cluster needs must already be provided by the host.
+    - name: Require host-provided kernel facilities on LXC guests
+      ansible.builtin.assert:
+        that:
+          - probe_overlay_fs.rc == 0
+          - probe_module_paths.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: >-
+          This LXC guest needs a host kernel that already provides overlay as a
+          registered filesystem and required modules (loaded or built in);
+          the guest cannot load them itself. Ask the provider to load them,
+          onboard the node as a VM, or record an explicit hosting decision.
+      when: probe_env == 'lxc'
+
+    # A VM or metal host owns its kernel: the modules only need to be
+    # available, because convergence loads and persists them itself.
+    - name: Require loadable kernel modules on VM and metal hosts
+      ansible.builtin.assert:
+        that:
+          - >-
+            probe_modules.results | rejectattr('skipped', 'defined')
+            | rejectattr('rc', 'equalto', 0) | list | length == 0
+        fail_msg: >-
+          Kernel module(s) {{ probe_modules.results | rejectattr('skipped', 'defined')
+          | rejectattr('rc', 'equalto', 0)
+          | map(attribute='item') | join(', ') }} are not available on this
+          {{ probe_env }} host. Install the matching kernel module package
+          (for example linux-modules-extra-*) or fix the kernel before
+          converging; the base role will load and persist them.
+      when: probe_env != 'lxc'
+
+    - name: Check LXC cgroup delegation and TUN access
+      ansible.builtin.command:
+        argv: [test, -w, "{{ item }}"]
+      loop:
+        - /sys/fs/cgroup/cgroup.subtree_control
+        - /dev/net/tun
+      register: probe_lxc_access
+      changed_when: false
+      failed_when: false
+      when: probe_env == 'lxc'
+
+    - name: Read active swap devices
+      ansible.builtin.command: swapon --show --noheadings
+      register: probe_swap
+      changed_when: false
+      when: base_disable_swap | bool
+
+    - name: Check LXC network sysctl availability
+      ansible.builtin.command:
+        argv: [sysctl, -n, "{{ item.key }}"]
+      loop: "{{ base_sysctls | dict2items }}"
+      register: probe_lxc_sysctls
+      changed_when: false
+      failed_when: false
+      when: probe_env == 'lxc'
+
+    - name: Check LXC guest sysctl writability
+      ansible.builtin.command:
+        argv: [test, -w, "/proc/sys/{{ item.key | replace('.', '/') }}"]
+      loop: "{{ base_sysctls | dict2items }}"
+      register: probe_lxc_writable
+      changed_when: false
+      failed_when: false
+      when:
+        - probe_env == 'lxc'
+        - item.key not in base_lxc_host_sysctls
+
+    - name: Require LXC provider sysctls and guest controls
+      ansible.builtin.assert:
+        that:
+          - >-
+            probe_lxc_sysctls.results | rejectattr('skipped', 'defined')
+            | rejectattr('rc', 'equalto', 0) | list | length == 0
+          - >-
+            probe_lxc_sysctls.results
+            | selectattr('item.key', 'in', base_lxc_host_sysctls)
+            | rejectattr('stdout', 'equalto', '1') | list | length == 0
+          - >-
+            probe_lxc_writable.results | rejectattr('skipped', 'defined')
+            | rejectattr('rc', 'equalto', 0) | list | length == 0
+          - not (base_disable_swap | bool) or probe_swap.stdout | trim | length == 0
+        fail_msg: >-
+          LXC requires host-provided bridge netfilter switches set to 1,
+          writable guest network sysctls, and no active host-owned swap.
+          Ask the provider to expose these facilities; the guest cannot
+          safely set host-owned switches or disable host swap.
+      when: probe_env == 'lxc'
+
+    - name: Require an identified uplink for IPv6 router advertisements
+      ansible.builtin.assert:
+        that:
+          - base_ra_interfaces | length > 0
+          - base_ra_interfaces | difference(ansible_interfaces) | length == 0
+        fail_msg: >-
+          Specify firewall_external_interface as an existing uplink when
+          neither default route identifies it; IPv6 forwarding needs RA on
+          that interface.
+      when: base_sysctls['net.ipv6.conf.all.forwarding'] | string == '1'
+
+    - name: Check LXC IPv6 router advertisement control writability
+      ansible.builtin.command:
+        argv: [test, -w, "/proc/sys/net/ipv6/conf/{{ item }}/accept_ra"]
+      loop: "{{ base_ra_interfaces }}"
+      register: probe_ra_writable
+      changed_when: false
+      failed_when: false
+      when: probe_env == 'lxc'
+
+    - name: Require LXC IPv6 router advertisement controls
+      ansible.builtin.assert:
+        that:
+          - probe_ra_writable.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+        fail_msg: >-
+          Provider must expose writable IPv6 accept_ra controls on uplinks
+          so the guest retains its IPv6 route when forwarding is enabled.
+      when: probe_env == 'lxc'
+
+    - name: Refuse an unsupported host
+      ansible.builtin.assert:
+        that:
+          - probe_cgroup.stat.exists
+          - >-
+            ['cpu', 'memory', 'pids']
+            | difference((probe_cgroup_controllers.content | b64decode).split())
+            | length == 0
+          - probe_tun.stat.exists
+          - probe_tun.stat.ischr | default(false)
+          - >-
+            probe_env != 'lxc' or
+            (probe_lxc_access.results | selectattr('rc', 'equalto', 0) | list | length == 2)
+        fail_msg: >-
+          This host needs cgroup v2 with cpu, memory, and pids controllers,
+          a character /dev/net/tun device, and (on LXC) writable delegated
+          cgroup subtree and TUN access. Ask the provider to expose them.

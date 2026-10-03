@@ -1,0 +1,8 @@
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../example/base
+namespace: example
+commonAnnotations:
+  cvp.example.com/overlay: non-production-smoke

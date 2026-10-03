@@ -1,0 +1,48 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+  annotations:
+    cvp.example.com/owner: cluster
+spec:
+  valuesContent: |-
+    additionalArguments:
+      - --api.dashboard=false
+      - --providers.kubernetesingress.ingressclass=traefik
+    ingressClass:
+      enabled: true
+      isDefaultClass: false
+      name: traefik
+    logs:
+      access:
+        enabled: true
+      general:
+        level: WARN
+    nodeSelector:
+      cvp.io/ingress: "true"
+    ports:
+      web:
+        expose:
+          default: true
+        redirectTo:
+          to: websecure
+          scheme: https
+          permanent: true
+      websecure:
+        expose:
+          default: true
+    providers:
+      kubernetesCRD:
+        enabled: false
+      kubernetesIngress:
+        enabled: true
+        publishedService:
+          enabled: true
+    service:
+      enabled: true
+      labels:
+        svccontroller.k3s.cattle.io/lbpool: public
+      spec:
+        externalTrafficPolicy: Local

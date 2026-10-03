@@ -1,0 +1,5 @@
+---
+creation_rules:
+  - path_regex: .+\.sops\.yaml$
+    encrypted_regex: ^(data|stringData)$
+    age: AGE_PUBLIC_RECIPIENT_REPLACE_ME

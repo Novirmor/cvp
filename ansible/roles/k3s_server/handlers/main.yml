@@ -1,0 +1,9 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Restart K3s server
+  ansible.builtin.systemd_service:
+    name: k3s.service
+    state: restarted

@@ -1,0 +1,13 @@
+[Unit]
+Description=CVP IPv6 to IPv4 ingress forwarder for port {{ ingress_v6_port }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP6-LISTEN:{{ ingress_v6_port }},fork,reuseaddr,ipv6only=1,bind=[::] TCP4:{{ ingress_v6_target_host }}:{{ ingress_v6_port }}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

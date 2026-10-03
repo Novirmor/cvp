@@ -1,0 +1,69 @@
+---
+- name: Validate backup inputs before enabling the timer
+  ansible.builtin.assert:
+    that:
+      - k3s_backup_age_recipient | length > 0
+      - k3s_backup_upload_command | length > 0
+      - k3s_backup_retention_days | int > 0
+    fail_msg: >-
+      Encrypted off-host K3s backup requires k3s_backup_age_recipient and an
+      k3s_backup_upload_command supplied outside Git.
+  when: k3s_backup_enabled | bool
+
+- name: Install backup tools
+  ansible.builtin.apt:
+    name:
+      - age
+      - sqlite3
+    state: present
+    update_cache: true
+
+- name: Create the local encrypted backup directory
+  ansible.builtin.file:
+    path: "{{ k3s_backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install the K3s SQLite and token backup script
+  ansible.builtin.template:
+    src: k3s-backup.j2
+    dest: "{{ k3s_backup_script_path }}"
+    owner: root
+    group: root
+    mode: "0700"
+  no_log: true
+
+- name: Install the backup service
+  ansible.builtin.template:
+    src: cvp-k3s-backup.service.j2
+    dest: "/etc/systemd/system/{{ k3s_backup_service_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the backup timer
+  ansible.builtin.template:
+    src: cvp-k3s-backup.timer.j2
+    dest: "/etc/systemd/system/{{ k3s_backup_timer_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Reload systemd units after backup changes
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Stop the backup service only when backups are disabled
+  ansible.builtin.systemd_service:
+    name: "{{ k3s_backup_service_name }}"
+    state: stopped
+    enabled: false
+  when: not k3s_backup_enabled | bool
+
+- name: Ensure the backup timer is in the requested state
+  ansible.builtin.systemd_service:
+    name: "{{ k3s_backup_timer_name }}"
+    state: "{{ 'started' if k3s_backup_enabled | bool else 'stopped' }}"
+    enabled: "{{ k3s_backup_enabled | bool }}"

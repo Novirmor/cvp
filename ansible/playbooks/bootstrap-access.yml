@@ -1,0 +1,91 @@
+---
+- name: Validate the access bootstrap before changing a host
+  hosts: wireguard
+  connection: local
+  become: false
+  gather_facts: false
+  run_once: true
+  vars:
+    bootstrap_admin_keys: >-
+      {{ lookup('ansible.builtin.env', 'CVP_BOOTSTRAP_ADMIN_KEYS')
+         | default('[]', true) | from_json }}
+  tasks:
+    - name: Require one target, root access, and approved public keys
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length == 1
+          - ansible_user == 'root'
+          - not ansible_become | bool
+          - bootstrap_admin_keys is sequence
+          - bootstrap_admin_keys is not string
+          - bootstrap_admin_keys is not mapping
+          - bootstrap_admin_keys | length > 0
+          - >-
+            bootstrap_admin_keys | select('match', bootstrap_key_pattern) | list | length
+            == bootstrap_admin_keys | length
+        fail_msg: >-
+          Limit bootstrap-access to one inventory node, connect as root
+          without sudo, and set CVP_BOOTSTRAP_ADMIN_KEYS to a JSON array of
+          approved SSH public keys.
+      vars:
+        bootstrap_key_pattern: >-
+          ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,2}( .*)?$
+      no_log: true
+
+- name: Establish the operator login without changing network policy
+  hosts: wireguard
+  become: false
+  gather_facts: false
+  vars:
+    bootstrap_admin_keys: >-
+      {{ lookup('ansible.builtin.env', 'CVP_BOOTSTRAP_ADMIN_KEYS') | from_json }}
+  tasks:
+    - name: Require a Debian-family host with apt
+      ansible.builtin.raw: >-
+        test -x /usr/bin/apt-get &&
+        grep -Eq '(^ID=(debian|ubuntu)$|^ID_LIKE=.*debian)' /etc/os-release
+      changed_when: false
+
+    - name: Check minimal Ansible prerequisites
+      ansible.builtin.raw: >-
+        test -x /usr/bin/python3 && command -v sudo &&
+        command -v modprobe && command -v sysctl &&
+        dpkg-query -W -f='${Status}' python3-apt 2>/dev/null |
+        grep -qx 'install ok installed'
+      register: bootstrap_prerequisites
+      changed_when: false
+      failed_when: false
+
+    - name: Install Python, sudo, and host-probe tools if absent
+      ansible.builtin.raw: >-
+        DEBIAN_FRONTEND=noninteractive apt-get update &&
+        DEBIAN_FRONTEND=noninteractive apt-get install -y
+        python3 python3-apt sudo kmod procps
+      when: bootstrap_prerequisites.rc != 0
+
+    - name: Create the operator account
+      ansible.builtin.user:
+        name: ops
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+        state: present
+
+    - name: Install approved SSH public keys for the operator
+      ansible.posix.authorized_key:
+        user: ops
+        key: "{{ item }}"
+        state: present
+        manage_dir: true
+      loop: "{{ bootstrap_admin_keys }}"
+      no_log: true
+
+    - name: Grant the operator passwordless sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/ops
+        content: "ops ALL=(ALL:ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: visudo -cf %s

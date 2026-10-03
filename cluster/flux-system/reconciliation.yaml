@@ -1,0 +1,111 @@
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: policy
+  namespace: flux-system
+spec:
+  deletionPolicy: Orphan
+  interval: 10m
+  path: ./cluster/infrastructure/policy/overlays/cluster
+  prune: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: policy
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: traefik
+      namespace: kube-system
+    - apiVersion: apps/v1
+      kind: DaemonSet
+      name: svclb-traefik
+      namespace: kube-system
+  interval: 10m
+  path: ./cluster/infrastructure/ingress/overlays/k3s
+  prune: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: data
+  namespace: flux-system
+  annotations:
+    cvp.example.com/status: reserved-until-a-stateful-service-is-approved
+spec:
+  dependsOn:
+    - name: policy
+  interval: 10m
+  path: ./cluster/data/overlays/cluster
+  prune: true
+  suspend: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+  annotations:
+    cvp.example.com/status: opt-in-non-production-smoke-overlay
+spec:
+  dependsOn:
+    - name: infrastructure
+  interval: 10m
+  path: ./cluster/apps/overlays/smoke
+  prune: true
+  suspend: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: operations
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infrastructure
+  interval: 10m
+  path: ./cluster/operations/overlays/cluster
+  prune: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age

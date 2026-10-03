@@ -1,0 +1,26 @@
+---
+base_packages: []
+base_lxc_host_sysctls:
+  - net.bridge.bridge-nf-call-iptables
+  - net.bridge.bridge-nf-call-ip6tables
+base_ra_interfaces: []
+base_sysctls:
+  net.ipv4.ip_forward: "1"
+  net.ipv6.conf.all.forwarding: "1"
+  net.bridge.bridge-nf-call-iptables: "1"
+  net.bridge.bridge-nf-call-ip6tables: "1"
+  net.ipv4.conf.all.src_valid_mark: "1"
+base_kernel_modules:
+  - br_netfilter
+  - overlay
+  - vxlan
+base_public_ingress_ports: []
+base_disable_swap: true
+base_manage_admin_user: false
+base_admin_user: cvp-admin
+base_admin_authorized_keys: []
+base_manage_sshd: false
+base_ssh_service_name: ssh
+base_ssh_port: 22
+base_journal_max_use: 500M
+base_journal_max_file_size: 50M

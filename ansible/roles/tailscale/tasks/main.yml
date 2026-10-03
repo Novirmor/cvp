@@ -1,0 +1,81 @@
+---
+- name: Install the Tailscale repository key
+  ansible.builtin.get_url:
+    url: "{{ tailscale_repo_url }}/{{ ansible_distribution | lower }}/{{ ansible_distribution_release }}.noarmor.gpg"
+    dest: "{{ tailscale_keyring_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Configure the pinned Tailscale package source
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by={{ tailscale_keyring_path }}]
+      {{ tailscale_repo_url }}/{{ ansible_distribution | lower }}
+      {{ ansible_distribution_release }} main
+    filename: tailscale
+    state: present
+
+- name: Prefer the configured Tailscale source
+  ansible.builtin.copy:
+    dest: /etc/apt/preferences.d/tailscale
+    content: |
+      Package: tailscale
+      Pin: origin "pkgs.tailscale.com"
+      Pin-Priority: 700
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install Tailscale
+  ansible.builtin.apt:
+    name: "{{ 'tailscale=' ~ tailscale_package_version if tailscale_package_version | length > 0 else 'tailscale' }}"
+    state: present
+    update_cache: true
+
+- name: Enable the Tailscale service
+  ansible.builtin.systemd_service:
+    name: tailscaled.service
+    state: started
+    enabled: true
+
+- name: Read Tailscale backend state
+  ansible.builtin.command: tailscale status --json
+  register: tailscale_status
+  changed_when: false
+  failed_when: false
+
+- name: Enroll Tailscale when an external auth key is supplied
+  ansible.builtin.command:
+    argv: "{{ ['tailscale', 'up', '--auth-key=' ~ tailscale_auth_key,
+               '--hostname=' ~ node_name,
+               '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false')]
+             + (['--login-server=' ~ tailscale_login_server] if tailscale_login_server | length > 0 else [])
+             + (
+               ['--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
+               if tailscale_advertise_tags | length > 0
+               else []
+             )
+             + tailscale_extra_up_args }}"
+  no_log: true
+  when:
+    - tailscale_auth_key | length > 0
+    - tailscale_status.rc != 0 or 'Running' not in tailscale_status.stdout
+
+- name: Reconcile mutable Tailscale settings on an enrolled host
+  ansible.builtin.command:
+    argv: "{{ ['tailscale', 'set',
+               '--hostname=' ~ node_name,
+               '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false')]
+             + (
+               ['--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
+               if tailscale_advertise_tags | length > 0
+               else []
+             )
+             + tailscale_extra_set_args }}"
+  register: tailscale_reconcile
+  changed_when: false
+  when:
+    - tailscale_status.rc == 0
+    - tailscale_status.stdout | trim | length > 0
+    - (tailscale_status.stdout | from_json).BackendState | default('') == 'Running'

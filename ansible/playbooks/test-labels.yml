@@ -1,0 +1,56 @@
+---
+- name: Validate inventory node tags and independent edge cases
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Validate the configured inventory before any negative cases
+      ansible.builtin.include_tasks: tasks/validate-node-tags.yml
+      vars:
+        node_tag_validation_hosts: "{{ groups['wireguard'] | default([]) }}"
+
+    - name: Register valid custom labels and taints
+      ansible.builtin.add_host:
+        name: valid-tag-host
+        node_name: valid-tag-host
+        k3s_node_labels: ['svccontroller.k3s.cattle.io/needs_reconcile=', 'cvp.io/gpu=false']
+        k3s_node_taints: ['dedicated.example/database:NoSchedule', 'testing=hello.world:NoExecute']
+
+    - name: Validate valid declarations in isolation
+      ansible.builtin.include_tasks: tasks/validate-node-tags.yml
+      vars:
+        node_tag_validation_hosts: [valid-tag-host]
+
+    - name: Check each invalid declaration independently
+      ansible.builtin.include_tasks: tasks/test-invalid-node-tags.yml
+      loop:
+        - {name: unmanaged-domain, labels: ['example.com/zone=a'], taints: [], expected: managed_domains_pattern}
+        - name: reserved-label
+          labels: ['kubernetes.io/arch=amd64']
+          taints: []
+          domains: ['^kubernetes\.io/']
+          expected: reserved_pattern
+        - {name: derived-role, labels: ['cvp.io/role=agent'], taints: [], expected: role=}
+        - {name: catalog-typo, labels: ['cvp.io/copmute=true'], taints: [], expected: catalog_pattern}
+        - {name: invalid-effect, labels: [], taints: ['dedicated=example:Always'], expected: taint_pattern}
+        - {name: name-mismatch, node_name: wrong-name, labels: [], taints: []}
+        - {name: bad-prefix-wildcard, domains: ['^.*'], labels: [], taints: []}
+        - {name: bad-prefix-broad, domains: ['^cvp\.io'], labels: [], taints: []}
+        - {name: bad-prefix-meta, domains: ['^cvp.io/'], labels: [], taints: []}
+        - {name: bad-prefix-dns, domains: ['^a_foo\.io/'], labels: [], taints: []}
+        - {name: bad-label-prefix, labels: ['Upper.example/label=x'], taints: []}
+        - {name: bad-label-quote, labels: ['cvp.io/compute="true'], taints: []}
+        - {name: bad-label-newline, labels: ['cvp.io/compute=true\n'], taints: []}
+        - {name: bad-taint-prefix, labels: [], taints: ['UPPER.example/key:NoSchedule']}
+        - {name: bad-taint-reserved, labels: [], taints: ['node.kubernetes.io/not-ready:NoSchedule']}
+        - {name: bad-taint-duplicate, labels: [], taints: ['dedicated=a:NoSchedule', 'dedicated=b:NoExecute']}
+        - {name: bad-taint-value, labels: [], taints: ['key=a"b:NoSchedule']}
+      loop_control:
+        loop_var: case
+
+    - name: Run Node patch regression tests in the Ansible Python environment
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/test_node_patches.py"
+      changed_when: false

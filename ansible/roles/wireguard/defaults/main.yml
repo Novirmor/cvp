@@ -1,0 +1,9 @@
+---
+wireguard_interface: wg0
+wireguard_port: 51820
+wireguard_address: ""
+wireguard_private_key_file: /etc/wireguard/privatekey
+wireguard_mtu: 1420
+wireguard_persistent_keepalive: 25
+wireguard_manage_config: true
+wireguard_peers_group: wireguard

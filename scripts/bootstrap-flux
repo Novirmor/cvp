@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root_dir"
+
+: "${FLUX_GITHUB_OWNER:?Set FLUX_GITHUB_OWNER to the reviewed GitHub owner.}"
+: "${FLUX_GITHUB_REPOSITORY:?Set FLUX_GITHUB_REPOSITORY to the reviewed repository.}"
+: "${FLUX_KUBE_CONTEXT:?Set FLUX_KUBE_CONTEXT to the reviewed target context.}"
+: "${FLUX_GIT_SSH_KEY_FILE:?Set FLUX_GIT_SSH_KEY_FILE to a temporary private deploy key.}"
+: "${FLUX_GIT_KNOWN_HOSTS_FILE:?Set FLUX_GIT_KNOWN_HOSTS_FILE to a reviewed GitHub known_hosts file.}"
+: "${SOPS_AGE_KEY_FILE:?Set SOPS_AGE_KEY_FILE to the recovered age identity.}"
+: "${FLUX_BOOTSTRAP_TIMEOUT:=5m}"
+
+command -v kubectl >/dev/null || { printf '%s\n' 'kubectl is required' >&2; exit 1; }
+
+[[ "$FLUX_KUBE_CONTEXT" != -* ]] || {
+  printf '%s\n' 'FLUX_KUBE_CONTEXT must name a Kubernetes context' >&2
+  exit 1
+}
+
+for required_file in "$FLUX_GIT_SSH_KEY_FILE" "$FLUX_GIT_KNOWN_HOSTS_FILE" "$SOPS_AGE_KEY_FILE"; do
+  [[ -f "$required_file" ]] || {
+    printf 'required file does not exist: %s\n' "$required_file" >&2
+    exit 1
+  }
+done
+
+expected_url="ssh://git@github.com/${FLUX_GITHUB_OWNER}/${FLUX_GITHUB_REPOSITORY}.git"
+grep -Fq "url: ${expected_url}" cluster/flux-system/source.yaml || {
+  printf 'cluster/flux-system/source.yaml must declare %s\n' "$expected_url" >&2
+  exit 1
+}
+
+kubectl config get-contexts -o name | grep -Fqx "$FLUX_KUBE_CONTEXT" || {
+  printf 'Kubernetes context does not exist: %s\n' "$FLUX_KUBE_CONTEXT" >&2
+  exit 1
+}
+
+kubectl --context="$FLUX_KUBE_CONTEXT" cluster-info >/dev/null
+
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/namespace.yaml
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/gotk-components.yaml
+kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
+  --for=condition=Available deployment --all --timeout="$FLUX_BOOTSTRAP_TIMEOUT"
+
+kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system create secret generic flux-system \
+  --from-file=identity="$FLUX_GIT_SSH_KEY_FILE" \
+  --from-file=known_hosts="$FLUX_GIT_KNOWN_HOSTS_FILE" --dry-run=client -o yaml | \
+  kubectl --context="$FLUX_KUBE_CONTEXT" apply -f -
+
+kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system create secret generic sops-age \
+  --from-file=age.agekey="$SOPS_AGE_KEY_FILE" --dry-run=client -o yaml | \
+  kubectl --context="$FLUX_KUBE_CONTEXT" apply -f -
+
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/source.yaml
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/sync.yaml
+kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
+  --for=condition=Ready gitrepository/flux-system --timeout="$FLUX_BOOTSTRAP_TIMEOUT"
+
+for reconciliation in flux-system policy infrastructure operations; do
+  kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
+    --for=condition=Ready "kustomization/${reconciliation}" --timeout="$FLUX_BOOTSTRAP_TIMEOUT"
+done
+
+printf 'Flux bootstrap complete for context %s.\n' "$FLUX_KUBE_CONTEXT"

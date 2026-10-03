@@ -1,0 +1,33 @@
+---
+- name: Probe the converged WireGuard underlay and peer MTU
+  hosts: wireguard
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read WireGuard state
+      ansible.builtin.command: wg show {{ wireguard_interface }}
+      changed_when: false
+
+    - name: Read WireGuard interface MTU
+      ansible.builtin.command: ip link show dev {{ wireguard_interface }}
+      changed_when: false
+
+    - name: Probe every peer with a no-fragment packet
+      ansible.builtin.command:
+        argv:
+          - ping
+          - -c
+          - "2"
+          - -W
+          - "2"
+          - -M
+          - do
+          - -s
+          - "{{ wireguard_mtu_probe_payload }}"
+          - -I
+          - "{{ wireguard_interface }}"
+          - "{{ hostvars[item].wireguard_address }}"
+      changed_when: false
+      loop: "{{ groups[wireguard_peers_group] | difference([inventory_hostname]) }}"
+      loop_control:
+        label: "{{ item }}"

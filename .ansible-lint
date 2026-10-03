@@ -1,0 +1,14 @@
+---
+profile: safety
+
+exclude_paths:
+  - .github/
+  - ansible/collections/
+  - cluster/
+
+skip_list:
+  - var-naming[no-role-prefix]
+  - yaml
+
+warn_list:
+  - jinja[spacing]

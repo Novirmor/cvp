@@ -1,0 +1,65 @@
+---
+# Deliberately non-compliant workloads used as negative tests: scripts/test-manifests
+# asserts that every rule below fires. Do not "fix" this fixture; do not deploy it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noncompliant-deployment
+  namespace: example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: noncompliant
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: noncompliant
+    spec:
+      hostNetwork: true
+      hostIPC: true
+      hostPID: true
+      volumes:
+        - name: host-modules
+          hostPath:
+            path: /lib/modules
+      containers:
+        - name: web
+          image: nginx:latest
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            capabilities:
+              add:
+                - NET_ADMIN
+        - name: sidecar
+          image: nginx:1.27
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: noncompliant-cronjob
+  namespace: example
+spec:
+  schedule: "17 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: busybox:1.36
+              securityContext:
+                runAsUser: 0
+              volumeMounts:
+                - name: host-tmp
+                  mountPath: /host-tmp
+              resources:
+                requests:
+                  cpu: 10m
+          volumes:
+            - name: host-tmp
+              hostPath:
+                path: /tmp

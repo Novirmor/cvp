@@ -1,0 +1,13 @@
+---
+firewall_manage: true
+firewall_external_interface: ""
+firewall_public_ingress_ports:
+  - 80
+  - 443
+firewall_ssh_port: 22
+firewall_ssh_ipv4_source_cidrs: []
+firewall_ssh_ipv6_source_cidrs: []
+firewall_wireguard_ipv4_source_cidrs:
+  - 0.0.0.0/0
+firewall_wireguard_ipv6_source_cidrs:
+  - ::/0

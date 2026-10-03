@@ -1,0 +1,26 @@
+# Copy this file to an ignored local *.tfvars file and replace every
+# placeholder before planning. The provider token must come from the
+# CLOUDFLARE_API_TOKEN environment variable or a secret manager.
+
+zone_id = "replace-with-32-character-zone-id"
+
+# 198.51.100.0/24 and 2001:db8::/32 are documentation-only addresses.
+records = {
+  # ingress_a = {
+  #   name    = "app.example.com"
+  #   type    = "A"
+  #   content = "198.51.100.10"
+  #   ttl     = 1
+  #   proxied = true
+  #   comment = "K3s public ingress IPv4; update during an ingress relocation."
+  # }
+
+  ingress_aaaa = {
+    name    = "app.example.com"
+    type    = "AAAA"
+    content = "2001:db8::10"
+    ttl     = 1
+    proxied = true
+    comment = "K3s public ingress IPv6; update during an ingress relocation."
+  }
+}

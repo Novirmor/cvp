@@ -1,0 +1,100 @@
+---
+# A compliant workload used as a positive test: it must pass every rule in
+# tests/policy. It mirrors the security baseline of cluster/apps/example.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compliant-deployment
+  namespace: example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: compliant
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: compliant
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          # yamllint disable-line rule:line-length
+          image: nginxinc/nginx-unprivileged:1.27.1-alpine@sha256:c149247b2e5997ce60f337bcb19f61c0c09b906224e6f1683be64248c814d7e1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+              ephemeral-storage: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: compliant-cronjob
+  namespace: example
+spec:
+  schedule: "17 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: prepare
+              image: alpine:3.20.3@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                  ephemeral-storage: 16Mi
+                limits:
+                  cpu: 50m
+                  memory: 64Mi
+                  ephemeral-storage: 64Mi
+          containers:
+            - name: job
+              image: alpine:3.20.3@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 32Mi
+                  ephemeral-storage: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+                  ephemeral-storage: 128Mi

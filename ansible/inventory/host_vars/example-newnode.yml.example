@@ -1,0 +1,56 @@
+---
+# Template for onboarding a node. Copy to ansible/inventory/host_vars/<node>.yml,
+# fill every field, and register the host in hosts.yml. The .yml.example suffix
+# keeps this file out of inventory loading; see docs/runbooks/node-onboarding.md.
+
+ansible_host: ""            # stable DNS name or address for SSH
+ansible_port: 22
+node_name: ""               # must equal the inventory host key
+
+# LXC guests and ordinary VMs (or metal) are both supported.
+#   lxc   : shares the host kernel; the probe requires overlay registered and
+#           br_netfilter/vxlan loaded or built into the host, and convergence only
+#           verifies that state — the guest cannot load or persist modules.
+#   vm    : owns its kernel; the probe requires the modules to be available and
+#           convergence loads them and persists them across reboots.
+#   metal : like vm, without a hypervisor.
+#   auto  : accepts whatever systemd-detect-virt reports.
+# Pin the real environment instead of leaving auto: a pinned value that later
+# disagrees (provider migration, rebuilt image) fails probe, site, and verify.
+node_virtualization: auto   # replace with lxc | vm | metal before onboarding
+
+wireguard_address: ""       # free address in the operator-selected mesh subnet
+wireguard_endpoint: ""      # "[public-ipv6]:51820" or "public-ipv4:51820"
+wireguard_public_key: ""    # wg pubkey of the private key kept in the secret store
+
+tailscale_address: ""       # assigned at enrollment; recorded afterwards
+tailscale_advertise_tags:
+  - tag:k3s
+
+k3s_role: agent             # worker-only by default; server requires a reviewed quorum decision
+k3s_server_init: false      # true only for the one cluster-init server
+k3s_tls_sans: []            # extra API SANs for this node (its wireguard_address on init)
+
+# Node tags. Rules enforced by validation (task test runs it offline):
+#   - cvp.io/role is derived from k3s_role; declaring it fails validation.
+#   - cvp.io/ accepts only the boolean catalog tags from ARCHITECTURE.md
+#     (compute, storage, stateful, ingress, gpu, system); typos fail validation.
+#   - kubernetes.io/ and k8s.io/ keys are reserved by the API.
+#   - every label key must match an escaped literal DNS prefix in k3s_managed_label_domains
+#     (group_vars/all.yml): declared labels are both applied and reconciled
+#     away when removed from inventory, so an unmanaged domain is rejected.
+k3s_node_labels:
+  - cvp.io/compute=true
+  # Custom tag domains: first add the escaped prefix to k3s_managed_label_domains
+  # in group_vars/all.yml (one reviewed change), then declare labels here, e.g.:
+  # - example.com/zone=fra
+  # Workloads select custom tags with node selectors or affinity exactly like
+  # cvp.io tags; removing a declared label reconciles it off the node.
+k3s_node_taints: []         # e.g. ["dedicated.example/database:NoSchedule"]
+
+# Storage intent for storage nodes; leave disabled on compute-only nodes.
+storage_enabled: false
+storage_device: ""          # by-id device path once accepted at the storage gate
+storage_manage_device: false
+
+...

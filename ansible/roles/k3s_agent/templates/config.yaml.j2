@@ -1,0 +1,10 @@
+server: "https://{{ hostvars[k3s_server_host].wireguard_address }}:6443"
+token-file: "{{ k3s_agent_token_path }}"
+data-dir: "{{ k3s_data_dir }}"
+node-name: "{{ node_name }}"
+node-ip: "{{ wireguard_address }}"
+flannel-iface: "{{ k3s_flannel_iface }}"
+node-label:
+{% for label in k3s_node_labels %}
+  - "{{ label }}"
+{% endfor %}

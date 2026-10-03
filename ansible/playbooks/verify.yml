@@ -1,0 +1,245 @@
+---
+- name: Verify host and K3s state without changing it
+  hosts: wireguard
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read WireGuard state
+      ansible.builtin.command: wg show {{ wireguard_interface }}
+      register: verify_wireguard
+      changed_when: false
+
+    - name: Read WireGuard address
+      ansible.builtin.command: ip -o address show dev {{ wireguard_interface }}
+      register: verify_wireguard_address
+      changed_when: false
+
+    - name: Verify the expected WireGuard address is configured
+      ansible.builtin.assert:
+        that:
+          - wireguard_address in verify_wireguard_address.stdout
+        fail_msg: >-
+          {{ wireguard_interface }} is up but does not have {{ wireguard_address }}.
+
+    - name: Check Tailscale without changing enrollment
+      ansible.builtin.command: tailscale status --json
+      register: verify_tailscale
+      changed_when: false
+      failed_when: false
+
+    # Evidence for gate records: which environment each node actually runs on.
+    - name: Detect the virtualization environment
+      ansible.builtin.command: systemd-detect-virt
+      register: verify_virt
+      changed_when: false
+      failed_when: false
+
+    - name: Require a conclusive virtualization detection
+      ansible.builtin.assert:
+        that:
+          - verify_virt.rc in [0, 1]
+          - >-
+            (verify_virt.rc == 1 and verify_virt.stdout | trim == 'none')
+            or (verify_virt.rc == 0 and verify_virt.stdout | trim in
+                (node_container_ids + node_vm_ids))
+        fail_msg: >-
+          systemd-detect-virt failed or returned an unknown environment
+          (rc={{ verify_virt.rc }}, output='{{ verify_virt.stdout | trim }}').
+          Cannot verify an unclassified host.
+
+    - name: Classify the detected environment
+      ansible.builtin.set_fact:
+        verify_detected_env: >-
+          {{ 'lxc' if verify_virt.stdout | trim in node_container_ids
+             else 'vm' if verify_virt.stdout | trim in node_vm_ids
+             else 'metal' }}
+
+    - name: Require a pinned environment declaration to match reality
+      ansible.builtin.assert:
+        that:
+          - node_virtualization == verify_detected_env
+        fail_msg: >-
+          node_virtualization pins {{ node_virtualization }} but
+          systemd-detect-virt reports '{{ verify_virt.stdout | trim | default('none', true) }}'
+          ({{ verify_detected_env }}). The host moved to a different
+          environment than the inventory records; reconcile the inventory and
+          re-run the probe before accepting this node as verified.
+      when: node_virtualization != 'auto'
+
+    - name: Report the effective environment
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} runs on
+          '{{ verify_virt.stdout | trim | default('none', true) }}'
+          ({{ verify_detected_env }}; declared: {{ node_virtualization }})
+
+    - name: Read live network sysctls
+      ansible.builtin.command:
+        argv: [sysctl, -n, "{{ item.key }}"]
+      loop: "{{ base_sysctls | dict2items }}"
+      register: verify_sysctls
+      changed_when: false
+      failed_when: false
+
+    - name: Require live network sysctls to match inventory
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - item.stdout | trim == item.item.value | string
+        fail_msg: >-
+          Live {{ item.item.key }} is '{{ item.stdout | trim }}'
+          (rc={{ item.rc }}); expected {{ item.item.value }}.
+      loop: "{{ verify_sysctls.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Read live IPv6 router advertisement settings
+      ansible.builtin.command:
+        argv: [sysctl, -n, "net.ipv6.conf.{{ item }}.accept_ra"]
+      loop: "{{ base_ra_interfaces }}"
+      register: verify_ra
+      changed_when: false
+      failed_when: false
+      when: base_sysctls['net.ipv6.conf.all.forwarding'] | string == '1'
+
+    - name: Require router advertisements on forwarding-enabled uplinks
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - item.stdout | trim == '2'
+        fail_msg: >-
+          {{ item.item }} needs live IPv6 accept_ra=2 with forwarding enabled;
+          observed '{{ item.stdout | trim }}' (rc={{ item.rc }}).
+      loop: "{{ verify_ra.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: base_sysctls['net.ipv6.conf.all.forwarding'] | string == '1'
+
+    - name: Check WireGuard service
+      ansible.builtin.systemd_service:
+        name: wg-quick@{{ wireguard_interface }}.service
+      register: verify_wireguard_service
+      changed_when: false
+
+    - name: Check firewall syntax
+      ansible.builtin.command: nft -c -f /etc/nftables.conf
+      register: verify_firewall
+      changed_when: false
+
+    - name: Check firewall service
+      ansible.builtin.systemd_service:
+        name: nftables.service
+      register: verify_firewall_service
+      changed_when: false
+
+    - name: Check K3s service
+      ansible.builtin.systemd_service:
+        name: "{{ 'k3s.service' if k3s_role == 'server' else 'k3s-agent.service' }}"
+      register: verify_k3s_service
+      changed_when: false
+
+    - name: Check the exact local-path mountpoint
+      ansible.builtin.command: findmnt --noheadings --output UUID --mountpoint {{ storage_mountpoint }}
+      register: verify_storage_mount
+      changed_when: false
+      failed_when: false
+
+    - name: Verify required host services
+      ansible.builtin.assert:
+        that:
+          - verify_wireguard_service.status.ActiveState == 'active'
+          - verify_k3s_service.status.ActiveState == 'active'
+          - verify_tailscale.rc == 0
+          - "'Running' in verify_tailscale.stdout"
+          - verify_firewall.rc == 0
+          - verify_firewall_service.status.ActiveState == 'active'
+          - verify_storage_mount.rc == 0 or storage_device | length == 0
+        fail_msg: >-
+          One or more host checks failed. Inspect the registered command output
+          and systemd journal before changing the host.
+
+    - name: Wait for Flannel to publish the subnet environment
+      ansible.builtin.wait_for:
+        path: /run/flannel/subnet.env
+        state: present
+        timeout: 300
+      when: k3s_role is defined
+
+    - name: Read the Flannel MTU
+      ansible.builtin.command:
+        argv:
+          - awk
+          - -F=
+          - '$1 == "FLANNEL_MTU" { print $2 }'
+          - /run/flannel/subnet.env
+      register: verify_flannel_mtu
+      changed_when: false
+      when: k3s_role is defined
+
+    - name: Require the measured pod MTU to match the design
+      ansible.builtin.assert:
+        that:
+          - verify_flannel_mtu.stdout | trim == (k3s_expected_pod_mtu | string)
+        fail_msg: >-
+          Flannel reports pod MTU {{ verify_flannel_mtu.stdout | trim | default('unknown') }};
+          expected {{ k3s_expected_pod_mtu }} after the WireGuard/VXLAN path test.
+          A missing or different MTU is a verification failure, not a skip.
+      when: k3s_role is defined
+
+- name: Verify the control plane from a server
+  hosts: k3s_servers
+  become: true
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Read the cluster nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+        api_version: v1
+        kind: Node
+      register: verify_k8s_nodes
+
+    - name: Show cluster node readiness
+      ansible.builtin.debug:
+        msg: >-
+          {{ verify_k8s_nodes.resources
+             | map(attribute='metadata.name')
+             | list }} with Ready conditions
+          {{ verify_k8s_nodes.resources
+             | map(attribute='status.conditions')
+             | select('defined')
+             | map('selectattr', 'type', 'equalto', 'Ready')
+             | map('first')
+             | map(attribute='status')
+             | list }}
+
+    - name: Require every inventory node to be present and Ready
+      ansible.builtin.assert:
+        that:
+          - verify_k8s_nodes.resources | length == groups['wireguard'] | length
+          - >-
+            groups['wireguard']
+            | difference(verify_k8s_nodes.resources | map(attribute='metadata.name') | list)
+            | length == 0
+          - >-
+            verify_k8s_nodes.resources
+            | selectattr('metadata.name', 'in', groups['wireguard'])
+            | map(attribute='status.conditions')
+            | select('defined')
+            | map('selectattr', 'type', 'equalto', 'Ready')
+            | map('first')
+            | list | length == groups['wireguard'] | length
+          - >-
+            verify_k8s_nodes.resources
+            | selectattr('metadata.name', 'in', groups['wireguard'])
+            | map(attribute='status.conditions')
+            | select('defined')
+            | map('selectattr', 'type', 'equalto', 'Ready')
+            | map('first')
+            | map(attribute='status')
+            | select('ne', 'True')
+            | list | length == 0
+        fail_msg: >-
+          Expected every inventory node ({{ groups['wireguard'] | join(', ') }})
+          to be present and Ready; observed:
+          {{ verify_k8s_nodes.resources | map(attribute='metadata.name') | list }}.

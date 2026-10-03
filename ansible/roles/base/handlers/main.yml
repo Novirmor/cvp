@@ -1,0 +1,16 @@
+---
+- name: Validate SSH configuration
+  ansible.builtin.command: sshd -t
+  listen: Reload SSH
+  changed_when: false
+
+- name: Reload SSH
+  ansible.builtin.systemd_service:
+    name: "{{ base_ssh_service_name }}.service"
+    state: reloaded
+  listen: Reload SSH
+
+- name: Restart journald
+  ansible.builtin.systemd_service:
+    name: systemd-journald.service
+    state: restarted
