@@ -26,6 +26,27 @@ chooses node count, server/agent roles, ingress placement, and storage intent.
 identify an explicitly selected initial server before convergence. Only that
 server has `k3s_server_init: true`.
 
+Site validates the complete topology on the controller before host access, even
+for a limited run. Server and agent groups exclusively partition the WireGuard
+group, each node declares its matching role and boolean init flag, and exactly
+one mesh node belongs to `ingress`. Mesh addresses are unique usable IPv4
+addresses in one `/24`, public keys are unique, and all nodes agree on the init
+host, designated server, datastore, and local-storage path. SQLite requires
+exactly one server.
+
+Persistent host settings and credentials are supplied through the external
+`cvp/operator.yml` under `XDG_CONFIG_HOME` (default `~/.config`), or an explicit
+`CVP_OPERATOR_CONFIG_FILE`. Host convergence and probes load its validated
+`cvp_operator_defaults` and `cvp_operator_hosts` mappings before host access.
+Connection and node identity remain in inventory; per-node credentials and
+destructive confirmations cannot be distributed through operator defaults.
+The file is literal data; only `wireguard_private_key` and `tailscale_auth_key`
+accept `{env: NAME}` credential references. Onboarding pins the file digest or
+its absence and checks API readiness and all existing inventory membership,
+including roles, mesh addresses, and Ready state. Unexpected nodes, missing
+existing nodes, and unconfirmed additional servers block onboarding. The check
+is repeated under lifecycle locks before convergence.
+
 For example, `server1` could initialize the cluster using the synthetic mesh
 address `192.0.2.1`. These are documentation values, not provisioned resources.
 Initial bootstrap uses the host bootstrap runbook; the onboarding helper adds
@@ -41,8 +62,12 @@ reboots. The probe, the base role, and the verification playbook classify
 environments with the same shared identifier lists, and a pinned declaration
 that disagrees with the detected environment fails all three.
 
-All nodes remain schedulable; labels, taints, affinity, resource requests,
-and limits define intentional placement.
+All nodes are intended to remain schedulable after bootstrap; labels, taints,
+affinity, resource requests, and limits define intentional placement. New nodes
+register with the reserved `cvp.io/bootstrap=true:NoSchedule` taint and
+`cvp.io/bootstrap-quarantine=true` label. A single concurrency-checked API patch
+per node applies desired labels and taints and removes the quarantine before
+lifecycle ownership is released. These reserved keys cannot be set in inventory.
 
 ## Node tags and allocation
 
@@ -65,9 +90,10 @@ selectors all match); a workload that accepts either uses multiple
 affecting future scheduling; existing pods are not evicted by a node-label
 change. Tag changes follow the same review path as ingress or storage
 changes. Taints are optional per node (`k3s_node_taints`) and are reconciled
-through the Kubernetes API, but Ansible only removes taints recorded as its
-own in the `cvp.io/managed-taints` Node annotation. Kubernetes/controller
-taints are never cleared merely because they are absent from inventory.
+through the Kubernetes API. Apart from the reserved bootstrap quarantine,
+Ansible only removes taints recorded as its own in the `cvp.io/managed-taints`
+Node annotation. Kubernetes/controller taints are never cleared merely because
+they are absent from inventory.
 
 Ansible reconciles the `cvp.io/*` and `svccontroller.k3s.cattle.io/*` label
 namespaces through the `kubernetes.core` collection; it does not manage other
@@ -88,7 +114,7 @@ domains are never modified or removed.
 OpenTofu owns:
 
 - Cloudflare zone records and provider-level policy.
-- Tailscale ACLs, tags, and split-DNS policy.
+- Tailscale ACLs, tag ownership, and split-DNS policy.
 - Encrypted remote state for those resources.
 
 It does not create Kubernetes resources or configure hosts.
@@ -108,8 +134,30 @@ Ansible owns:
 - The host-side prerequisites for Flux bootstrap, but not Flux or SOPS secrets.
 
 Ansible does not apply application, database, ingress, certificate, monitoring,
-or other ordinary Kubernetes resources. It may use `kubectl` only for the
-one-time GitOps bootstrap or documented break-glass recovery.
+or other ordinary Kubernetes resources. It uses the Kubernetes API for Node
+reconciliation and read-only health checks, including delegated `kubectl`
+readiness checks. Imperative workload changes remain confined to documented
+bootstrap or break-glass recovery.
+
+Site acquires `/var/lib/cvp/lifecycle.lock` on the full selected host set before
+host convergence. Mutating `--limit` selections must include
+`k3s_cluster_init_host` so the shared API/credential dependency is locked. Every
+phase uses `any_errors_fatal`; ownership is released only after successful Node
+reconciliation. Restore uses the same lifecycle lock. Failed operations retain
+their locks without automatic expiry or stealing. Operators must inspect the
+state, verify no owner is still running, and resolve recovery before explicit
+cleanup.
+
+When operator-account management is enabled, Ansible owns its complete SSH
+authorized-key set and removes omitted keys. SSH hardening is checked against
+effective daemon settings. WireGuard rotation requires a new matching key pair
+and an explicit host confirmation; peer updates are coordinated maintenance,
+not an atomic or uninterrupted-service operation.
+
+Journald, SSH, and IPv6 ingress activation records bind configuration fingerprints
+to systemd invocation IDs after successful activation; ingress also checks that
+the expected process owns its listener. Failed activation leaves no success
+record, allowing a later run to retry unchanged pending configuration.
 
 ### K3s and Flux: cluster layer
 
@@ -156,7 +204,21 @@ WireGuard is the node underlay, not an application service mesh. K3s nodes use
 their operator-assigned mesh addresses as internal node addresses. Flannel uses
 `wg0` as its interface and the VXLAN backend, avoiding a second WireGuard layer.
 
-The host firewall allows these cluster ports only on `wg0`:
+WireGuard convergence uses `wg syncconf` on the live interface, with in-place
+address/MTU reconciliation, instead of restarting `wg-quick` or its K3s
+dependents. The supported shape is the repository's single IPv4 `/24` with peer
+`/32` routes inside it; interface identity/address migrations and unsupported
+configuration require explicit coordinated maintenance. Unchanged endpoint
+intent preserves authenticated roaming; changed endpoint intent is applied.
+Live verification accepts dynamic learned/resolved endpoints rather than
+requiring equality to the configured hostname or address, while checking the
+keys, peers, AllowedIPs, keepalives, port, MTU, address, and applied fingerprint.
+It also requires the kernel-connected mesh `/24` route, including with no peers,
+and direct effective routes to every peer. Route drift on an active interface
+requires explicit maintenance; absent/down interfaces are checked after startup
+or in-place recovery before successful activation is recorded.
+
+The host firewall permits these node-to-node cluster paths on `wg0`:
 
 | Port | Scope | Purpose |
 | --- | --- | --- |
@@ -166,8 +228,39 @@ The host firewall allows these cluster ports only on `wg0`:
 | UDP 8472 | all nodes | Flannel VXLAN |
 | TCP 10250 | all nodes | Kubelet API and metrics |
 
-Public WireGuard endpoints accept the mesh UDP port only from known peer
-addresses where the provider permits stable filtering.
+Tailscale separately permits SSH and API access, plus ingress testing on ingress
+nodes; pods can reach the API and kubelet through their configured pod CIDR.
+WireGuard endpoint source allowlists default to all sources, with peer keys
+providing authentication. Narrow the allowlists to stable peer endpoints when
+available.
+
+Firewall administration preflight requires either an explicit source CIDR
+matching the current SSH client or exact established-socket kernel binding to
+the private interface and a direct matching return route. Stock unbound sshd
+therefore needs a host-scoped `/32` or `/128`, including the client's Tailscale
+source address for ordinary private SSH. If session metadata is unavailable,
+an independently verified source CIDR remains mandatory. Backend `Running`
+and private destination addresses alone cannot authorize activation.
+
+The firewall identifies IPv4 and IPv6 public uplinks separately. New external
+forwarding is allowed only for DNAT traffic whose original destination is an
+ingress uplink address and approved TCP port, preserving established and private
+cluster paths. This complements input filtering; pod-directed DNAT traffic
+bypasses host INPUT. nftables reload and stop operations affect only the owned
+`cvp_filter` table.
+
+Convergence records the applied configuration hash and live owned-table state;
+read-only verification detects a missing or changed table and unapplied files.
+Probes and verification still perform read-only checks under `--check`.
+Verification delegates API readiness and Node reads to `k3s_server_host`, even
+with an agent-only limit, and requires only selected nodes to be Ready with
+their exact mesh InternalIP.
+
+Kube-proxy uses iptables mode and restricts NodePort addresses to IPv4 loopback,
+the node's exact WireGuard IPv4 address, and `::1/128`; specifying the IPv6 family
+avoids an implicit wildcard. LoadBalancer NodePort allocation remains enabled
+because ServiceLB with `externalTrafficPolicy: Local` needs it. Public exposure
+is constrained by both this address selection and the host forwarding policy.
 
 Because packets are encapsulated by both VXLAN and WireGuard, the implementation
 must measure path MTU and set a verified pod MTU. Large cross-node TCP and UDP
@@ -181,10 +274,11 @@ use Kubernetes Services directly.
 K3s servers use embedded etcd by default. The operator selects server membership
 and reviews quorum impact before adding or removing a server. A three-server
 configuration tolerates one server failure; a single server does not.
-The explicitly selected cluster-init server bootstraps etcd and
-generates the shared server token, agent token, and secrets-encryption key.
-Ansible distributes those files to the joining servers before their first
-start, so all supervisors share the same credentials and encryption key.
+The explicitly selected cluster-init server bootstraps etcd. K3s generates its
+server token and secrets-encryption configuration; Ansible provisions the
+dedicated agent token and copies the server/agent tokens to joining servers.
+K3s itself distributes secrets-encryption material through datastore bootstrap;
+Ansible does not manually copy the encryption configuration.
 Loss of quorum requires etcd recovery procedures. A deliberate single-server
 setup may instead use SQLite. Ansible does not run `kubectl` for node settings;
 labels and taints are reconciled with the `kubernetes.core` modules.
@@ -199,13 +293,31 @@ The K3s configuration must:
 - Keep packaged CoreDNS, Traefik, ServiceLB, metrics-server, and network policy
   unless a measured problem justifies replacing one.
 
-The K3s etcd snapshot, the server and agent tokens, the node marker, and the
-recorded K3s version are one recovery unit. All members are encrypted and
-copied off-host. Application volume data is a separate recovery unit. Restore
-stops the other servers, resets one target from the snapshot
-(`k3s server --cluster-reset --cluster-reset-restore-path`), and the remaining
-servers rejoin or are rebuilt from the surviving quorum; a disposable restore
-drill is mandatory.
+The K3s snapshot, server and agent tokens, node marker, and serving binary's
+version form one encrypted recovery unit. Backup-enabled servers publish unique
+bundles containing the archive and its checksum; both must be copied off-host.
+Backup enablement is persistent operator configuration. Disabling an enabled or
+busy backup schedule requires a host-specific confirmation. Application volume
+data remains a separate recovery unit.
+An on-host backup-identity ledger binds the timer, service, and script names;
+renaming them fails closed until the old units and ledger are explicitly migrated.
+
+Before restore, the operator stops or fences other servers and reconciles the
+target as the designated init server in both inventory and installed config.
+Restore validates effective systemd execution and K3s configuration sources,
+rejecting unaccounted drop-ins, environment inputs, and command overrides. Its
+checksum sidecar must contain exactly one SHA256 record for the selected archive
+basename. The play validates the archive on the controller, uses one-use
+encrypted remote transport, preserves original state, then resets the target
+from the snapshot.
+After success, peers need the restored credentials and correct join URLs before
+their databases are cleared and they rejoin. Raw rollback instead preserves the
+original peer databases and credentials for original-quorum recovery. Failed
+transactions retain their guard and recovery material for explicit resolution.
+The persistent restore guard inhibits systemd startup, including after reboot.
+An authorized recovery start consumes a single-use `/run` authorization bound to
+the current boot, guard identity, and common lifecycle owner, expiring within
+60 seconds. Recovery preserves the service's existing boot-enablement setting.
 
 ## Ingress and DNS
 
@@ -218,7 +330,9 @@ over IPv6. Ansible bridges the two on the ingress node with systemd socat
 forwarder units on the selected node: listeners on `[::]:80` and `[::]:443`
 forward to `127.0.0.1:80` and `127.0.0.1:443`, where K3s ServiceLB and Traefik listen on
 IPv4. The units are owned by the Ansible host layer role that manages the
-ingress forwarders (see `ansible/roles/`), not by any Kubernetes resource.
+ingress forwarders (see `ansible/roles/`), not by any Kubernetes resource. They
+run unprivileged with bind-service capability and bounded children, tasks, and
+memory. Public IPv4 reaches ServiceLB directly.
 
 The limitations of this frontend are accepted deliberately: the IPv6 path is
 a plain TCP proxy, so IPv6 client source addresses are not preserved
@@ -240,6 +354,22 @@ K3s local-path storage is the initial StorageClass. Stateful workloads are
 pinned to operator-selected storage nodes; their volumes do not move automatically
 after node loss. Recovery restores them on a replacement or surviving node from
 off-host backup.
+
+Host storage checks device identity, unique UUID, filesystem, and mount layout
+before mutation. Automatic formatting is limited to an all-zero ext4 candidate
+with both format opt-ins and the exact host/device/hash confirmation from
+preflight. Existing ext4/XFS mounts must pass identity checks. Populated-directory
+migrations, device mappings, conflicting mounts, and ambiguous disk ownership
+require manual preparation; the role does not move application data.
+Probes are bounded to 15 seconds, whole-device zero scans to 300 seconds, and
+each inspection to 600 seconds with a five-second kill grace period, including
+in check mode. Timeouts fail closed; large or slow devices require external
+preparation.
+
+All mesh nodes share one `k3s_default_local_storage_path`. On every
+storage-enabled node, `storage_mountpoint` must equal that path (default
+`/var/lib/rancher/k3s/storage`); heterogeneous per-node mount paths are not
+supported by this local-path configuration.
 
 Rules:
 
@@ -313,7 +443,8 @@ measured node budget and remain removable without affecting workloads.
 
 The required recoveries are:
 
-1. Recreate a node from a clean supported OS/LXC using Ansible.
+1. Recover persistent operator configuration and recreate a node from a clean
+   supported OS/LXC using Ansible.
 2. Recreate WireGuard and verify node connectivity.
 3. Reinstall the pinned K3s version.
 4. Restore the K3s datastore and matching server token, or build a clean cluster

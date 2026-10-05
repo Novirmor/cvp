@@ -36,15 +36,19 @@ loop. A full stop suspends the root, the children, and the source.
 
 ```sh
 flux suspend kustomization flux-system -n flux-system
-flux suspend kustomization policy infrastructure operations -n flux-system
+flux suspend kustomization policy infrastructure data apps operations -n flux-system
 flux suspend source git flux-system -n flux-system
 ```
 
-Suspending the source stops new revision fetches; the children keep their
-last applied revision. Verify with `flux get kustomizations -n flux-system`
+Record the prior suspension states before the commands. Suspending the source
+stops new revision fetches; it does not stop children applying the cached
+artifact. Suspending a Kustomization does not cancel an execution already in
+progress, so wait for in-flight work to settle before imperative recovery.
+Verify with `flux get kustomizations -n flux-system`
 and `flux get sources git -n flux-system` (the Suspended column must agree
-with the incident decision). `data` and `apps` are already suspended in Git
-and are not part of an emergency suspension.
+with the incident decision). Include `data` and `apps` even though they ship
+suspended: they may have been enabled since bootstrap. Include any subsequently
+added children as well.
 
 An imperative suspension is temporary by design: the committed child specs
 are the durable state. A suspension that must survive the incident becomes a
@@ -61,12 +65,23 @@ flux resume source git flux-system -n flux-system
 flux reconcile source git flux-system -n flux-system
 flux resume kustomization flux-system -n flux-system
 flux reconcile kustomization flux-system -n flux-system --with-source
-flux reconcile kustomization policy infrastructure operations -n flux-system --with-source
+for child in policy infrastructure operations; do
+  flux reconcile kustomization "$child" -n flux-system --with-source || exit 1
+done
 ```
 
-If the source fetched a bad revision that Git has since fixed, the forced
-`--with-source` reconcile is what discards it; the kustomize-controller never
-applies an artifact that is not the source's current revision.
+Use the reviewed enabled child set from Git in that loop: add `data` after
+`policy` and `apps` after `infrastructure` when enabled, preserving any required
+data-before-app dependency. Do not resume a child that is durably suspended in
+Git. The root restores the committed child specs, including explicit false
+suspension values on the default active children. Reconcile one child per
+command; the pinned Flux reconcile CLI processes only its first positional name.
+
+Refresh the repaired source while the Kustomizations are still suspended and
+verify its revision before resuming the root. This prevents resuming against a
+known stale artifact; it does not retroactively cancel an already-started apply.
+After ingress changes, run the explicit-context `cluster-ingress-ready` check
+and external HTTP/TLS gate in `cluster.md`.
 
 ## Controller failure
 
@@ -80,8 +95,9 @@ kubectl -n flux-system rollout restart deploy/<controller>
 
 If the namespace or the CRDs are damaged, re-run the bootstrap helper against
 an explicit context with the recovered deploy key and SOPS age identity (see
-`cluster.md`); it reinstalls the committed components and waits for the
-policy, infrastructure, and operations Kustomizations to become Ready:
+`cluster.md`); it validates and installs an immutable fetched snapshot, then waits
+for the source and every active Kustomization to become Ready at that verified
+commit and current generation. Keep the branch unchanged until bootstrap finishes:
 
 ```sh
 FLUX_GITHUB_OWNER=example-owner \
@@ -96,7 +112,10 @@ SOPS_AGE_KEY_FILE=/path/to/recovered/age.key \
 Replace the example owner and repository with the reviewed GitHub values.
 Before running the helper, replace the `example.invalid/repository.git`
 placeholder in `cluster/flux-system/source.yaml` with the matching repository
-URL and verify its branch.
+URL and verify its branch. Commit and push the complete cluster configuration
+to that branch before invoking the helper; its preflight compares actual file
+bytes, including edits hidden by Git index flags, before contacting Kubernetes.
+Branch-race failures do not roll back already completed applies.
 
 ## Resuming safely
 

@@ -18,7 +18,11 @@ not put them in `*.tfvars`, backend files, shell history, or this repository.
   and DNS Write permissions.
 - Tailscale: `TAILSCALE_API_KEY`, or the provider's OAuth environment variables
   with permissions to manage the tailnet policy and DNS configuration.
-- S3 backend: use the backend's standard environment or workload credentials.
+- S3 backend: use environment credentials or workload credentials. Guarded
+  operations disable shared AWS configuration/credential files and reject
+  profiles and explicit shared-file overrides. Do not select the backend via
+  `AWS_ENDPOINT_URL*` or other AWS endpoint environment variables: put the
+  region and any S3-compatible endpoint explicitly in the backend configuration.
 
 ## First Use
 
@@ -44,6 +48,8 @@ task cloudflare-show -- \
 Repeat for Tailscale with `task tailscale-init`, `task tailscale-plan`, and its
 own backend file, state key, and variable file. The example identity values
 are placeholders and must be replaced with real Tailscale identities.
+Before the first Tailscale imports or normal plan, establish its durable tailnet
+identity using the adoption procedure below.
 `records` is deliberately required to contain at least one Cloudflare record:
 omitting the variable file or passing `{}` fails validation instead of
 producing a delete-all plan.
@@ -61,10 +67,56 @@ task cloudflare-apply -- /path/outside/repository/plans/cloudflare-YYYYMMDD.tfpl
 ```
 
 The tasks require saved plan paths to be absolute and outside the repository;
-plan files can reveal resource configuration. Use `task cloudflare-drift-plan`
+paths are resolved through symlinks and `..` before checking. Use an existing
+artifact directory owned by you, without group/other write access. Each output
+name must be new: existing files, directories, and output symlinks are refused.
+Plans and state snapshots are published atomically with mode `0600` from
+exclusively created private temporary files. Plan files can reveal resource
+configuration. Use `task cloudflare-drift-plan`
 or `task tailscale-drift-plan` with an external `-out` path when inspecting
 drift without changing provider resources, and review that artifact in the same
 way.
+
+Each OpenTofu subprocess runs from a new private **external** configuration
+snapshot, with the initialized root's data directory and backend. Relative
+variable-file paths are not supported; use absolute external files. Execution
+directories live under `$XDG_STATE_HOME/cvp/tofu` (normally
+`~/.local/state/cvp/tofu`), or `CVP_TOFU_RECOVERY_DIR`. The recovery directory
+must be owned by you, mode `0700`, with trusted directory ancestry. Successful
+execution directories are removed. Failed or interrupted executions retain the
+configuration snapshot, private stdout/stderr, and any recovery state; apply
+also retains the exact input plan. Failed command output is not echoed into
+terminal or automation logs. The wrapper reports the retained directory.
+
+If a backend write fails after resource changes, **do not rerun apply**. Inspect
+the reported private directory for `errored.tfstate`; verify the original
+backend/workspace and follow a reviewed state-recovery procedure before any
+further mutation. If OpenTofu could not write that file, its raw-state fallback
+is in the private `stderr.log` instead. Preserve the entire directory until
+recovery is complete, and do not paste these logs into tickets or CI output.
+
+Keep the plan's adjacent `.cvp.json` binding file with the plan. Show and apply
+verify the artifact hash, repository root, initialized backend configuration,
+and workspace, then operate on a private copy of the verified bytes. A moved
+checkout, reconfigured backend, or old unbound plan requires a fresh plan and
+review. This binding detects accidental mix-ups; it does not certify human
+review or protect against an operator who can rewrite both files.
+Binding format 2 also requires regeneration of older format-1 plans. Backend
+endpoint/shared-configuration overrides are rejected rather than silently
+changing the effective destination behind the binding. Local backends are
+supported for isolated testing only with explicit absolute external `path` and
+`workspace_dir` settings; operational roots use S3.
+If a root was initialized using an environment-selected endpoint or profile,
+review and reinitialize its explicit backend configuration and credential
+source before regenerating plans. Merely unsetting a routing variable can
+select a different backend and is not a migration procedure.
+
+The wrapper rejects `TF_CLI_ARGS*`, targeted/excluded plans, mode overrides,
+unlocked operations, and additional output flags. Pass supported variable,
+lock-timeout, parallelism, and display options explicitly. `-detailed-exitcode`
+retains OpenTofu's exit status 2 for a successful plan containing changes.
+`TF_LOG*` and `TOFU_LOG*` settings are rejected too, including `TF_LOG_PATH`:
+ambient debug logging must not introduce an unvalidated output destination.
 
 ## Deletion Safeguards
 
@@ -112,15 +164,52 @@ Cloudflare record import uses the zone and record IDs:
 
 ```sh
 task cloudflare-import -- \
+  -var-file=/path/outside/repository/cloudflare.tfvars \
   'cloudflare_dns_record.public["ingress_a"]' ZONE_ID/RECORD_ID
 ```
 
-Tailscale policy and DNS imports use the provider resource IDs:
+For a new, empty Tailscale state, establish the identity **before either
+import**. This guarded operation is intentionally separate from normal plans:
 
 ```sh
-task tailscale-import -- tailscale_acl.policy acl
-task tailscale-import -- tailscale_dns_configuration.tailnet dns_configuration
+mise exec -- ./scripts/tofu-operation tailscale establish-identity \
+  YOUR_EXPLICIT_TAILNET_ID_OR_DOMAIN \
+  -var-file=/path/outside/repository/tailscale.tfvars
 ```
+
+It accepts only empty state, produces a fixed identity-only plan, verifies that
+the sole change is creation of the builtin `terraform_data.tailnet_identity`,
+and applies those inspected bytes under normal state locking. It cannot apply
+external resource changes or replace an existing identity. The tailnet argument
+is authoritative for establishment; use that same explicit value in subsequent
+variable files. Generic `-target`/`-exclude` options remain forbidden.
+
+Tailscale policy and DNS imports then use the provider resource IDs:
+
+```sh
+task tailscale-import -- -var-file=/path/outside/repository/tailscale.tfvars \
+  tailscale_acl.policy acl
+task tailscale-import -- -var-file=/path/outside/repository/tailscale.tfvars \
+  tailscale_dns_configuration.tailnet dns_configuration
+```
+
+Use an explicit tailnet ID/domain, never the credential-relative `-` alias.
+Both singleton resources depend on the protected tailnet identity. The wrapper
+checks the effective tailnet against that established identity before import
+or planning, pins the checked value for the operation, and inspects saved plans
+locally to refuse singleton creation or identity changes: import both ACL
+and DNS first. The DNS provider's create operation replaces existing remote
+DNS configuration, so an ACL creation failure alone would not protect DNS.
+Direct OpenTofu commands bypass this wrapper adoption gate.
+
+Existing states with a correctly populated identity need no identity migration.
+An old state containing imported singletons but no identity is rejected. Freeze
+all writers, take private state and remote-policy/DNS snapshots, and review the
+original tailnet before migration. One explicit migration is to relinquish the
+old state's singleton ownership without deleting remote objects, establish the
+identity in the now-empty state, then re-import those same objects for the
+verified tailnet. Use the State Handoff safeguards below; do not invent an
+identity for already-imported objects or use targeting to bypass the rejection.
 
 Inspect the resulting plan after each import. Do not use `-target` as a normal
 deployment method, and do not enable overwrite flags to bypass an inventory.

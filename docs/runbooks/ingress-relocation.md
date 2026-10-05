@@ -74,14 +74,19 @@ below does both explicitly so only the new node accepts public 80 and 443.
 
    ```sh
    kubectl -n kube-system get pods -o wide | grep traefik
-   kubectl -n kube-system get ds svclb-traefik -o wide
+    kubectl -n kube-system get ds -l svccontroller.k3s.cattle.io/svcname=traefik,svccontroller.k3s.cattle.io/svcnamespace=kube-system -o wide
+    python3 scripts/cluster-ingress-ready --context reviewed-cluster-context --timeout 5m
    ```
 
    The traefik pod must be ready on the target node and the svclb-traefik
    DaemonSet must have a ready pod there. Probe the public port on the target
    directly before touching DNS; `task verify` alone does not validate ingress
    placement or external routing. Also confirm the K3s helm-controller
-   rendered the unchanged `HelmChartConfig` (see `cluster.md`).
+    rendered the unchanged `HelmChartConfig` (see `cluster.md`). The readiness
+    helper checks the deployed chart/values, completed chart Job, rollout, and
+    Ready local endpoints; it does not probe the public path. Keep Service
+    NodePort allocation enabled because the pinned K3s ServiceLB uses those
+    ports for `externalTrafficPolicy: Local`.
 
 5. Cut over DNS through the Cloudflare root following `tofu.md`: change the
    record content to the target node's public address, update every declared

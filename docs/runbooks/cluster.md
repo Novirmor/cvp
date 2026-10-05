@@ -20,11 +20,47 @@ Flux v2.5.1 components and CRDs are committed in
 `cluster/flux-system/gotk-components.yaml`; the K3s `HelmChartConfig` CRD is a
 cluster prerequisite supplied by K3s.
 
-`task test` additionally runs the conftest policy suite in `tests/policy/`
-against every rendered overlay: prohibited host networking, hostPath volumes,
-privileged and non-restricted security contexts, mutable image tags, and
-unbounded resources are rejected before merge, and a deliberately
-non-compliant fixture proves each rule fires.
+`task test` runs `scripts/test-manifests`. It checks source Secret/generator
+structure, follows repository-local Flux paths including suspended children,
+and evaluates every discovered render before producing a sanitized
+schema-only stream for encrypted Secrets. The policy suite covers native
+pod-bearing kinds, effective container security overrides, dropped capabilities,
+host ports, immutable images, and positive resource quantities. Only the exact
+pinned vendored Flux controller containers receive image/ephemeral-storage
+exceptions; new workloads in `flux-system` do not.
+
+Nullable optional maps and arrays are normalized before policy evaluation;
+malformed structures fail closed. The rendered null regressions also run through
+strict Kubernetes 1.35 schemas, proving that policy rejects inputs schemas permit.
+Cross-render checks require explicit workload namespaces and managed restricted
+PSA, default-deny, quota, and LimitRange relationships. System exceptions are
+limited to the known Flux resources and the K3s Traefik HelmChartConfig.
+Build file references must stay inside `cluster/`. Flux-side rendering overrides
+and remote kubeconfigs are rejected; express supported transformations in the
+local Kustomize overlay so validation sees the same output.
+
+Focused credential-free checks can also run individually:
+
+```sh
+python3 scripts/test-cluster-policy
+python3 scripts/test-cluster-guards
+python3 scripts/test-cluster-traefik
+python3 scripts/test-cluster-manifests
+python3 scripts/test-cluster-bootstrap
+bash scripts/test-manifests
+```
+
+The first two checks are offline; they use conftest, Git, SOPS, age, and Python's
+standard library. The SOPS test creates its own temporary identity. The chart
+test uses Helm to render the exact archive shipped by the pinned K3s version,
+checks its committed SHA-256 in
+`cluster/infrastructure/ingress/packaged-chart.json`, and asserts redirect and
+ServiceLB behavior. Review that pin together with K3s upgrades. For offline
+chart testing, set `CVP_CLUSTER_ASSET_DIR` to a directory containing the pinned
+chart archive, `k3s-<version>-traefik.yaml`, and `k3s-<version>-servicelb.go`
+from that K3s release. The full manifest check and bootstrap orchestration tests
+also download Kubernetes schemas. Bootstrap orchestration uses local Git remotes
+through an SSH stub and a kubectl stub; it never contacts Kubernetes.
 
 ## Bootstrap
 
@@ -40,7 +76,20 @@ non-compliant fixture proves each rule fires.
    `cluster/flux-system/source.yaml` with the reviewed repository URL and branch.
    Set both `FLUX_GITHUB_OWNER` and `FLUX_GITHUB_REPOSITORY` explicitly to match
    the URL (`ssh://git@github.com/<owner>/<repository>.git`); replace the example
-   values below with the operator's repository.
+   values below with the operator's repository. Commit and push the complete
+   `cluster/` tree to that branch first. The helper fetches the remote branch
+    through strict SSH host verification and compares its cluster tree and actual
+    local file bytes before any Kubernetes command. It fails for local edits,
+    untracked cluster files, unpublished configuration, and differences concealed
+    by `assume-unchanged` or `skip-worktree`. It validates the fetched snapshot's
+    source URL/branch, policies, namespace relationships and strict schemas, then
+    applies only that snapshot's bootstrap manifests. The snapshot is deleted on
+    exit; deploy and age keys remain separate operator inputs.
+   Every Git invocation discards inherited `GIT_*` overrides, and the preflight
+    verifies the worktree root is the expected checkout. Bootstrap rejects
+    `.sourceignore`, source filters/includes/submodules, cluster symlinks, and
+    transforms that make directly applied bootstrap files differ from their
+    validated render. Repository-local Flux paths must stay inside `cluster/`.
 4. Recover the Git deploy key and SOPS age identity from an operator-chosen
    external secrets store and seed them through the context-safe bootstrap
    helper; Ansible does not own either private key:
@@ -63,44 +112,61 @@ CronJobs are also suspended and contain fail-closed templates only.
 The root `flux-system` Kustomization reconciles with `wait: false`. The root
 does not wait on its children, because the suspended `apps` and `data`
 Kustomizations never reconcile and would leave the root unhealthy on a fresh
-bootstrap. Instead, bootstrap relies on each child Kustomization's own wait,
-and the root health checks still gate the six Flux controller Deployments
-before the root reports healthy.
+bootstrap. Each child has its own wait or explicit health checks, and the root
+health checks gate the six Flux controller Deployments before the root reports
+healthy.
+
+Bootstrap success additionally requires the source artifact and every active
+Kustomization's applied revision to equal the verified commit, current-generation
+Ready status, and no suspension. Source and root explicitly declare `suspend:
+false`, so bootstrap resumes them after break glass. Every child declares its
+suspension state; the root restores those states from Git without waiting for
+suspended children. The source continues tracking its branch after bootstrap.
+The gate runs before and after ingress checks.
+Keep the published branch unchanged throughout bootstrap: branch movement fails
+the checks, but the helper neither locks Git nor rolls back completed applies.
+Old Ready conditions alone are insufficient evidence of recovery.
 
 ## Post-Bootstrap Traefik Verification
 
-After the `infrastructure` Kustomization first becomes healthy, the ingress
-path must still be verified by hand. The Flux health checks on the traefik
-Deployment and the svclb-traefik DaemonSet mitigate, but do not prove, the
-chart upgrade: K3s applies the `HelmChartConfig` through its own
-helm-controller asynchronously from Flux reconciliation, so a health-check
-pass can predate the latest Traefik values. Work through this gate:
+The `infrastructure` Kustomization uses `wait: false` with an explicit Traefik
+Deployment health check. K3s processes HelmChartConfig asynchronously, and the
+ServiceLB DaemonSet name contains a Service-UID suffix. Flux Ready alone is not
+proof that the new chart values or public traffic path are working.
 
-1. Confirm the K3s helm-controller actually processed the HelmChartConfig:
+1. The bootstrap helper runs this read-only check automatically. Repeat it
+   after every chart/ingress change and during relocation or recovery:
 
-   ```sh
-   kubectl -n kube-system get helmchart traefik -o yaml
-   ```
+    ```sh
+    python3 scripts/cluster-ingress-ready --context reviewed-cluster-context --timeout 5m
+    ```
 
-   The rendered values must include the committed configuration and the
-   status must show no failed operation.
+    It checks the live HelmChartConfig, latest deployed release's chart version
+    and intended values, a completed chart Job owned by the current HelmChart,
+    the Deployment's observed generation and completed rollout, Service ports,
+    placement labels, and ServiceLB pods plus Ready local Traefik endpoints.
+    Its timeout fails closed; it does not mutate resources or test the public
+    dataplane. The intended values check is a subset comparison, not an audit
+    of every default or stale value in the Helm release.
 
-2. Confirm the traefik Deployment completed its rollout:
+    Helm status does not include chart metadata. The helper fetches metadata
+    and values with `helm get ... --revision` bound to the status revision,
+    then rechecks the latest status and retries if the release changes during
+    collection.
 
-   ```sh
-   kubectl -n kube-system rollout status deploy/traefik
-   ```
+    Inspect the generated DaemonSet by labels when diagnosing a failed gate:
 
-3. Confirm the svclb-traefik DaemonSet has a ready pod on the node labeled
-   `cvp.io/ingress=true`, so the ServiceLB endpoint is local to the ingress
-   node:
+    ```sh
+    kubectl -n kube-system get ds -l svccontroller.k3s.cattle.io/svcname=traefik,svccontroller.k3s.cattle.io/svcnamespace=kube-system -o wide
+    kubectl -n kube-system get helmchart traefik -o yaml
+    ```
 
-   ```sh
-   kubectl -n kube-system get ds svclb-traefik -o wide
-   kubectl -n kube-system get pods -o wide
-   ```
+    Keep `allocateLoadBalancerNodePorts: true` with `externalTrafficPolicy:
+    Local`: the pinned K3s ServiceLB forwards to those NodePorts. Disabling
+    them breaks this path; they are not unused allocations. Changing to a
+    NodePort-free frontend requires a separate traffic/source-IP design review.
 
-4. From an external vantage point, send an HTTP request to the ingress node
+2. From an external vantage point, send an HTTP request to the ingress node
    on port 80 and confirm the redirect targets HTTPS on the public port 443,
    never Traefik's internal port 8443:
 
@@ -109,9 +175,10 @@ pass can predate the latest Traefik values. Work through this gate:
    ```
 
    The redirect is configured through the chart's structured
-   `ports.web.redirectTo` values because the raw entrypoint arguments resolve
+   `ports.web.http.redirections.entryPoint` values because raw entrypoint arguments resolve
    `websecure` to Traefik's internal 8443 and produce broken public
-   redirects.
+   redirects. The packaged chart silently ignores the obsolete `redirectTo`
+   key; the local render test detects the missing redirect arguments.
 
 Bootstrap is not complete until this manual gate passes.
 
