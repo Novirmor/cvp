@@ -3,6 +3,8 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  vars_files:
+    - ../roles/ingress_v6/defaults/main.yml
   vars:
     ingress_v6_target_host: 127.0.0.1
   tasks:

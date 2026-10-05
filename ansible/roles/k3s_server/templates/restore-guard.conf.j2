@@ -1,0 +1,2 @@
+[Service]
+ExecCondition=/usr/bin/python3 {{ k3s_start_guard_path | default('/usr/local/libexec/cvp-k3s-start-guard') }} {{ k3s_restore_guard_path | default('/var/lib/cvp/k3s-restore-in-progress') }} {{ k3s_start_authorization_path | default('/run/cvp/k3s-restore-start') }} {{ cvp_lifecycle_lock_path | default('/var/lib/cvp/lifecycle.lock') }} {{ k3s_data_dir }}/.cvp-restore-in-progress

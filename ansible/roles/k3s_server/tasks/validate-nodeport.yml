@@ -1,0 +1,13 @@
+---
+- name: Require a bare unicast IPv4 WireGuard address for the NodePort allowlist
+  ansible.builtin.assert:
+    that:
+      - wireguard_address is string
+      - wireguard_address is match(ipv4_host_pattern)
+      - wireguard_address is not match('^(?:0|127|22[4-9]|23[0-9]|24[0-9]|25[0-5])\.')
+    fail_msg: >-
+      wireguard_address must be one bare unicast IPv4 address. The IPv4-only
+      cluster exposes NodePorts only on 127.0.0.1 and that exact WireGuard IP.
+  vars:
+    ipv4_octet: '(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+    ipv4_host_pattern: '^(?:{{ ipv4_octet }}\.){3}{{ ipv4_octet }}\Z'

@@ -1,18 +1,34 @@
 """Offline regression tests for the actual site.yml patch template."""
 
 import json
+import copy
+import os
 from pathlib import Path
+import shlex
+import shutil
+import sys
 from typing import Any, cast
 import unittest
 
-from jinja2.nativetypes import NativeEnvironment
-import yaml
+try:
+    from jinja2.nativetypes import NativeEnvironment
+    import jsonpatch
+    import yaml
+except ImportError:
+    executable = shutil.which("ansible-playbook")
+    if not executable or os.environ.get("CVP_NODE_PATCH_ANSIBLE_PYTHON"):
+        raise
+    interpreter = shlex.split(Path(executable).read_text().splitlines()[0].removeprefix("#!"))
+    os.environ["CVP_NODE_PATCH_ANSIBLE_PYTHON"] = "1"
+    os.execv(interpreter[0], [*interpreter, "-B", str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 SITE = yaml.safe_load(Path(__file__).with_name("site.yml").read_text())
-TASK = next(task for task in SITE[-1]["tasks"] if task["name"] == "Compute patches for selected inventory nodes")
+RECONCILIATION = next(play for play in SITE
+                      if play.get("name") == "Reconcile K3s node labels and taints through the Kubernetes API")
+TASK = next(task for task in RECONCILIATION["tasks"] if task["name"] == "Compute patches for selected inventory nodes")
 TEMPLATE = TASK["vars"]["node_patch"]
-CONFLICT_TASK = next(task for task in SITE[-1]["tasks"] if task["name"] == "Refuse to adopt unowned taints")
+CONFLICT_TASK = next(task for task in RECONCILIATION["tasks"] if task["name"] == "Refuse to adopt unowned taints")
 
 
 def patch_for(node, labels, taints):
@@ -31,13 +47,17 @@ def patch_for(node, labels, taints):
 
 class NodePatchTests(unittest.TestCase):
     def test_selected_hosts_drive_validation_and_delegated_reconciliation(self):
-        self.assertEqual(SITE[0]["hosts"], "wireguard")
-        self.assertEqual(SITE[0]["connection"], "local")
-        self.assertEqual(SITE[0]["tasks"][0]["vars"]["node_tag_validation_hosts"],
+        validation = next(play for play in SITE if play["name"] == "Validate node tags before configuring hosts")
+        loader = next(play for play in SITE if play["name"] == "Load persistent operator configuration")
+        self.assertEqual(loader["ansible.builtin.import_playbook"], "load-operator-config.yml")
+        self.assertEqual(validation["hosts"], "wireguard")
+        self.assertEqual(validation["connection"], "local")
+        tags = next(task for task in validation["tasks"] if task["name"] == "Validate selected inventory nodes")
+        self.assertEqual(tags["vars"]["node_tag_validation_hosts"],
                          "{{ ansible_play_hosts_all }}")
-        self.assertEqual(SITE[-1]["hosts"], "wireguard")
-        self.assertEqual(SITE[-1]["vars"]["tag_target_nodes"], "{{ ansible_play_hosts_all }}")
-        for task in SITE[-1]["tasks"]:
+        self.assertEqual(RECONCILIATION["hosts"], "wireguard")
+        self.assertEqual(RECONCILIATION["vars"]["tag_target_nodes"], "{{ ansible_play_hosts_all }}")
+        for task in RECONCILIATION["tasks"]:
             if task["name"] in ("Wait for selected nodes to register in the Kubernetes API",
                                 "Read the selected cluster nodes",
                                 "Apply the node label and taint patches"):
@@ -103,6 +123,49 @@ class NodePatchTests(unittest.TestCase):
         self.assertEqual(ops[0], {"op": "test", "path": "/metadata/resourceVersion", "value": "25"})
         self.assertEqual(ops[1], {"op": "add", "path": "/metadata/labels/cvp.io~1role", "value": "agent"})
         self.assertEqual(ops[2]["value"], 'a"b\\c')
+
+    def test_atomic_quarantine_removal_applies_inventory_and_preserves_controller_state(self):
+        quarantine = {"key": "cvp.io/bootstrap", "value": "true", "effect": "NoSchedule"}
+        previous = {"key": "dedicated", "value": "old", "effect": "NoExecute"}
+        controllers = [{"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
+                       {"key": "controller.io/protected", "value": "keep", "effect": "NoExecute"}]
+        node = {"metadata": {"resourceVersion": "42", "labels": {
+            "cvp.io/bootstrap-quarantine": "true", "cvp.io/old": "true", "kubernetes.io/os": "linux"},
+            "annotations": {"cvp.io/managed-taints": json.dumps([previous]), "controller.io/state": "keep"}},
+            "spec": {"taints": [controllers[0], previous, quarantine, controllers[1]]}}
+        labels = ["cvp.io/role=agent", "cvp.io/compute=true"]
+        taints = ["dedicated=new:NoSchedule"]
+        ops = patch_for(node, labels, taints)
+        final = jsonpatch.apply_patch(node, ops)
+        desired = {"key": "dedicated", "value": "new", "effect": "NoSchedule"}
+        self.assertEqual(final["spec"]["taints"], controllers + [desired])
+        self.assertEqual(final["metadata"]["labels"], {
+            "kubernetes.io/os": "linux", "cvp.io/role": "agent", "cvp.io/compute": "true"})
+        self.assertEqual(final["metadata"]["annotations"], {
+            "cvp.io/managed-taints": json.dumps([desired]), "controller.io/state": "keep"})
+        self.assertEqual(patch_for(final, labels, taints), [])
+        self.assertIn(quarantine, node["spec"]["taints"])
+        for changed in ("version", "taints", "ledger"):
+            with self.subTest(changed=changed):
+                concurrent = copy.deepcopy(node)
+                if changed == "version":
+                    concurrent["metadata"]["resourceVersion"] = "43"
+                elif changed == "taints":
+                    concurrent["spec"]["taints"].append({"key": "another-controller", "effect": "NoExecute"})
+                else:
+                    concurrent["metadata"]["annotations"]["cvp.io/managed-taints"] = "[]"
+                with self.assertRaises(jsonpatch.JsonPatchTestFailed):
+                    jsonpatch.apply_patch(concurrent, ops)
+
+    def test_bootstrap_only_patch_does_not_claim_controller_taints(self):
+        controller = {"key": "node.kubernetes.io/unreachable", "effect": "NoExecute"}
+        node = {"metadata": {"labels": {"cvp.io/bootstrap-quarantine": "true"}, "resourceVersion": "1"},
+                "spec": {"taints": [{"key": "cvp.io/bootstrap", "value": "true", "effect": "NoSchedule"},
+                                    controller]}}
+        final = jsonpatch.apply_patch(node, patch_for(node, ["cvp.io/role=control-plane"], []))
+        self.assertEqual(final["spec"]["taints"], [controller])
+        self.assertEqual(final["metadata"]["labels"], {"cvp.io/role": "control-plane"})
+        self.assertNotIn("annotations", final["metadata"])
 
 
 if __name__ == "__main__":

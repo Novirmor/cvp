@@ -7,6 +7,8 @@ After=k3s.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=16min
+TimeoutStopSec=30s
 ExecCondition=/usr/bin/systemctl is-active --quiet k3s.service
 ExecStart={{ k3s_backup_script_path }}
 User=root
@@ -15,9 +17,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths={{ k3s_backup_dir }}
+ReadWritePaths={{ k3s_backup_dir | quote }}
 {% for path in k3s_backup_writable_paths %}
-ReadWritePaths={{ path }}
+ReadWritePaths={{ path | quote }}
 {% endfor %}
 RestrictSUIDSGID=true
 LockPersonality=true

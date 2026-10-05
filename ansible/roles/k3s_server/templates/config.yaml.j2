@@ -2,6 +2,10 @@ write-kubeconfig-mode: "{{ k3s_write_kubeconfig_mode }}"
 data-dir: "{{ k3s_data_dir }}"
 node-name: "{{ node_name }}"
 node-ip: "{{ wireguard_address }}"
+kube-proxy-arg:
+  - "proxy-mode=iptables"
+  - "iptables-localhost-nodeports=true"
+  - "nodeport-addresses=127.0.0.1/32,{{ wireguard_address }}/32,::1/128"
 advertise-address: "{{ wireguard_address }}"
 {% if not k3s_server_init | bool %}
 # Joining servers connect to the init server, which initialized the embedded
@@ -29,9 +33,12 @@ tls-san:
   - "{{ san }}"
 {% endfor %}
 node-label:
+  - "cvp.io/bootstrap-quarantine=true"
 {% for label in k3s_node_labels %}
   - "{{ label }}"
 {% endfor %}
+node-taint:
+  - "cvp.io/bootstrap=true:NoSchedule"
 {% if k3s_disable_components | length > 0 %}
 disable:
 {% for component in k3s_disable_components %}

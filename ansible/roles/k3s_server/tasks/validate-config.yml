@@ -1,0 +1,28 @@
+---
+- name: Validate all effective K3s configuration sources
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', '../files/cvp-k3s-config-check.py') }}"
+    stdin: >-
+      {{ {'configs': [k3s_config_path] + ([restore_config] if restore_config is defined else []),
+          'environment': k3s_environment_path
+                         | default('/etc/default/' ~ k3s_checked_unit | regex_replace('\.service$', '')),
+          'unit': k3s_checked_unit,
+          'unit_path': k3s_checked_unit_path | default('/etc/systemd/system/' ~ k3s_checked_unit),
+          'unit_roots': k3s_systemd_unit_roots | default(['/etc/systemd/system', '/run/systemd/system',
+                                                       '/usr/local/lib/systemd/system', '/usr/lib/systemd/system',
+                                                       '/lib/systemd/system']),
+          'binary': k3s_bin_path,
+          'guard_dropin': k3s_start_guard_dropin
+                          | default('/etc/systemd/system/k3s.service.d/50-cvp-restore-guard.conf'),
+          'guard_content': lookup('ansible.builtin.template', '../templates/restore-guard.conf.j2'),
+          'require_unit': k3s_require_installed_unit | default(false) | bool,
+          'require_guard': k3s_require_loaded_guard | default(false) | bool} | to_json }}
+  vars:
+    k3s_checked_unit: >-
+      {{ k3s_activation_unit | default('k3s.service' if k3s_role | default('server') == 'server'
+                                      else 'k3s-agent.service') }}
+  changed_when: false
+  check_mode: false

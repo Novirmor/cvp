@@ -1,0 +1,35 @@
+---
+- name: Create the persistent recovery inhibit directory
+  ansible.builtin.file:
+    path: "{{ k3s_restore_guard_path | default('/var/lib/cvp/k3s-restore-in-progress') | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Create the K3s startup guard directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ k3s_start_guard_path | default('/usr/local/libexec/cvp-k3s-start-guard') | dirname }}"
+    - "{{ k3s_start_guard_dropin | default('/etc/systemd/system/k3s.service.d/50-cvp-restore-guard.conf') | dirname }}"
+
+- name: Install the recovery-aware K3s startup guard
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.file', '../files/cvp-k3s-start-guard.py') }}\n"
+    dest: "{{ k3s_start_guard_path | default('/usr/local/libexec/cvp-k3s-start-guard') }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the systemd recovery startup condition
+  ansible.builtin.copy:
+    content: "{{ lookup('ansible.builtin.template', '../templates/restore-guard.conf.j2') }}"
+    dest: "{{ k3s_start_guard_dropin | default('/etc/systemd/system/k3s.service.d/50-cvp-restore-guard.conf') }}"
+    owner: root
+    group: root
+    mode: "0644"

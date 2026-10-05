@@ -1,0 +1,29 @@
+---
+- name: Generate this invocation's lifecycle ownership token
+  ansible.builtin.set_fact:
+    cvp_lifecycle_token: >-
+      {{ lookup('ansible.builtin.pipe', 'python3 -c "import secrets; print(secrets.token_hex(32))"') }}
+  no_log: true
+  when: not ansible_check_mode and cvp_lifecycle_token is not defined
+
+- name: Acquire exclusive host lifecycle ownership
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', '../../files/cvp-lifecycle.py') }}"
+    stdin: >-
+      {{ {'action': 'check' if ansible_check_mode else 'acquire',
+          'path': cvp_lifecycle_lock_path | default('/var/lib/cvp/lifecycle.lock'),
+          'guard': k3s_restore_guard_path | default('/var/lib/cvp/k3s-restore-in-progress'),
+          'legacy_guard': (k3s_data_dir | default('/var/lib/rancher/k3s')) ~ '/.cvp-restore-in-progress',
+          'token': cvp_lifecycle_token | default('')} | to_json }}
+  register: cvp_lifecycle_acquisition
+  changed_when: cvp_lifecycle_acquisition.stdout == 'acquired'
+  check_mode: false
+  no_log: true
+
+- name: Record acquired lifecycle ownership
+  ansible.builtin.set_fact:
+    cvp_lifecycle_acquired: "{{ not ansible_check_mode }}"
+  no_log: true

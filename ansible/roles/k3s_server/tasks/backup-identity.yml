@@ -1,0 +1,18 @@
+---
+- name: Verify the persisted and discovered backup unit identities
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', '../files/cvp-backup-identity.py') }}"
+    stdin: >-
+      {{ {'action': 'inspect' if ansible_check_mode else _k3s_backup_identity_action | default('inspect'),
+          'ledger': cvp_backup_identity_path | default('/var/lib/cvp/k3s-backup-identity.json'),
+          'unit_roots': k3s_systemd_unit_roots | default(['/etc/systemd/system', '/run/systemd/system',
+                                                       '/usr/local/lib/systemd/system', '/usr/lib/systemd/system',
+                                                       '/lib/systemd/system']),
+          'identity': {'timer': k3s_backup_timer_name, 'service': k3s_backup_service_name,
+                       'script': k3s_backup_script_path | default('/usr/local/sbin/k3s-backup')}} | to_json }}
+  register: k3s_backup_identity_result
+  changed_when: k3s_backup_identity_result.stdout == 'recorded'
+  check_mode: false

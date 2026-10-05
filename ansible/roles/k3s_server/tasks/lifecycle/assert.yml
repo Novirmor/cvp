@@ -1,0 +1,17 @@
+---
+- name: Verify exclusive host lifecycle ownership
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', '../../files/cvp-lifecycle.py') }}"
+    stdin: >-
+      {{ {'action': 'check' if ansible_check_mode else 'assert',
+          'path': cvp_lifecycle_lock_path | default('/var/lib/cvp/lifecycle.lock'),
+          'guard': k3s_restore_guard_path | default('/var/lib/cvp/k3s-restore-in-progress'),
+          'legacy_guard': (k3s_data_dir | default('/var/lib/rancher/k3s')) ~ '/.cvp-restore-in-progress',
+          'allow_restore': cvp_lifecycle_allow_restore | default(false) | bool,
+          'token': cvp_lifecycle_token | default('')} | to_json }}
+  changed_when: false
+  check_mode: false
+  no_log: true

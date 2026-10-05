@@ -3,6 +3,9 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  become: false
+  vars:
+    ansible_become: false
   tasks:
     - name: Validate the configured inventory before any negative cases
       ansible.builtin.include_tasks: tasks/validate-node-tags.yml

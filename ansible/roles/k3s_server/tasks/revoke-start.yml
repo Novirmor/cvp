@@ -1,0 +1,15 @@
+---
+- name: Revoke unused recovery startup authorization
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', '../files/cvp-k3s-start-guard.py') }}"
+    stdin: >-
+      {{ {'action': 'revoke', 'guard': restore_guard,
+          'legacy_guard': k3s_data_dir ~ '/.cvp-restore-in-progress',
+          'authorization': k3s_start_authorization_path | default('/run/cvp/k3s-restore-start'),
+          'lock': cvp_lifecycle_lock_path | default('/var/lib/cvp/lifecycle.lock'),
+          'token': cvp_lifecycle_token} | to_json }}
+  changed_when: false
+  no_log: true

@@ -1,4 +1,9 @@
 ---
+- name: Load persistent operator configuration
+  ansible.builtin.import_playbook: load-operator-config.yml
+  vars:
+    ansible_become: false
+
 - name: Restore the K3s datastore and tokens
   hosts: k3s_servers
   become: true
@@ -9,6 +14,9 @@
     restore_identity: "{{ lookup('ansible.builtin.env', 'K3S_RESTORE_AGE_IDENTITY') }}"
     restore_confirm_host: "{{ lookup('ansible.builtin.env', 'K3S_RESTORE_CONFIRM_HOST') }}"
     restore_confirm: "{{ lookup('ansible.builtin.env', 'K3S_RESTORE_CONFIRM') | lower }}"
+    restore_peer_recovery_confirmed: >-
+      {{ lookup('ansible.builtin.env', 'K3S_RESTORE_PEER_RECOVERY_CONFIRMED') | lower }}
+    restore_guard: "{{ k3s_restore_guard_path | default('/var/lib/cvp/k3s-restore-in-progress') }}"
     restore_allow_version_mismatch: >-
       {{ lookup('ansible.builtin.env', 'K3S_RESTORE_ALLOW_VERSION_MISMATCH')
          | default('') | lower }}
@@ -23,14 +31,74 @@
     # removed.
     restore_config: /etc/rancher/k3s/config.restore.yaml
     restore_staging_root: /var/lib/rancher/k3s/.restore
-    # restore_run_stamp is frozen by a set_fact pre_task: a lookup in play
-    # vars would re-evaluate on every reference and point successive tasks at
-    # different staging directories, silently disabling rollback.
+    # Freeze a unique directory for the entire transaction, including rollback.
     restore_remote_dir: "{{ restore_staging_root }}/{{ restore_run_stamp }}"
+    restore_mutation_paths:
+      - "{{ k3s_data_dir }}/server/db"
+      - "{{ k3s_data_dir }}/server/cred"
+      - "{{ k3s_data_dir }}/server/tls"
+      - "{{ k3s_server_token_path }}"
+      - "{{ k3s_agent_token_server_path }}"
+      - "{{ restore_config }}"
+    restore_mount_check_script: |
+      import os, re, sys
+      roots = {os.path.abspath(p) for p in sys.argv[1:]}
+      roots.update(os.path.realpath(p) for p in sys.argv[1:])
+      if not roots:
+          raise SystemExit('No recovery paths supplied for mount validation')
+      def unescape(value):
+          return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), value)
+      mounts = []
+      with open('/proc/self/mountinfo', encoding='utf-8', errors='surrogateescape') as table:
+          for line in table:
+              fields = line.split()
+              if not fields:
+                  continue
+              if (len(fields) < 10 or not fields[0].isdigit() or not fields[1].isdigit()
+                      or not re.fullmatch(r'[0-9]+:[0-9]+', fields[2])
+                      or '-' not in fields[6:] or len(fields) - fields.index('-', 6) < 4):
+                  raise SystemExit('Cannot validate malformed mountinfo; refusing deletion')
+              target = unescape(fields[4])
+              if not os.path.isabs(target):
+                  raise SystemExit('Mountinfo target is not absolute; refusing deletion')
+              mounts.append(os.path.normpath(target))
+      if not mounts:
+          raise SystemExit('Empty mount table; refusing deletion')
+      blocked = sorted({p for p in mounts if any(os.path.commonpath([p, root]) == root for root in roots)})
+      if blocked:
+          raise SystemExit('Mounted recovery paths: ' + ', '.join(blocked)
+                           + '; automated recursive deletion is refused')
+    restore_mount_check_command: >-
+      {{ ['timeout', '--kill-after=5s', '15s', 'python3', '-c', restore_mount_check_script] }}
+    restore_extract_script: |
+      import pathlib, shutil, sys, tarfile
+      root = pathlib.Path(sys.argv[1])
+      expected = set(sys.argv[2:])
+      with tarfile.open(root / 'backup.tar.gz', 'r:gz') as archive:
+          members = archive.getmembers()
+          if len(members) != len(expected) or {m.name for m in members} != expected:
+              raise SystemExit('Recovery archive has unexpected or duplicate members')
+          if any(not m.isfile() or m.size <= 0 for m in members):
+              raise SystemExit('Recovery members must be non-empty regular files')
+          for member in members:
+              with archive.extractfile(member) as src, (root / member.name).open('xb') as dest:
+                  shutil.copyfileobj(src, dest)
+              (root / member.name).chmod(0o600)
   pre_tasks:
+    - name: Initialize all recovery phases before validation or host access
+      ansible.builtin.set_fact:
+        restore_validation_ok: false
+        restore_success: false
+        restore_preserved: false
+        restore_replacement_started: false
+        restore_guard_owned: false
+        restore_lifecycle_owned: false
+        restore_local_dir: {}
+        restore_transfer_dir: {}
+
     - name: Freeze the per-run staging stamp
       ansible.builtin.set_fact:
-        restore_run_stamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+        restore_run_stamp: "{{ lookup('pipe', 'python3 -c \"import uuid; print(uuid.uuid4().hex)\"') }}"
 
     # Controller-side validation only. A failure here never reaches the
     # mutation rescue path and never touches the host.
@@ -43,23 +111,47 @@
           - restore_archive | length > 0
           - restore_checksum | length > 0
           - restore_identity | length > 0
+          - k3s_datastore in ['sqlite', 'etcd']
+          - not ansible_check_mode
+          - k3s_server_init | bool
+          - k3s_cluster_init_host == inventory_hostname
+          - k3s_server_host == inventory_hostname
+          - k3s_datastore != 'sqlite' or groups['k3s_servers'] | length == 1
+          - groups['k3s_servers'] | length == 1 or restore_peer_recovery_confirmed == 'true'
         fail_msg: >-
           Run this playbook with --limit on one target server, and set
           K3S_RESTORE_CONFIRM=true, K3S_RESTORE_CONFIRM_HOST to that exact
           hostname, K3S_RESTORE_ARCHIVE, K3S_RESTORE_CHECKSUM, and
           K3S_RESTORE_AGE_IDENTITY. This play replaces the control-plane state;
-          the other servers must already be stopped.
+          the other servers must already be stopped or fenced. The target must
+          be the designated init host in inventory AND its installed config.
+          For multiple servers also set K3S_RESTORE_PEER_RECOVERY_CONFIRMED=true:
+          after a successful reset, peers need the restored tokens and a join URL
+          pointing at this target before their databases are removed. After raw
+          rollback, preserve all original peer databases and credentials instead.
+
+    - name: Require every other server to be a joiner in inventory
+      ansible.builtin.assert:
+        that: not hostvars[item].k3s_server_init | default(false) | bool
+        fail_msg: "{{ item }} must be reconciled as a joining server before restoring this target."
+      loop: "{{ groups['k3s_servers'] | difference([inventory_hostname]) }}"
 
     - name: Require recovery tools on the controller
-      ansible.builtin.command: "{{ item }} --version"
+      ansible.builtin.command:
+        argv: [timeout, --kill-after=5s, 15s, "{{ item }}", --version]
       delegate_to: localhost
       become: false
+      vars:
+        ansible_become: false
       changed_when: false
       loop:
         - age
+        - age-keygen
         - sqlite3
 
     - name: Validate the recovery unit on the controller
+      vars:
+        ansible_become: false
       block:
         - name: Create a private controller staging directory
           ansible.builtin.tempfile:
@@ -86,9 +178,14 @@
         - name: Verify the encrypted archive checksum before any host change
           ansible.builtin.command:
             argv:
-              - sha256sum
-              - --check
-              - "{{ restore_checksum | basename }}"
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - python3
+              - -c
+              - "{{ lookup('ansible.builtin.file', '../roles/k3s_server/files/cvp-recovery-checksum.py') }}"
+              - "{{ restore_local_dir.path }}/{{ restore_archive | basename }}"
+              - "{{ restore_local_dir.path }}/{{ restore_checksum | basename }}"
           args:
             chdir: "{{ restore_local_dir.path }}"
           delegate_to: localhost
@@ -98,6 +195,9 @@
         - name: Decrypt the recovery archive on the controller
           ansible.builtin.command:
             argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
               - age
               - --decrypt
               - --identity
@@ -110,13 +210,24 @@
           no_log: true
 
         - name: Extract the recovery archive on the controller
-          ansible.builtin.unarchive:
-            src: "{{ restore_local_dir.path }}/backup.tar.gz"
-            dest: "{{ restore_local_dir.path }}"
-            remote_src: true
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - python3
+              - -c
+              - "{{ restore_extract_script }}"
+              - "{{ restore_local_dir.path }}"
+              - "{{ restore_state_file }}"
+              - server.token
+              - agent.token
+              - node
+              - k3s.version
           delegate_to: localhost
           become: false
           no_log: true
+          changed_when: true
 
         - name: Require a complete recovery unit
           ansible.builtin.stat:
@@ -140,7 +251,8 @@
           no_log: true
 
         - name: Read the recovery unit server marker
-          ansible.builtin.command: cat "{{ restore_local_dir.path }}/node"
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, cat, "{{ restore_local_dir.path }}/node"]
           delegate_to: localhost
           become: false
           changed_when: false
@@ -159,13 +271,15 @@
             msg: >-
               etcd snapshots are cluster-wide: this unit was taken on
               {{ restore_node_marker.stdout | trim }} and is being restored onto
-              {{ inventory_hostname }}, which the recovery procedure supports.
+              {{ inventory_hostname }}, the designated init host. Restoring onto
+              a different target requires first reconciling the init/join topology.
           when:
             - k3s_datastore == 'etcd'
             - restore_node_marker.stdout | trim != inventory_hostname
 
         - name: Read the recorded datastore version
-          ansible.builtin.command: cat "{{ restore_local_dir.path }}/k3s.version"
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, cat, "{{ restore_local_dir.path }}/k3s.version"]
           delegate_to: localhost
           become: false
           changed_when: false
@@ -174,7 +288,11 @@
         - name: Verify SQLite integrity before any host change
           ansible.builtin.command:
             argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
               - sqlite3
+              - -readonly
               - "{{ restore_local_dir.path }}/state.db"
               - PRAGMA integrity_check;
           delegate_to: localhost
@@ -191,6 +309,50 @@
           no_log: true
           when: k3s_datastore == 'sqlite'
 
+        - name: Create private encrypted transfer staging
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: cvp-k3s-transfer
+          delegate_to: localhost
+          become: false
+          register: restore_transfer_dir
+
+        - name: Generate a one-use transport identity in memory
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, age-keygen]
+          delegate_to: localhost
+          become: false
+          register: restore_transfer_identity
+          changed_when: true
+          no_log: true
+
+        - name: Derive the one-use transport recipient
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, age-keygen, -y]
+            stdin: "{{ restore_transfer_identity.stdout }}"
+            stdin_add_newline: false
+          delegate_to: localhost
+          become: false
+          register: restore_transfer_recipient
+          changed_when: false
+          no_log: true
+
+        - name: Encrypt the validated recovery unit for transport
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - age
+              - -r
+              - "{{ restore_transfer_recipient.stdout | trim }}"
+              - -o
+              - "{{ restore_transfer_dir.path }}/recovery.age"
+              - "{{ restore_local_dir.path }}/backup.tar.gz"
+          delegate_to: localhost
+          become: false
+          changed_when: true
+
         - name: Mark controller validation complete
           ansible.builtin.set_fact:
             restore_validation_ok: true
@@ -200,41 +362,82 @@
           ansible.builtin.fail:
             msg: >-
               Recovery unit validation failed on the controller. The host was
-              not modified. Controller staging is removed by the cleanup
-              handler; inspect the error above.
+              not modified. Controller cleanup runs next and any cleanup failure
+              is reported with its path. Inspect the error above.
 
       always:
-        - name: Remove controller staging after a validation failure
+        - name: Check controller plaintext staging for nested mounts before cleanup
+          ansible.builtin.command:
+            argv: "{{ restore_mount_check_command + [restore_local_dir.path] }}"
+          delegate_to: localhost
+          become: false
+          changed_when: false
+          when: restore_local_dir.path is defined
+
+        - name: Remove controller plaintext before any remote operation
           ansible.builtin.file:
             path: "{{ restore_local_dir.path }}"
             state: absent
           delegate_to: localhost
           become: false
-          failed_when: false
-          no_log: true
+          when: restore_local_dir.path is defined
+
+        - name: Check incomplete transfer staging for nested mounts before cleanup
+          ansible.builtin.command:
+            argv: "{{ restore_mount_check_command + [restore_transfer_dir.path] }}"
+          delegate_to: localhost
+          become: false
+          changed_when: false
           when:
-            - restore_local_dir.path is defined
-            - not restore_validation_ok | default(false)
+            - restore_transfer_dir.path is defined
+            - not restore_validation_ok | bool
+
+        - name: Remove incomplete encrypted transfer staging
+          ansible.builtin.file:
+            path: "{{ restore_transfer_dir.path }}"
+            state: absent
+          delegate_to: localhost
+          become: false
+          when:
+            - restore_transfer_dir.path is defined
+            - not restore_validation_ok | bool
 
   tasks:
-    # Everything below lives inside one block so that the always-cleanup
-    # removes controller staging even when a pre-mutation task (version check,
-    # token comparison) fails.
+    # Only one-use ciphertext remains on the controller during remote operations.
     - name: Replace the control-plane state
       block:
+        - name: Acquire exclusive lifecycle ownership for recovery
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/lifecycle/acquire.yml
+
+        - name: Record recovery lifecycle ownership
+          ansible.builtin.set_fact:
+            restore_lifecycle_owned: true
+
+        - name: Validate recovery configuration sources
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/validate-config.yml
+          vars:
+            k3s_require_installed_unit: true
+
+        - name: Validate recovery backup unit identities
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/backup-identity.yml
+
         - name: Read the installed K3s version
           ansible.builtin.command:
             argv:
-              - sh
-              - -c
-              - "{{ k3s_bin_path }} --version | awk 'NR==1 {print $3}'"
+              - timeout
+              - --kill-after=5s
+              - 15s
+              - "{{ k3s_bin_path }}"
+              - --version
           changed_when: false
           register: restore_host_version
 
         - name: Require the installed binary to match the datastore version
           ansible.builtin.assert:
             that:
-              - restore_host_version.stdout | trim == restore_archive_version.stdout | trim
+              - >-
+                restore_host_version.stdout is search('(?m)^k3s version '
+                ~ (restore_archive_version.stdout | trim | regex_escape) ~ '(?: |$)')
             fail_msg: >-
               The recovery datastore was produced by K3s
               {{ restore_archive_version.stdout | trim }} but the installed binary
@@ -243,12 +446,221 @@
               reviewing the version skew policy.
           when: restore_allow_version_mismatch != 'true'
 
-        - name: Initialize restore phase tracking
+        - name: Read the installed server configuration
+          ansible.builtin.slurp:
+            src: "{{ k3s_config_path }}"
+          register: restore_installed_config
+          no_log: true
+
+        - name: Require the installed topology to match the recovery target
+          ansible.builtin.assert:
+            that:
+              - "'server' not in installed_config"
+              - installed_config.get('data-dir', '/var/lib/rancher/k3s') == k3s_data_dir
+              - installed_config.get('cluster-init', false) | bool == (k3s_datastore == 'etcd')
+              - installed_config.get('agent-token-file') == k3s_agent_token_server_path
+              - installed_config.get('token-file', k3s_data_dir ~ '/server/token') == k3s_server_token_path
+              - "'token' not in installed_config and 'agent-token' not in installed_config"
+              - "'datastore-endpoint' not in installed_config"
+              - "'cluster-reset' not in installed_config and 'cluster-reset-restore-path' not in installed_config"
+              - installed_config.get('write-kubeconfig', '/etc/rancher/k3s/k3s.yaml') == '/etc/rancher/k3s/k3s.yaml'
+            fail_msg: Reconcile the installed init/join topology before recovery.
+          vars:
+            installed_config: "{{ restore_installed_config.content | b64decode | from_yaml }}"
+
+        - name: Refuse an unfinished recovery transaction
+          ansible.builtin.stat:
+            path: "{{ restore_guard }}"
+          register: restore_guard_stat
+
+        - name: Require the previous recovery to be resolved explicitly
+          ansible.builtin.assert:
+            that: not restore_guard_stat.stat.exists
+            fail_msg: "Inspect and resolve {{ restore_guard }} before starting another restore."
+
+        - name: Record the original service state
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, systemctl, show, --property=ActiveState, --value, k3s.service]
+          changed_when: false
+          register: restore_original_service
+
+        - name: Record the original backup timer state
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=5s
+              - 15s
+              - systemctl
+              - show
+              - --property=ActiveState
+              - --value
+              - "{{ k3s_backup_timer_name }}"
+          changed_when: false
+          register: restore_original_timer
+
+        - name: Create private per-run remote staging
+          ansible.builtin.file:
+            path: "{{ restore_remote_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Transfer the verified encrypted recovery unit to remote staging
+          ansible.builtin.copy:
+            src: "{{ restore_transfer_dir.path }}/recovery.age"
+            dest: "{{ restore_remote_dir }}/recovery.age"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Decrypt transport using the one-use identity from stdin
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - age
+              - --decrypt
+              - --identity
+              - /dev/stdin
+              - --output
+              - "{{ restore_remote_dir }}/backup.tar.gz"
+              - "{{ restore_remote_dir }}/recovery.age"
+            stdin: "{{ restore_transfer_identity.stdout }}"
+            stdin_add_newline: false
+          changed_when: true
+          no_log: true
+
+        - name: Extract verified transport members into remote staging
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - python3
+              - -c
+              - "{{ restore_extract_script }}"
+              - "{{ restore_remote_dir }}"
+              - "{{ restore_state_file }}"
+              - server.token
+              - agent.token
+              - node
+              - k3s.version
+          changed_when: true
+          no_log: true
+
+        - name: Install the persistent recovery startup inhibit
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/install-start-guard.yml
+
+        - name: Load the persistent recovery startup inhibit
+          ansible.builtin.systemd_service:
+            daemon_reload: true
+          async: 60
+          poll: 2
+
+        - name: Verify the effective recovery startup inhibit
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/validate-config.yml
+          vars:
+            k3s_require_installed_unit: true
+            k3s_require_loaded_guard: true
+
+        - name: Acquire the exclusive recovery guard
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, mkdir, --mode=0700, "{{ restore_guard }}"]
+          changed_when: true
+
+        - name: Record ownership of this recovery guard
           ansible.builtin.set_fact:
-            restore_mutated: false
-            restore_success: false
-            restore_had_previous: false
-            restore_moved_creds: false
+            restore_guard_owned: true
+
+        - name: Bind recovery guard to lifecycle ownership
+          ansible.builtin.copy:
+            dest: "{{ restore_guard }}/owner"
+            content: "{{ cvp_lifecycle_token }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Record the guarded recovery transaction
+          ansible.builtin.copy:
+            dest: "{{ restore_guard }}/transaction"
+            content: "Recovery staging: {{ restore_remote_dir }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Persist the recovery inhibit before stopping or replacing state
+          ansible.builtin.command:
+            argv:
+              - python3
+              - "{{ k3s_start_guard_path | default('/usr/local/libexec/cvp-k3s-start-guard') }}"
+            stdin: >-
+              {{ {'action': 'fence', 'guard': restore_guard,
+                  'legacy_guard': k3s_data_dir ~ '/.cvp-restore-in-progress',
+                  'authorization': k3s_start_authorization_path | default('/run/cvp/k3s-restore-start'),
+                  'lock': cvp_lifecycle_lock_path | default('/var/lib/cvp/lifecycle.lock'),
+                  'token': cvp_lifecycle_token,
+                  'files': [k3s_start_guard_path | default('/usr/local/libexec/cvp-k3s-start-guard'),
+                            k3s_start_guard_dropin
+                            | default('/etc/systemd/system/k3s.service.d/50-cvp-restore-guard.conf')]} | to_json }}
+          changed_when: false
+          no_log: true
+
+        - name: Stop backup scheduling during recovery
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=10s
+              - 100s
+              - systemctl
+              - stop
+              - "{{ k3s_backup_timer_name }}"
+              - "{{ k3s_backup_service_name }}"
+          changed_when: true
+
+        - name: Stop K3s before touching the datastore
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=10s, 100s, systemctl, stop, k3s.service]
+          changed_when: true
+
+        - name: Inspect original state trees
+          ansible.builtin.stat:
+            path: "{{ k3s_data_dir }}/server/{{ item }}"
+          loop: [db, cred, tls]
+          register: restore_original_trees
+
+        - name: Require recovery trees to be real directories
+          ansible.builtin.assert:
+            that: not item.stat.exists or (item.stat.isdir and not item.stat.islnk)
+            fail_msg: Recovery does not support symlinked state trees; resolve the storage layout before replacement.
+          loop: "{{ restore_original_trees.results }}"
+
+        - name: Inspect the datastore root
+          ansible.builtin.stat:
+            path: "{{ k3s_data_dir }}/server/db/{{ 'etcd' if k3s_datastore == 'etcd' else 'state.db' }}"
+          register: restore_datastore_root
+
+        - name: Require the datastore root not to be a symlink
+          ansible.builtin.assert:
+            that: not restore_datastore_root.stat.exists or not restore_datastore_root.stat.islnk
+            fail_msg: Recovery does not support a symlinked datastore root; resolve it before replacement.
+
+        - name: Check the complete mount table before preserving recovery trees
+          ansible.builtin.command:
+            argv: "{{ restore_mount_check_command + restore_mutation_paths }}"
+          changed_when: false
+
+        - name: Inspect original token files
+          ansible.builtin.stat:
+            path: "{{ item.source }}"
+          loop:
+            - { source: "{{ k3s_server_token_path }}", backup: previous-server.token }
+            - { source: "{{ k3s_agent_token_server_path }}", backup: previous-agent.token }
+          register: restore_original_tokens
+          no_log: true
 
         - name: Check whether this server is already initialized
           ansible.builtin.stat:
@@ -264,143 +676,126 @@
             src: "{{ k3s_server_token_path }}"
           register: restore_current_server_token
           no_log: true
-          when: restore_initialized | bool
+          when: restore_original_tokens.results[0].stat.exists
 
         - name: Compare the restored and current server tokens
           ansible.builtin.command:
             argv:
+              - timeout
+              - --kill-after=5s
+              - 15s
               - cmp
               - -s
-              - "{{ restore_local_dir.path }}/server.token"
+              - "{{ restore_remote_dir }}/server.token"
               - /dev/stdin
           args:
             stdin: "{{ restore_current_server_token.content | b64decode }}"
-          delegate_to: localhost
-          become: false
+            stdin_add_newline: false
           register: restore_token_compare
           changed_when: false
-          failed_when: false
+          failed_when: restore_token_compare.rc not in [0, 1]
           no_log: true
-          when: restore_initialized | bool
+          when: restore_original_tokens.results[0].stat.exists
 
         - name: Record whether this is the same cluster
           ansible.builtin.set_fact:
             restore_same_cluster: "{{ restore_token_compare.rc | default(1) == 0 }}"
-          when: restore_initialized | bool
-
-        - name: Create private per-run remote staging
-          ansible.builtin.file:
-            path: "{{ restore_remote_dir }}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0700"
-
-        - name: Transfer only verified recovery members to remote staging
-          ansible.builtin.copy:
-            src: "{{ restore_local_dir.path }}/{{ item }}"
-            dest: "{{ restore_remote_dir }}/{{ item }}"
-            owner: root
-            group: root
-            mode: "0600"
-          loop:
-            - "{{ restore_state_file }}"
-            - server.token
-            - agent.token
-          no_log: true
-
-        - name: Mark the host as being mutated
-          ansible.builtin.set_fact:
-            restore_mutated: true
-
-        - name: Stop K3s before touching the datastore
-          ansible.builtin.systemd_service:
-            name: k3s.service
-            state: stopped
+          when: restore_original_tokens.results[0].stat.exists
 
         - name: Back up the current SQLite datastore for rollback
-          ansible.builtin.copy:
-            src: "{{ k3s_data_dir }}/server/db/state.db"
-            dest: "{{ restore_remote_dir }}/previous-state.db"
-            remote_src: true
-            owner: root
-            group: root
-            mode: "0600"
+          ansible.builtin.command:
+            argv:
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - sqlite3
+              - -readonly
+              - "{{ k3s_data_dir }}/server/db/state.db"
+              - ".backup '{{ restore_remote_dir }}/previous-state.db'"
+          changed_when: true
           when:
             - restore_initialized | bool
             - k3s_datastore == 'sqlite'
 
-        - name: Archive the current etcd datastore for rollback
+        - name: Verify the SQLite rollback copy
           ansible.builtin.command:
             argv:
-              - tar
-              - -C
-              - "{{ k3s_data_dir }}/server"
-              - -czf
-              - "{{ restore_remote_dir }}/previous-db.tgz"
-              - db
+              - timeout
+              - --kill-after=10s
+              - 300s
+              - sqlite3
+              - -readonly
+              - "{{ restore_remote_dir }}/previous-state.db"
+              - 'PRAGMA integrity_check;'
+          changed_when: false
+          register: restore_previous_integrity
+          failed_when: restore_previous_integrity.rc != 0 or restore_previous_integrity.stdout | trim != 'ok'
           when:
             - restore_initialized | bool
-            - k3s_datastore == 'etcd'
+            - k3s_datastore == 'sqlite'
+
+        - name: Archive original datastore and bootstrap trees for rollback
+          ansible.builtin.command:
+            argv: >-
+              {{ ['timeout', '--kill-after=10s', '300s', 'tar', '-C', k3s_data_dir ~ '/server',
+                  '-czf', restore_remote_dir ~ '/previous-trees.tgz']
+                 + (restore_original_trees.results | selectattr('stat.exists') | map(attribute='item') | list) }}
+          changed_when: true
+          when: restore_original_trees.results | selectattr('stat.exists') | list | length > 0
+
+        - name: Verify the rollback tree archive
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=10s, 300s, tar, -tzf, "{{ restore_remote_dir }}/previous-trees.tgz"]
+          changed_when: false
+          when: restore_original_trees.results | selectattr('stat.exists') | list | length > 0
 
         - name: Back up the current tokens for rollback
           ansible.builtin.copy:
-            src: "{{ item.source }}"
-            dest: "{{ restore_remote_dir }}/{{ item.destination }}"
+            src: "{{ item.item.source }}"
+            dest: "{{ restore_remote_dir }}/{{ item.item.backup }}"
             remote_src: true
             owner: root
             group: root
             mode: "0600"
-          loop:
-            - { source: "{{ k3s_server_token_path }}", destination: previous-server.token }
-            - { source: "{{ k3s_agent_token_server_path }}", destination: previous-agent.token }
-          when: restore_initialized | bool
+          loop: "{{ restore_original_tokens.results }}"
+          when: item.stat.exists
+          no_log: true
 
         - name: Record that previous state was preserved
           ansible.builtin.set_fact:
-            restore_had_previous: true
-          when: restore_initialized | bool
+            restore_preserved: true
 
-        - name: Remove stale SQLite sidecars before replacing the database
-          ansible.builtin.file:
-            path: "{{ k3s_data_dir }}/server/db/{{ item }}"
-            state: absent
-          loop:
-            - state.db-wal
-            - state.db-shm
-          when: k3s_datastore == 'sqlite'
-
-        - name: Archive local bootstrap material that belongs to a different cluster
+        - name: Revalidate mounts before replacement
           ansible.builtin.command:
-            argv:
-              - tar
-              - -C
-              - "{{ k3s_data_dir }}/server"
-              - -czf
-              - "{{ restore_remote_dir }}/previous-creds.tgz"
-              - cred
-              - tls
-          when:
-            - restore_initialized | bool
-            - not (restore_same_cluster | default(false) | bool)
+            argv: "{{ restore_mount_check_command + restore_mutation_paths }}"
+          changed_when: false
 
-        - name: Remove conflicting bootstrap material from a different cluster
+        - name: Record replacement before the first destructive operation
+          ansible.builtin.set_fact:
+            restore_replacement_started: true
+
+        - name: Revalidate lifecycle ownership before replacement
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/lifecycle/assert.yml
+          vars:
+            cvp_lifecycle_allow_restore: true
+
+        - name: Remove bootstrap material and SQLite state superseded by the snapshot
           ansible.builtin.file:
             path: "{{ k3s_data_dir }}/server/{{ item }}"
             state: absent
-          loop:
-            - cred
-            - tls
-          when:
-            - restore_initialized | bool
-            - not (restore_same_cluster | default(false) | bool)
+          loop: "{{ ['cred', 'tls'] + (['db'] if k3s_datastore == 'sqlite' else []) }}"
 
-        - name: Record that bootstrap material was moved
-          ansible.builtin.set_fact:
-            restore_moved_creds: true
-          when:
-            - restore_initialized | bool
-            - not (restore_same_cluster | default(false) | bool)
+        - name: Create recovery destination directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+          loop:
+            - "{{ k3s_data_dir }}/server/db"
+            - "{{ k3s_server_token_path | dirname }}"
+            - "{{ k3s_agent_token_server_path | dirname }}"
 
         - name: Install the verified SQLite database
           ansible.builtin.copy:
@@ -411,14 +806,6 @@
             group: root
             mode: "0600"
           when: k3s_datastore == 'sqlite'
-
-        - name: Create the datastore directory
-          ansible.builtin.file:
-            path: "{{ k3s_data_dir }}/server/db"
-            state: directory
-            owner: root
-            group: root
-            mode: "0700"
 
         - name: Stage the restored etcd snapshot
           ansible.builtin.copy:
@@ -442,14 +829,16 @@
             - { source: server.token, destination: "{{ k3s_server_token_path }}" }
             - { source: agent.token, destination: "{{ k3s_agent_token_server_path }}" }
 
-        - name: Prepare a restore configuration without the join URL
+        - name: Prepare the restore configuration with the archived server token
           ansible.builtin.copy:
-            src: "{{ k3s_config_path }}"
+            content: >-
+              {{ (restore_installed_config.content | b64decode | from_yaml
+                  | combine({'token-file': k3s_server_token_path})) | to_nice_yaml }}
             dest: "{{ restore_config }}"
-            remote_src: true
             owner: root
             group: root
             mode: "0600"
+          no_log: true
           when: k3s_datastore == 'etcd'
 
         - name: Remove the join URL from the restore configuration
@@ -462,11 +851,19 @@
         - name: Reset the server from the restored etcd snapshot
           ansible.builtin.command:
             argv:
+              - timeout
+              - --kill-after=15s
+              - 300s
+              - env
+              - -i
+              - PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              - HOME=/root
               - "{{ k3s_bin_path }}"
               - server
               - --cluster-reset
               - "--cluster-reset-restore-path={{ k3s_data_dir }}/server/db/restore-etcd-snapshot"
               - "--config={{ restore_config }}"
+          changed_when: true
           when: k3s_datastore == 'etcd'
 
         - name: Remove the restore-only configuration
@@ -481,11 +878,25 @@
             state: absent
           when: k3s_datastore == 'etcd'
 
+        - name: Authorize the restored service startup
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/authorize-start.yml
+
         - name: Start K3s after installing the recovery unit
           ansible.builtin.systemd_service:
             name: k3s.service
             state: started
-            enabled: true
+            no_block: true
+          async: 60
+          poll: 2
+
+        - name: Wait for the restored service to finish starting
+          ansible.builtin.command:
+            argv: [timeout, --kill-after=5s, 15s, systemctl, is-active, k3s.service]
+          changed_when: false
+          register: restore_service_ready
+          until: restore_service_ready.rc == 0 and restore_service_ready.stdout | trim == 'active'
+          retries: 60
+          delay: 3
 
         - name: Wait for the restored Kubernetes API
           ansible.builtin.wait_for:
@@ -499,6 +910,8 @@
             api_version: v1
             kind: Namespace
           register: restore_namespaces
+          async: 30
+          poll: 5
           retries: 10
           delay: 6
           until: restore_namespaces is not failed
@@ -519,148 +932,223 @@
             restore_success: true
 
       rescue:
-        - name: Fail without rollback when nothing was mutated
+        - name: Fail without replacing any original state when preparation failed
           ansible.builtin.fail:
             msg: >-
-              Restore failed before any host mutation. Rollback material and
-              remote staging were not created. Inspect the error above.
-          when: not restore_mutated | default(false) | bool
+              Restore preparation failed; original datastore, bootstrap material,
+              and tokens were not replaced. Services may have been stopped.
+              Inspect {{ restore_remote_dir }} and {{ restore_guard }} before
+              resuming the original services. No deletion or rollback was attempted.
+          when: not restore_replacement_started | default(false) | bool
 
-        - name: Stop K3s before rolling back
-          ansible.builtin.systemd_service:
-            name: k3s.service
-            state: stopped
-          failed_when: false
+        - name: Roll back only a fully preserved transaction
+          block:
+            - name: Require complete preservation before rollback
+              ansible.builtin.assert:
+                that: restore_preserved | bool
 
-        - name: Remove stale SQLite sidecars before rollback
-          ansible.builtin.file:
-            path: "{{ k3s_data_dir }}/server/db/{{ item }}"
-            state: absent
-          loop:
-            - state.db-wal
-            - state.db-shm
-          failed_when: false
-          when: k3s_datastore == 'sqlite'
+            - name: Revalidate lifecycle ownership before rollback
+              ansible.builtin.include_tasks: ../roles/k3s_server/tasks/lifecycle/assert.yml
+              vars:
+                cvp_lifecycle_allow_restore: true
 
-        - name: Restore the previous SQLite database
-          ansible.builtin.copy:
-            src: "{{ restore_remote_dir }}/previous-state.db"
-            dest: "{{ k3s_data_dir }}/server/db/state.db"
-            remote_src: true
-            owner: root
-            group: root
-            mode: "0600"
-          failed_when: false
-          when:
-            - restore_had_previous | bool
-            - k3s_datastore == 'sqlite'
+            - name: Revoke replacement startup authorization before rollback
+              ansible.builtin.include_tasks: ../roles/k3s_server/tasks/revoke-start.yml
 
-        - name: Remove the failed etcd datastore
-          ansible.builtin.file:
-            path: "{{ k3s_data_dir }}/server/db"
-            state: absent
-          failed_when: false
-          when:
-            - restore_had_previous | bool
-            - k3s_datastore == 'etcd'
+            - name: Stop K3s before rolling back
+              ansible.builtin.command:
+                argv: [timeout, --kill-after=10s, 100s, systemctl, stop, k3s.service]
+              changed_when: true
 
-        - name: Restore the previous etcd datastore
-          ansible.builtin.command:
-            argv:
-              - tar
-              - -C
-              - "{{ k3s_data_dir }}/server"
-              - -xzf
-              - "{{ restore_remote_dir }}/previous-db.tgz"
-          failed_when: false
-          when:
-            - restore_had_previous | bool
-            - k3s_datastore == 'etcd'
+            - name: Revalidate mounts before rollback deletion
+              ansible.builtin.command:
+                argv: "{{ restore_mount_check_command + restore_mutation_paths }}"
+              changed_when: false
 
-        - name: Remove leftover restore artifacts
-          ansible.builtin.file:
-            path: "{{ item }}"
-            state: absent
-          failed_when: false
-          loop:
-            - "{{ restore_config }}"
-            - "{{ k3s_data_dir }}/server/db/restore-etcd-snapshot"
-          when: k3s_datastore == 'etcd'
+            - name: Remove only state touched by the failed replacement
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: absent
+              loop: "{{ restore_mutation_paths }}"
 
-        - name: Restore the previous tokens
-          ansible.builtin.copy:
-            src: "{{ restore_remote_dir }}/{{ item.source }}"
-            dest: "{{ item.destination }}"
-            remote_src: true
-            owner: root
-            group: root
-            mode: "0600"
-          failed_when: false
-          no_log: true
-          loop:
-            - { source: previous-server.token, destination: "{{ k3s_server_token_path }}" }
-            - { source: previous-agent.token, destination: "{{ k3s_agent_token_server_path }}" }
-          when: restore_had_previous | bool
+            - name: Restore the original datastore and bootstrap trees
+              ansible.builtin.command:
+                argv:
+                  - timeout
+                  - --kill-after=10s
+                  - 300s
+                  - tar
+                  - -C
+                  - "{{ k3s_data_dir }}/server"
+                  - -xzf
+                  - "{{ restore_remote_dir }}/previous-trees.tgz"
+              changed_when: true
+              when: restore_original_trees.results | selectattr('stat.exists') | list | length > 0
 
-        - name: Remove the unrestored datastore when no previous state existed
-          ansible.builtin.file:
-            path: "{{ item }}"
-            state: absent
-          loop:
-            - "{{ k3s_data_dir }}/server/db"
-            - "{{ k3s_server_token_path }}"
-            - "{{ k3s_agent_token_server_path }}"
-          when: not restore_had_previous | bool
+            - name: Remove archived SQLite sidecars before installing the logical rollback copy
+              ansible.builtin.file:
+                path: "{{ k3s_data_dir }}/server/db/{{ item }}"
+                state: absent
+              loop: [state.db-wal, state.db-shm]
+              when:
+                - restore_initialized | bool
+                - k3s_datastore == 'sqlite'
 
-        - name: Restore archived bootstrap material
-          ansible.builtin.command:
-            argv:
-              - tar
-              - -C
-              - "{{ k3s_data_dir }}/server"
-              - -xzf
-              - "{{ restore_remote_dir }}/previous-creds.tgz"
-          failed_when: false
-          when: restore_moved_creds | default(false) | bool
+            - name: Restore the WAL-inclusive SQLite rollback copy
+              ansible.builtin.copy:
+                src: "{{ restore_remote_dir }}/previous-state.db"
+                dest: "{{ k3s_data_dir }}/server/db/state.db"
+                remote_src: true
+                owner: root
+                group: root
+                mode: "0600"
+              when:
+                - restore_initialized | bool
+                - k3s_datastore == 'sqlite'
 
-        - name: Restart K3s after rollback
-          ansible.builtin.systemd_service:
-            name: k3s.service
-            state: restarted
-          failed_when: false
+            - name: Restore original tokens that existed before replacement
+              ansible.builtin.copy:
+                src: "{{ restore_remote_dir }}/{{ item.item.backup }}"
+                dest: "{{ item.item.source }}"
+                remote_src: true
+                owner: root
+                group: root
+                mode: "0600"
+              no_log: true
+              loop: "{{ restore_original_tokens.results }}"
+              when: item.stat.exists
 
-        - name: Wait for the rolled-back Kubernetes API
-          ansible.builtin.wait_for:
-            host: "{{ wireguard_address }}"
-            port: 6443
-            timeout: 120
-          failed_when: false
+            - name: Authorize the preserved standalone rollback startup
+              ansible.builtin.include_tasks: ../roles/k3s_server/tasks/authorize-start.yml
+              when:
+                - restore_initialized | bool
+                - restore_original_service.stdout | trim == 'active'
+                - groups['k3s_servers'] | length == 1
+
+            - name: Restart an originally active standalone server after complete rollback
+              ansible.builtin.systemd_service:
+                name: k3s.service
+                state: started
+                no_block: true
+              async: 60
+              poll: 2
+              when:
+                - restore_initialized | bool
+                - restore_original_service.stdout | trim == 'active'
+                - groups['k3s_servers'] | length == 1
+
+            - name: Wait for the standalone rollback service
+              ansible.builtin.command:
+                argv: [timeout, --kill-after=5s, 15s, systemctl, is-active, k3s.service]
+              changed_when: false
+              register: restore_rollback_ready
+              until: restore_rollback_ready.rc == 0 and restore_rollback_ready.stdout | trim == 'active'
+              retries: 40
+              delay: 3
+              when:
+                - restore_initialized | bool
+                - restore_original_service.stdout | trim == 'active'
+                - groups['k3s_servers'] | length == 1
+
+          rescue:
+            - name: Stop recovery after a rollback failure
+              ansible.builtin.fail:
+                msg: >-
+                  ROLLBACK FAILED. Do not restart services or delete peer databases.
+                  Preserve {{ restore_remote_dir }} and {{ restore_guard }} for
+                  manual recovery. The failed task above must be resolved before
+                  any startup; the original archive and tokens have been retained.
 
         - name: Fail with the preserved rollback location
           ansible.builtin.fail:
             msg: >-
-              K3s restoration failed and rollback was attempted. Rollback
-              material is preserved in {{ restore_remote_dir }} (root-only;
-              it contains plaintext datastore and token copies). Verify the
-              rollback, then remove that directory explicitly. On the other
-              servers, delete /var/lib/rancher/k3s/server/db before restarting
-              them so they rejoin the rolled-back cluster. Inspect the journal
-              for the failed attempt.
+              Restore failed; the original local state was restored. Material is
+              preserved in {{ restore_remote_dir }} (plaintext, root-only).
+              This is RAW rollback, not cluster-reset: KEEP all original peer
+              databases and tokens. Multi-server targets remain stopped; coordinate
+              startup of the original quorum. A target with no original initialized
+              database also remains stopped. Verify recovery before removing
+              {{ restore_guard }} and explicitly resuming the backup timer.
 
       always:
+        - name: Remove any unused recovery startup authorization
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/revoke-start.yml
+          when: restore_lifecycle_owned | bool
+
+        - name: Check encrypted controller staging for nested mounts before cleanup
+          ansible.builtin.command:
+            argv: "{{ restore_mount_check_command + [restore_transfer_dir.path] }}"
+          delegate_to: localhost
+          become: false
+          vars:
+            ansible_become: false
+          changed_when: false
+          when: restore_transfer_dir.path is defined
+
         - name: Remove controller recovery staging
           ansible.builtin.file:
-            path: "{{ restore_local_dir.path }}"
+            path: "{{ restore_transfer_dir.path }}"
             state: absent
           delegate_to: localhost
           become: false
-          failed_when: false
-          no_log: true
+          vars:
+            ansible_become: false
+          when: restore_transfer_dir.path is defined
+
+        - name: Check the owned guard for nested mounts before cleanup
+          ansible.builtin.command:
+            argv: "{{ restore_mount_check_command + [restore_guard] }}"
+          changed_when: false
+          when:
+            - restore_success | bool
+            - restore_guard_owned | bool
+
+        - name: Remove the backup guard after verified recovery
+          ansible.builtin.file:
+            path: "{{ restore_guard }}"
+            state: absent
+          when:
+            - restore_success | bool
+            - restore_guard_owned | bool
+
+        - name: Resume previously active backup scheduling after verified recovery
+          ansible.builtin.systemd_service:
+            name: "{{ k3s_backup_timer_name }}"
+            state: started
+            no_block: true
+          async: 60
+          poll: 2
+          when:
+            - restore_success | default(false) | bool
+            - restore_original_timer.stdout | default('inactive') | trim == 'active'
+
+        - name: Report the reset peer recovery requirements
+          ansible.builtin.debug:
+            msg: >-
+              Snapshot recovery on the designated init host is verified. Keep
+              peers stopped until their join URLs point here and their server and
+              agent tokens match the restored files. Preserve peer bootstrap
+              material before reconciling it against this snapshot; newer local
+              credentials can prevent rejoin. Only then clear peer databases and
+              rejoin one at a time. Reconcile agent tokens and verify every node.
+          when:
+            - restore_success | default(false) | bool
+            - groups['k3s_servers'] | length > 1
+
+        - name: Check remote recovery staging for nested mounts before cleanup
+          ansible.builtin.command:
+            argv: "{{ restore_mount_check_command + [restore_remote_dir] }}"
+          changed_when: false
+          when: restore_success | default(false) | bool
 
         - name: Remove remote recovery staging after a verified restore
           ansible.builtin.file:
             path: "{{ restore_remote_dir }}"
             state: absent
+          when: restore_success | default(false) | bool
+
+        - name: Release lifecycle ownership after complete recovery cleanup
+          ansible.builtin.include_tasks: ../roles/k3s_server/tasks/lifecycle/release.yml
           when: restore_success | default(false) | bool
 
 ...

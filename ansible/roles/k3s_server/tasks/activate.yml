@@ -1,0 +1,126 @@
+---
+- name: Require lifecycle ownership before K3s activation
+  ansible.builtin.include_tasks: lifecycle/assert.yml
+
+- name: Validate configuration sources before K3s activation
+  ansible.builtin.include_tasks: validate-config.yml
+
+- name: Hash the desired activation inputs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop: "{{ k3s_activation_inputs }}"
+  register: k3s_activation_stats
+  no_log: true
+
+- name: Require complete activation inputs
+  ansible.builtin.assert:
+    that: item.stat.exists and item.stat.isreg and item.stat.checksum is defined
+  loop: "{{ k3s_activation_stats.results }}"
+  no_log: true
+
+- name: Compute the desired activation fingerprint
+  ansible.builtin.set_fact:
+    k3s_activation_desired: >-
+      {{ k3s_activation_stats.results | map(attribute='stat.checksum') | join(':') | hash('sha256') }}
+  no_log: true
+
+- name: Inspect the last verified activation
+  ansible.builtin.stat:
+    path: "{{ k3s_activation_stamp }}"
+  register: k3s_activation_stamp_stat
+
+- name: Read the last verified activation
+  ansible.builtin.slurp:
+    src: "{{ k3s_activation_stamp }}"
+  register: k3s_activation_previous
+  when: k3s_activation_stamp_stat.stat.exists
+  no_log: true
+
+- name: Read the running K3s process before activation
+  ansible.builtin.command:
+    argv: [timeout, --kill-after=5s, 15s, systemctl, show, --property=MainPID, --value, "{{ k3s_activation_unit }}"]
+  register: k3s_activation_pid_before
+  changed_when: false
+
+- name: Inspect the running binary before activation
+  ansible.builtin.command:
+    argv: [timeout, --kill-after=5s, 10s, "/proc/{{ k3s_activation_pid_before.stdout | trim }}/exe", --version]
+  register: k3s_activation_runtime_before
+  changed_when: false
+  failed_when: false
+  when: k3s_activation_pid_before.stdout | trim is match('^[1-9][0-9]*$')
+
+- name: Decide whether activation is required
+  ansible.builtin.set_fact:
+    k3s_activation_needed: >-
+      {{ (k3s_activation_previous.content | default('') | b64decode | trim) != k3s_activation_desired
+         or not (k3s_activation_runtime_before.stdout | default('') is
+                 search('(?m)^k3s version ' ~ (k3s_version | regex_escape) ~ '(?: |$)')) }}
+
+- name: Activate changed or previously unverified K3s state
+  ansible.builtin.systemd_service:
+    name: "{{ k3s_activation_unit }}"
+    enabled: true
+    daemon_reload: true
+    no_block: true
+    state: "{{ 'restarted' if k3s_activation_needed else 'started' }}"
+  async: 60
+  poll: 2
+
+- name: Wait for K3s activation readiness
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - --kill-after=5s
+      - 15s
+      - systemctl
+      - show
+      - --property=ActiveState
+      - --property=MainPID
+      - "{{ k3s_activation_unit }}"
+  register: k3s_activation_ready
+  changed_when: false
+  until:
+    - k3s_activation_ready.rc == 0
+    - k3s_activation_ready.stdout is search('(?m)^ActiveState=active$')
+    - k3s_activation_ready.stdout is search('(?m)^MainPID=[1-9][0-9]*$')
+    - >-
+      not k3s_activation_needed or not
+      (k3s_activation_ready.stdout is search('(?m)^MainPID=' ~ (k3s_activation_pid_before.stdout | trim) ~ '$'))
+  retries: 60
+  delay: 3
+
+- name: Read the activated K3s process
+  ansible.builtin.command:
+    argv: [timeout, --kill-after=5s, 15s, systemctl, show, --property=MainPID, --value, "{{ k3s_activation_unit }}"]
+  register: k3s_activation_pid
+  changed_when: false
+
+- name: Revalidate the effective activated K3s configuration
+  ansible.builtin.include_tasks: validate-config.yml
+  vars:
+    k3s_require_installed_unit: true
+    k3s_require_loaded_guard: "{{ k3s_activation_unit == 'k3s.service' }}"
+
+- name: Require a running K3s process
+  ansible.builtin.assert:
+    that: k3s_activation_pid.stdout | trim is match('^[1-9][0-9]*$')
+
+- name: Verify the activated binary version
+  ansible.builtin.command:
+    argv: [timeout, --kill-after=5s, 10s, "/proc/{{ k3s_activation_pid.stdout | trim }}/exe", --version]
+  register: k3s_activation_runtime
+  changed_when: false
+  failed_when: >-
+    k3s_activation_runtime.rc != 0 or not
+    (k3s_activation_runtime.stdout is search('(?m)^k3s version ' ~ (k3s_version | regex_escape) ~ '(?: |$)'))
+
+- name: Record only a verified successful activation
+  ansible.builtin.copy:
+    dest: "{{ k3s_activation_stamp }}"
+    content: "{{ k3s_activation_desired }}\n"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true

@@ -3,8 +3,15 @@ token-file: "{{ k3s_agent_token_path }}"
 data-dir: "{{ k3s_data_dir }}"
 node-name: "{{ node_name }}"
 node-ip: "{{ wireguard_address }}"
+kube-proxy-arg:
+  - "proxy-mode=iptables"
+  - "iptables-localhost-nodeports=true"
+  - "nodeport-addresses=127.0.0.1/32,{{ wireguard_address }}/32,::1/128"
 flannel-iface: "{{ k3s_flannel_iface }}"
 node-label:
+  - "cvp.io/bootstrap-quarantine=true"
 {% for label in k3s_node_labels %}
   - "{{ label }}"
 {% endfor %}
+node-taint:
+  - "cvp.io/bootstrap=true:NoSchedule"

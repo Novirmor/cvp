@@ -1,4 +1,7 @@
 ---
+- name: Require lifecycle ownership before agent convergence
+  ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/lifecycle/assert.yml"
+
 - name: Require the agent inventory role
   ansible.builtin.assert:
     that:
@@ -11,6 +14,12 @@
       The K3s agent needs k3s_role=agent, a pinned version, a WireGuard node
       address, and a reachable server host in inventory.
 
+- name: Validate the private NodePort address
+  ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/validate-nodeport.yml"
+
+- name: Validate configuration sources before agent changes
+  ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/validate-config.yml"
+
 - name: Install K3s agent dependencies
   ansible.builtin.apt:
     name:
@@ -18,6 +27,9 @@
       - socat
     state: present
     update_cache: true
+    lock_timeout: 60
+  async: "{{ 0 if ansible_check_mode else 900 }}"
+  poll: 5
 
 - name: Create K3s agent directories
   ansible.builtin.file:
@@ -34,11 +46,11 @@
   ansible.builtin.get_url:
     url: "{{ k3s_binary_url }}"
     checksum: "sha256:{{ k3s_checksum_url }}"
+    timeout: 30
     dest: "{{ k3s_bin_path }}"
     owner: root
     group: root
     mode: "0755"
-  notify: Restart K3s agent
 
 - name: Link the K3s client tools
   ansible.builtin.file:
@@ -59,6 +71,7 @@
   delegate_to: "{{ k3s_server_host }}"
   register: k3s_server_token_slurp
   no_log: true
+  when: not ansible_check_mode
 
 - name: Require a non-empty server token
   ansible.builtin.assert:
@@ -68,6 +81,7 @@
       The K3s agent token was not readable. The server must be healthy before
       agents are joined.
   no_log: true
+  when: not ansible_check_mode
 
 - name: Install the agent token without exposing it in config or logs
   ansible.builtin.copy:
@@ -77,6 +91,7 @@
     group: root
     mode: "0600"
   no_log: true
+  when: not ansible_check_mode
 
 - name: Render the K3s agent configuration
   ansible.builtin.template:
@@ -85,7 +100,6 @@
     owner: root
     group: root
     mode: "0644"
-  notify: Restart K3s agent
 
 - name: Install the K3s agent systemd unit
   ansible.builtin.template:
@@ -94,13 +108,20 @@
     owner: root
     group: root
     mode: "0644"
-  notify:
-    - Reload systemd
-    - Restart K3s agent
 
-- name: Enable and start the K3s agent
-  ansible.builtin.systemd_service:
-    name: k3s-agent.service
-    state: started
-    enabled: true
-    daemon_reload: true
+- name: Activate and verify the K3s agent
+  ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/activate.yml"
+  when: not ansible_check_mode
+  vars:
+    k3s_activation_unit: k3s-agent.service
+    k3s_activation_stamp: "{{ k3s_data_dir }}/.cvp-agent-activation"
+    k3s_activation_inputs:
+      - "{{ k3s_bin_path }}"
+      - "{{ k3s_config_path }}"
+      - /etc/systemd/system/k3s-agent.service
+      - "{{ k3s_agent_token_path }}"
+
+- name: Report the limits of an agent check-mode preview
+  ansible.builtin.debug:
+    msg: Check mode previews configuration only; token exchange and activation require a real convergence run.
+  when: ansible_check_mode

@@ -1,4 +1,96 @@
 ---
+- name: Require lifecycle ownership before backup convergence
+  ansible.builtin.include_tasks: lifecycle/assert.yml
+
+- name: Require explicit backup unit names
+  ansible.builtin.assert:
+    that:
+      - k3s_backup_timer_name is string
+      - k3s_backup_service_name is string
+      - k3s_backup_timer_name is match('^[A-Za-z0-9][A-Za-z0-9_.@-]*\.timer\Z')
+      - k3s_backup_service_name is match('^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service\Z')
+
+- name: Check historical backup identity before probing desired units
+  ansible.builtin.include_tasks: backup-identity.yml
+
+- name: Inspect current backup units through the systemd manager
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - --kill-after=5s
+      - 15s
+      - systemctl
+      - show
+      - --all
+      - --property=LoadState
+      - --property=UnitFileState
+      - --property=ActiveState
+      - --
+      - "{{ item }}"
+  loop:
+    - "{{ k3s_backup_timer_name }}"
+    - "{{ k3s_backup_service_name }}"
+  register: _k3s_backup_unit_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Require successful complete backup unit property queries
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+      - item.stderr | trim | length == 0
+      - item.stdout_lines | length == 3
+      - >-
+        item.stdout_lines | select('match', '^(LoadState|UnitFileState|ActiveState)=[a-z-]*\Z')
+        | list | length == 3
+      - item.stdout_lines | map('regex_replace', '=.*', '') | unique | length == 3
+    fail_msg: >-
+      Cannot establish backup state from the systemd manager. Resolve manager access,
+      incomplete output, or probe failures before changing K3s.
+  loop: "{{ _k3s_backup_unit_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Require conclusive backup unit load and activity states
+  ansible.builtin.assert:
+    that:
+      - _k3s_backup_properties.LoadState in ['loaded', 'not-found']
+      - >-
+        _k3s_backup_properties.ActiveState in
+        ['active', 'reloading', 'refreshing', 'inactive', 'failed', 'activating', 'deactivating']
+      - >-
+        (_k3s_backup_properties.LoadState == 'not-found'
+         and _k3s_backup_properties.UnitFileState == ''
+         and _k3s_backup_properties.ActiveState == 'inactive')
+        or (_k3s_backup_properties.LoadState == 'loaded'
+            and _k3s_backup_properties.UnitFileState in ['enabled', 'enabled-runtime', 'disabled', 'static'])
+      - >-
+        item.item != k3s_backup_timer_name or _k3s_backup_properties.UnitFileState != 'static'
+    fail_msg: Backup unit state is unsupported or inconsistent; resolve it before changing K3s.
+  vars:
+    _k3s_backup_properties: "{{ dict(item.stdout_lines | map('split', '=')) }}"
+  loop: "{{ _k3s_backup_unit_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Require host confirmation before disabling established backups
+  ansible.builtin.assert:
+    that:
+      - >-
+        k3s_backup_enabled | bool
+        or (_k3s_backup_timer_properties.UnitFileState not in ['enabled', 'enabled-runtime']
+            and _k3s_backup_unit_status.results | map(attribute='stdout_lines') | flatten
+                | select('match', '^ActiveState=') | map('regex_replace', '^ActiveState=', '')
+                | reject('in', ['inactive', 'failed']) | list | length == 0)
+        or k3s_backup_disable_confirm | default('') == inventory_hostname
+    fail_msg: >-
+      Backups are enabled or active on {{ inventory_hostname }}, but the desired configuration
+      disables them. Restore the persistent backup configuration, or set the host-scoped
+      k3s_backup_disable_confirm to {{ inventory_hostname }} after explicitly approving disablement.
+  vars:
+    _k3s_backup_timer_properties: "{{ dict(_k3s_backup_unit_status.results[0].stdout_lines | map('split', '=')) }}"
+
 - name: Validate backup inputs before enabling the timer
   ansible.builtin.assert:
     that:
@@ -15,8 +107,13 @@
     name:
       - age
       - sqlite3
+      - util-linux
     state: present
     update_cache: true
+    lock_timeout: 60
+  async: "{{ 0 if ansible_check_mode else 900 }}"
+  poll: 5
+  when: not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Create the local encrypted backup directory
   ansible.builtin.file:
@@ -25,6 +122,13 @@
     owner: root
     group: root
     mode: "0700"
+  when: not _k3s_backup_preflight_only | default(false) | bool
+
+- name: Record backup identity before installing its script or units
+  ansible.builtin.include_tasks: backup-identity.yml
+  vars:
+    _k3s_backup_identity_action: record
+  when: not ansible_check_mode and not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Install the K3s SQLite and token backup script
   ansible.builtin.template:
@@ -34,6 +138,7 @@
     group: root
     mode: "0700"
   no_log: true
+  when: not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Install the backup service
   ansible.builtin.template:
@@ -42,6 +147,7 @@
     owner: root
     group: root
     mode: "0644"
+  when: not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Install the backup timer
   ansible.builtin.template:
@@ -50,20 +156,31 @@
     owner: root
     group: root
     mode: "0644"
+  when: not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Reload systemd units after backup changes
   ansible.builtin.systemd_service:
     daemon_reload: true
+  async: 60
+  poll: 2
+  when: not ansible_check_mode and not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Stop the backup service only when backups are disabled
   ansible.builtin.systemd_service:
     name: "{{ k3s_backup_service_name }}"
     state: stopped
     enabled: false
-  when: not k3s_backup_enabled | bool
+  async: 120
+  poll: 2
+  when: >-
+    not k3s_backup_enabled | bool and not ansible_check_mode
+    and not _k3s_backup_preflight_only | default(false) | bool
 
 - name: Ensure the backup timer is in the requested state
   ansible.builtin.systemd_service:
     name: "{{ k3s_backup_timer_name }}"
     state: "{{ 'started' if k3s_backup_enabled | bool else 'stopped' }}"
     enabled: "{{ k3s_backup_enabled | bool }}"
+  async: 120
+  poll: 2
+  when: not ansible_check_mode and not _k3s_backup_preflight_only | default(false) | bool
