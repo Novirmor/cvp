@@ -18,6 +18,7 @@ tasks:
     cmds:
       - mise exec -- ./scripts/lint-worktree
       - ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-lint ansible
+      - mise exec -- conftest fmt --check tests/policy
 
   test:
     desc: Run credential-free repository tests
@@ -42,6 +43,12 @@ tasks:
         ansible/playbooks/bootstrap-access.yml --syntax-check
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ansible/playbooks/export-kubeconfig.yml --syntax-check
+      - >-
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ansible/playbooks/validate-inventory.yml --syntax-check
+      - >-
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
         ansible/playbooks/verify.yml --syntax-check
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
@@ -51,6 +58,21 @@ tasks:
         -i ansible/inventory/hosts.yml ansible/playbooks/test-labels.yml
       - mise exec -- ./scripts/test-onboard-node
       - mise exec -- ./scripts/test-prepare-access
+      - mise exec -- python3 -B scripts/test-wrapper-safety.py
+      - mise exec -- python3 -B scripts/test-tofu-identity.py
+      - mise exec -- python3 -B scripts/test-storage-safety.py
+      - mise exec -- python3 -B scripts/test-operator-config.py
+      - mise exec -- python3 -B scripts/test-kubeconfig-export.py -v
+      - mise exec -- python3 -B scripts/test-admin-access.py -v
+      - mise exec -- python3 -B scripts/test-topology.py
+      - mise exec -- python3 -B scripts/test-site-orchestration.py -v
+      - mise exec -- python3 -B scripts/test-onboarding-path.py -v
+      - mise exec -- python3 -B scripts/test-verification.py
+      - mise exec -- python3 -B scripts/test-backup-config.py
+      - mise exec -- python3 -B scripts/test-k3s-lifecycle.py -v
+      - >-
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
+        -i localhost, ansible/playbooks/test-host-network-security.yml
       - mise exec -- ./scripts/test-manifests
       - |
         if mise exec -- ./scripts/tofu-operation cloudflare plan -var-file=/tmp/vars; then
@@ -77,12 +99,39 @@ tasks:
     cmds:
       - mise exec -- gitleaks dir --redact --no-banner --config .gitleaks.toml .
 
+  test-firewall-dataplane:
+    desc: Run real-kernel firewall checks in unprivileged isolated network namespaces
+    cmds:
+      - mise exec -- python3 -B scripts/test-firewall-dataplane.py
+
+  test-wireguard-dataplane:
+    desc: Run WireGuard reconciliation checks in isolated unprivileged network namespaces
+    cmds:
+      - mise exec -- python3 -B scripts/test-wireguard-dataplane.py
+
+  tailscale-identity-init:
+    desc: Establish the protected tailnet identity in empty state before imports
+    cmds:
+      - mise exec -- ./scripts/tofu-operation tailscale establish-identity {{.CLI_ARGS}}
+
   probe:
     desc: Check host capabilities before convergence, without requiring an active WireGuard mesh
     cmds:
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
         ansible/playbooks/probe.yml {{.CLI_ARGS}}
+
+  validate-inventory:
+    desc: Validate operator configuration, topology, and node tags without contacting hosts
+    cmds:
+      - >-
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
+        -i ansible/inventory/hosts.yml ansible/playbooks/validate-inventory.yml
+
+  export-kubeconfig:
+    desc: Export a private TLS-verified cluster-admin kubeconfig with explicit host confirmation
+    cmds:
+      - mise exec -- ./scripts/export-kubeconfig
 
   probe-wireguard:
     desc: Check the converged WireGuard mesh and path MTU (run after task site)

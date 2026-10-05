@@ -11,7 +11,7 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 75
     steps:
       - name: Check out
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -28,5 +28,34 @@ jobs:
       - name: Verify ansible-playbook is provided by mise
         run: mise which ansible-playbook
 
+      - name: Install parser and database test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server sqlite3
+
       - name: Run quality gates
         run: task lint && task test && task security
+
+  network-dataplane:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654
+        with:
+          version: 2026.3.13
+          install: true
+          cache: true
+
+      - name: Install isolated network test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 nftables wireguard-tools
+          sudo modprobe wireguard
+          sudo modprobe nf_tables
+
+      - name: Run unprivileged kernel dataplane checks
+        run: task test-firewall-dataplane && task test-wireguard-dataplane

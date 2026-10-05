@@ -1,7 +1,8 @@
 [tools]
 task = "3.52.0"
 "pipx:pre-commit" = "4.1.0"
-"pipx:ansible-core" = "2.19.4"
+uv = "0.10.7"
+"pipx:ansible-core" = { version = "2.19.4", uvx = true, uvx_args = "--with jsonpatch==1.33 --with jsonpointer==3.0.0" }
 "pipx:ansible-lint" = "26.8.0"
 opentofu = "1.12.5"
 kubectl = "1.35.4"
