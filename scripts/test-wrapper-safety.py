@@ -29,18 +29,23 @@ with open(os.environ["TEST_CALLS"], "a") as log:
                          "cwd": os.getcwd(), "config": os.getenv("CVP_OPERATOR_CONFIG_FILE"),
                          "config_sha256": os.getenv("CVP_OPERATOR_CONFIG_SHA256")}) + "\n")
 tool = pathlib.Path(sys.argv[0]).name
-if tool == "mise":
-    if "ansible-inventory" in args:
+playbook = next((pathlib.Path(a).name for a in args if a.endswith(".yml") and "playbooks" in a), "")
+if tool in ("mise", "ansible-inventory", "ansible-playbook", "ansible"):
+    if "ansible-inventory" in args or tool == "ansible-inventory":
         print(os.environ["TEST_INVENTORY"])
-    if os.getenv("TEST_MUTATE_CONFIG") and "ansible/playbooks/probe.yml" in args:
+    if tool == "ansible":
+        print("worker1 | CHANGED | rc=0 | (stdout) root")
+    if os.getenv("TEST_MUTATE_CONFIG") and playbook == "probe.yml":
         pathlib.Path(os.environ["CVP_OPERATOR_CONFIG_FILE"]).write_text(
             '{"cvp_operator_defaults":{"storage_enabled":false}}')
-    if os.getenv("TEST_CREATE_CONFIG") and "ansible/playbooks/probe.yml" in args:
+    if os.getenv("TEST_CREATE_CONFIG") and playbook == "probe.yml":
         path = pathlib.Path(os.environ["XDG_CONFIG_HOME"]) / "cvp/operator.yml"
         path.parent.mkdir(parents=True)
         path.write_text('{}')
-    if os.getenv("TEST_FAIL_PREFLIGHT") and "ansible/playbooks/onboard-preflight.yml" in args:
+    if os.getenv("TEST_FAIL_PREFLIGHT") and playbook == "onboard-preflight.yml":
         sys.exit(1)
+elif tool == "ssh-keygen" and "-F" in args:
+    print(args[args.index("-F") + 1] + " ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture")
 elif tool == "tofu":
     assert args[0].startswith("-chdir=/"), args
     if args[1] == "plan":
@@ -78,7 +83,7 @@ class WrapperSafety(unittest.TestCase):
         self.work = Path(self.temporary.name)
         self.bin = self.work / "bin"
         self.bin.mkdir()
-        for name in ("tofu", "mise", "ssh-keygen"):
+        for name in ("tofu", "mise", "ssh-keygen", "ansible-inventory", "ansible-playbook", "ansible"):
             executable = self.bin / name
             executable.write_text(STUB)
             executable.chmod(0o700)
@@ -94,7 +99,11 @@ class WrapperSafety(unittest.TestCase):
             key: value for key, value in os.environ.items()
             if not key.startswith(("TF_", "CVP_", "TEST_", "AWS_", "TAILSCALE_", "CLOUDFLARE_"))
         }
+        self.home = self.work / "home"
+        (self.home / ".ssh").mkdir(parents=True, mode=0o700)
+        (self.home / ".ssh/known_hosts").write_text("worker1.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture\n")
         self.env.update({
+            "HOME": str(self.home), "XDG_STATE_HOME": str(self.work / "state"),
             "XDG_CONFIG_HOME": str(self.work / "config"),
             "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
             "TEST_CALLS": str(self.calls), "TF_DATA_DIR": str(self.backend),
@@ -126,6 +135,13 @@ class WrapperSafety(unittest.TestCase):
 
     def logged(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()] if self.calls.exists() else []
+
+    def playbooks(self):
+        return [call for call in self.logged() if call["tool"] == "ansible-playbook"]
+
+    def playbook_names(self):
+        return [Path(next(a for a in call["args"] if a.endswith(".yml") and "playbooks/" in a)).name
+                for call in self.playbooks()]
 
     def config(self, data):
         path = self.work / "operator.json"
@@ -257,15 +273,14 @@ class WrapperSafety(unittest.TestCase):
             "cvp_operator_hosts": {"worker1": {"storage_device": "/dev/disk/by-id/fixture"}},
         })
         self.run_wrapper("onboard-node")
-        calls = self.logged()
-        self.assertEqual(len(calls), 7)
+        calls = [call for call in self.logged() if call["tool"].startswith("ansible")]
+        self.assertEqual(self.playbook_names(), ["validate-inventory.yml", "probe.yml", "onboard-preflight.yml",
+                                                 "site.yml", "probe-wireguard.yml", "verify.yml"])
         self.assertTrue(all(call["config"] == str(path) for call in calls))
         self.assertEqual(len({call["config_sha256"] for call in calls}), 1)
         self.assertEqual(len(calls[0]["config_sha256"]), 64)
-        site = next(call for call in calls if "ansible/playbooks/site.yml" in call["args"])
-        self.assertNotIn("--limit", site["args"])
         for name in ("site.yml", "onboard-preflight.yml"):
-            call = next(call for call in calls if f"ansible/playbooks/{name}" in call["args"])
+            call = next(call for call in self.playbooks() if any(a.endswith(f"playbooks/{name}") for a in call["args"]))
             self.assertNotIn("--limit", call["args"])
             extras = [json.loads(call["args"][i + 1]) for i, arg in enumerate(call["args"]) if arg == "-e"]
             self.assertEqual(extras[-1]["cvp_onboard_node"], "worker1")
@@ -275,21 +290,20 @@ class WrapperSafety(unittest.TestCase):
         self.config({"cvp_operator_defaults": {"storage_enabled": True}})
         self.env["TEST_MUTATE_CONFIG"] = "1"
         self.run_wrapper("onboard-node", code=None)
-        calls = self.logged()
-        self.assertEqual(len(calls), 4)
-        self.assertIn("ansible/playbooks/probe.yml", calls[-1]["args"])
+        self.assertEqual(self.playbook_names()[-1], "probe.yml")
+        self.assertNotIn("site.yml", self.playbook_names())
 
     def test_config_appearance_after_probe_stops_before_mutation(self):
         self.env["TEST_CREATE_CONFIG"] = "1"
         self.run_wrapper("onboard-node", code=None)
-        self.assertEqual(len(self.logged()), 4)
-        self.assertIn("ansible/playbooks/probe.yml", self.logged()[-1]["args"])
+        self.assertEqual(self.playbook_names()[-1], "probe.yml")
+        self.assertNotIn("site.yml", self.playbook_names())
 
     def test_fleet_preflight_failure_stops_onboarding(self):
         self.env["TEST_FAIL_PREFLIGHT"] = "1"
         self.run_wrapper("onboard-node", code=None)
-        self.assertEqual(len(self.logged()), 3)
-        self.assertIn("ansible/playbooks/onboard-preflight.yml", self.logged()[-1]["args"])
+        self.assertEqual(self.playbook_names()[-1], "onboard-preflight.yml")
+        self.assertNotIn("site.yml", self.playbook_names())
 
     def test_real_ansible_ssh_precedence_uses_strict_checking_and_selected_identity(self):
         ssh = self.bin / "inert-ssh"
@@ -312,7 +326,8 @@ class WrapperSafety(unittest.TestCase):
         key = self.work / "chosen identity"
         key.write_text("synthetic private key")
         env = {key: value for key, value in self.env.items() if not key.startswith("ANSIBLE_")}
-        env.update(ANSIBLE_CONFIG=str(ROOT / "ansible/ansible.cfg"), ANSIBLE_HOST_KEY_CHECKING="False",
+        env.update(PATH=os.environ["PATH"],  # the real ansible, not the wrapper stubs
+                   ANSIBLE_CONFIG=str(ROOT / "ansible/ansible.cfg"), ANSIBLE_HOST_KEY_CHECKING="False",
                    ANSIBLE_SSH_HOST_KEY_CHECKING="False", ANSIBLE_SSH_ARGS="-o StrictHostKeyChecking=no",
                    ANSIBLE_SSH_COMMON_ARGS="-o StrictHostKeyChecking=no", ANSIBLE_SSH_EXTRA_ARGS="-o StrictHostKeyChecking=no",
                    ANSIBLE_SSH_EXECUTABLE=str(ssh), SSH_FIXTURE_LOG=str(log),
@@ -392,7 +407,7 @@ class WrapperSafety(unittest.TestCase):
     def test_operator_config_rejects_unknown_host_and_duplicate_keys(self):
         path = self.config({"cvp_operator_hosts": {"typo": {"storage_enabled": False}}})
         self.run_wrapper("onboard-node", code=None)
-        self.assertEqual(len(self.logged()), 1)
+        self.assertEqual([call["tool"] for call in self.logged()], ["ansible-inventory"])
         self.calls.unlink()
         path.write_text("cvp_operator_defaults: {}\ncvp_operator_defaults: {}\n")
         self.run_wrapper("onboard-node", code=None)

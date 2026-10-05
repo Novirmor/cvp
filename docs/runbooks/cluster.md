@@ -64,9 +64,8 @@ through an SSH stub and a kubectl stub; it never contacts Kubernetes.
 
 ## Bootstrap
 
-1. Complete initial host bootstrap from the empty default inventory as described
-   in `ansible-host-bootstrap.md`. The operator explicitly selects the initial
-   server; `task onboard` is only for subsequent nodes. Verify that the K3s API,
+1. Complete the [first host](nodes.md#3-first-host) from the empty default
+   inventory, including the private kubeconfig export. Verify that the K3s API,
    CoreDNS, packaged Traefik, and ServiceLB are available.
 2. Verify that only the intended ingress node has both
    `svccontroller.k3s.cattle.io/enablelb=true` and

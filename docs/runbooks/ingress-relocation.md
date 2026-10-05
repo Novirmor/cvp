@@ -30,7 +30,7 @@ below does both explicitly so only the new node accepts public 80 and 443.
 
 ## Preconditions
 
-- The target node is onboarded (`node-onboarding.md`), converged, healthy in
+- The target node is joined ([nodes.md](nodes.md)), converged, healthy in
   the WireGuard mesh, and reachable over Tailscale.
 - The target node has a stable public address for the Cloudflare record, and
   nothing of its own is bound to `[::]:80` and `[::]:443`.

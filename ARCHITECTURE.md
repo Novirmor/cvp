@@ -41,16 +41,17 @@ Persistent host settings and credentials are supplied through the external
 Connection and node identity remain in inventory; per-node credentials and
 destructive confirmations cannot be distributed through operator defaults.
 The file is literal data; only `wireguard_private_key` and `tailscale_auth_key`
-accept `{env: NAME}` credential references. Onboarding pins the file digest or
-its absence and checks API readiness and all existing inventory membership,
+accept `{file: PATH}` or `{env: NAME}` credential references. Joining pins the
+file digest and every referenced credential file, or the file's absence, and checks API readiness and all existing inventory membership,
 including roles, mesh addresses, and Ready state. Unexpected nodes, missing
 existing nodes, and unconfirmed additional servers block onboarding. The check
 is repeated under lifecycle locks before convergence.
 
 For example, `server1` could initialize the cluster using the synthetic mesh
 address `192.0.2.1`. These are documentation values, not provisioned resources.
-Initial bootstrap uses the host bootstrap runbook; the onboarding helper adds
-nodes only after the control plane exists.
+`task node-join` initializes the cluster only for the sole, cluster-init
+inventory node; every later node joins through the full-membership preflight
+after the control plane exists.
 
 Nodes may be LXC guests or ordinary VMs (`node_virtualization`: `lxc`, `vm`,
 `metal`, or `auto` for probe-time detection). The compatibility probe applies

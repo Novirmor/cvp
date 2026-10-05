@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
+# Compatibility entry point for `task onboard`: joins one node to an existing
+# cluster through the resumable `cvp_node.py join` workflow.
 set -Eeuo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$root_dir"
-export ANSIBLE_HOST_KEY_CHECKING=True
-export ANSIBLE_SSH_HOST_KEY_CHECKING=True ANSIBLE_TRANSPORT=ssh
-ssh_options="$(python3 -B scripts/cvp_wrapper_common.py ssh-options)"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -21,112 +20,13 @@ node="${CVP_ONBOARD_NODE:-}"
 if [[ -n "${CVP_ONBOARD_SITE_VARS_FILE:-}" && -n "${CVP_OPERATOR_CONFIG_FILE:-}" ]]; then
   fail 'set only CVP_OPERATOR_CONFIG_FILE; CVP_ONBOARD_SITE_VARS_FILE is a deprecated alias'
 fi
-config_file="${CVP_OPERATOR_CONFIG_FILE:-${CVP_ONBOARD_SITE_VARS_FILE:-}}"
-unset CVP_OPERATOR_CONFIG_SHA256 CVP_OPERATOR_CONFIG_ABSENT
-if [[ -z "$config_file" ]]; then
-  config_file="$(python3 -B scripts/cvp_wrapper_common.py operator-path)" ||
-    fail 'invalid default operator configuration'
-fi
-if [[ -n "$config_file" ]]; then
-  config_file="$(python3 -B scripts/cvp_wrapper_common.py operator-config "$config_file")" ||
-    fail 'invalid operator configuration'
-  export CVP_OPERATOR_CONFIG_FILE="$config_file"
-  CVP_OPERATOR_CONFIG_SHA256="$(python3 -B scripts/cvp_wrapper_common.py operator-digest "$config_file")"
-  export CVP_OPERATOR_CONFIG_SHA256
-else
-  export CVP_OPERATOR_CONFIG_ABSENT=1
+if [[ -n "${CVP_ONBOARD_SITE_VARS_FILE:-}" ]]; then
+  export CVP_OPERATOR_CONFIG_FILE="$CVP_ONBOARD_SITE_VARS_FILE"
 fi
 unset CVP_ONBOARD_SITE_VARS_FILE
 
-check_config() {
-  if [[ -z "$config_file" ]]; then
-    python3 -B scripts/cvp_wrapper_common.py operator-path > /dev/null ||
-      fail 'operator configuration appeared during onboarding; review it and start a new run'
-    return
-  fi
-  local digest
-  digest="$(python3 -B scripts/cvp_wrapper_common.py operator-digest "$config_file")" ||
-    fail 'operator configuration became invalid during onboarding'
-  [[ "$digest" == "$CVP_OPERATOR_CONFIG_SHA256" ]] ||
-    fail 'operator configuration changed during onboarding; review it and start a new run'
-}
-
-inventory="$(ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-inventory \
-  -i ansible/inventory/hosts.yml --list)" || fail 'could not read the Ansible inventory'
-printf '%s\n' "$inventory" | python3 -B scripts/cvp_wrapper_common.py ssh-inventory
-
-if [[ -n "$config_file" ]]; then
-  printf '%s\n' "$inventory" | python3 -B scripts/cvp_wrapper_common.py operator-inventory "$config_file" ||
-    fail 'operator configuration does not match inventory'
+args=(join "$node" --confirm "$node" --existing-cluster)
+if [[ -n "${CVP_ONBOARD_SERVER_CONFIRM:-}" ]]; then
+  args+=(--server-confirm "$CVP_ONBOARD_SERVER_CONFIRM")
 fi
-
-role="$(printf '%s\n' "$inventory" | python3 -c '
-import json
-import sys
-
-data = json.load(sys.stdin)
-node = sys.argv[1]
-
-def registered(group):
-    return node in data.get(group, {}).get("hosts", [])
-
-def reject(message):
-    sys.exit("error: " + message)
-
-if not registered("wireguard"):
-    reject(f"{node} must be in the wireguard group")
-if node in data:
-    reject(f"{node}: a node name must not collide with an inventory group")
-server = registered("k3s_servers")
-agent = registered("k3s_agents")
-if server == agent:
-    reject(f"{node} must be in exactly one of k3s_servers or k3s_agents")
-host = data.get("_meta", {}).get("hostvars", {}).get(node, {})
-if host.get("node_name") != node:
-    reject(f"{node}: node_name must match the inventory host key")
-if host.get("node_virtualization") not in ("lxc", "vm", "metal"):
-    reject(f"{node}: pin node_virtualization to lxc, vm, or metal before onboarding")
-if host.get("k3s_role") != ("server" if server else "agent"):
-    reject(f"{node}: k3s_role must match its server/agent inventory group")
-if host.get("k3s_server_init"):
-    reject(f"{node}: onboarding must not initialize a new control plane")
-if not host.get("wireguard_address") or not host.get("wireguard_public_key"):
-    reject(f"{node}: set the WireGuard address and public key before onboarding")
-print("server" if server else "agent")
-' "$node")" || fail 'correct the inventory before onboarding'
-
-[[ "$role" != server || "${CVP_ONBOARD_SERVER_CONFIRM:-}" == "$node" ]] ||
-  fail 'joining another etcd server changes quorum; set CVP_ONBOARD_SERVER_CONFIRM to the node after review'
-
-printf 'Checking repository and inventory for %s...\n' "$node"
-mise exec -- task test
-
-onboard_vars="$(python3 -c 'import json,sys; print(json.dumps({"cvp_onboard_node":sys.argv[1], "cvp_onboard_server_confirm":sys.argv[2]}))' \
-  "$node" "${CVP_ONBOARD_SERVER_CONFIRM:-}")"
-printf 'Checking the initialized control plane and fleet membership...\n'
-check_config
-ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/onboard-preflight.yml \
-  -e "$ssh_options" -e "$onboard_vars"
-
-printf 'Probing host capabilities on %s (read-only)...\n' "$node"
-check_config
-ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/probe.yml --limit "$node" -e "$ssh_options"
-
-printf 'Converging the full fleet to distribute the new WireGuard peer...\n'
-check_config
-ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/site.yml -e "$ssh_options" -e "$onboard_vars"
-
-printf 'Checking %s WireGuard peers and path MTU...\n' "$node"
-check_config
-ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/probe-wireguard.yml --limit "$node" -e "$ssh_options"
-
-printf 'Verifying all hosts and cluster nodes...\n'
-check_config
-ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/verify.yml -e "$ssh_options"
-
-printf 'Onboarding verified for %s.\n' "$node"
+exec python3 -B scripts/cvp_node.py "${args[@]}"

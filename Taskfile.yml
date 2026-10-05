@@ -56,7 +56,7 @@ tasks:
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
         -i ansible/inventory/hosts.yml ansible/playbooks/test-labels.yml
-      - mise exec -- ./scripts/test-onboard-node
+      - mise exec -- python3 -B scripts/test-node-lifecycle.py
       - mise exec -- ./scripts/test-prepare-access
       - mise exec -- python3 -B scripts/test-wrapper-safety.py
       - mise exec -- python3 -B scripts/test-tofu-identity.py
@@ -140,10 +140,32 @@ tasks:
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
         ansible/playbooks/probe-wireguard.yml {{.CLI_ARGS}}
 
+  node-new:
+    desc: >-
+      Scaffold one node's inventory, host vars, WireGuard key, and operator entry
+      without contacting it (dry run unless --write;
+      e.g. task node-new -- worker1 --ssh 203.0.113.21 --virt vm --ssh-source 203.0.113.10/32)
+    cmds:
+      - mise exec -- python3 -B scripts/cvp_node.py new {{.CLI_ARGS}}
+
+  node-join:
+    desc: >-
+      Resumably prepare access, probe, and join one node, including the first
+      (e.g. task node-join -- worker1 --confirm worker1)
+    cmds:
+      - mise exec -- python3 -B scripts/cvp_node.py join {{.CLI_ARGS}}
+
+  node-private:
+    desc: >-
+      Move one joined node's SSH to its Tailscale address and reconverge
+      (e.g. task node-private -- worker1 --confirm worker1)
+    cmds:
+      - mise exec -- python3 -B scripts/cvp_node.py private {{.CLI_ARGS}}
+
   onboard:
     desc: >-
-      Guarded node onboarding (set CVP_ONBOARD_NODE and CVP_ONBOARD_CONFIRM;
-      converges the full fleet after read-only checks)
+      Compatibility alias for node-join on an existing cluster
+      (set CVP_ONBOARD_NODE and CVP_ONBOARD_CONFIRM)
     cmds:
       - mise exec -- ./scripts/onboard-node
 

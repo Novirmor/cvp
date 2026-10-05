@@ -1,7 +1,8 @@
 ---
-# Template for onboarding a node. Copy to ansible/inventory/host_vars/<node>.yml,
-# fill every field, and register the host in hosts.yml. The .yml.example suffix
-# keeps this file out of inventory loading; see docs/runbooks/node-onboarding.md.
+# Reference for every host variable. `task node-new` generates host_vars files
+# and inventory membership for you; use this to understand or hand-edit them.
+# The .yml.example suffix keeps this file out of inventory loading; see
+# docs/runbooks/nodes.md.
 
 ansible_host: ""            # stable DNS name or address for SSH
 ansible_port: 22

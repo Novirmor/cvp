@@ -70,10 +70,13 @@ Tailscale enrollment keys, storage-device approvals, and destructive
 confirmations belong in the appropriate `cvp_operator_hosts` entry.
 
 Values are literal data, not Jinja expressions. Only `wireguard_private_key`
-and `tailscale_auth_key` accept environment references, for example
-`wireguard_private_key: {env: SERVER1_WG_PRIVATE_KEY}` in the host entry.
-Referenced variables must be present, nonempty, and free of control characters;
-literal credential strings are also supported. Other fields cannot use `{env: NAME}`.
+and `tailscale_auth_key` accept references: a private file such as
+`wireguard_private_key: {file: /home/operator/.config/cvp/keys/server1.wg-private}`
+(absolute, outside the checkout, a regular file owned by you with mode `0600`,
+one line), or an environment variable such as
+`wireguard_private_key: {env: SERVER1_WG_PRIVATE_KEY}`. Referenced values must
+be present, nonempty, and free of control characters; literal credential
+strings are also supported. Other fields cannot use references.
 
 Create operator-supplied files under `inventory/host_vars/` with node names,
 WireGuard addresses and public keys, stable public endpoints, SSH endpoints,
@@ -90,9 +93,10 @@ their kernel modules loaded and persisted by the base role. Forwarding-enabled
 uplinks retain IPv6 router advertisements via `accept_ra=2`. Before a fresh
 host probe, the OS must have `kmod` and `procps` available; `task probe` is
 read-only and does not install packages or require an active WireGuard mesh.
-Initial bootstrap follows `docs/runbooks/ansible-host-bootstrap.md`.
-Subsequent nodes onboard through `docs/runbooks/node-onboarding.md` and the
-`inventory/host_vars/example-newnode.yml.example` template.
+Every node, including the initial server, is scaffolded, joined, and moved to
+private SSH through `docs/runbooks/nodes.md` (`task node-new`, `task node-join`,
+`task node-private`). `inventory/host_vars/example-newnode.yml.example`
+documents each host variable for hand edits.
 
 Node labels are declared per host in `k3s_node_labels`; `cvp.io/role` is
 derived from `k3s_role`. Validation rejects reserved Kubernetes keys, invalid
@@ -105,8 +109,9 @@ the tag catalog is in `ARCHITECTURE.md`.
 
 Each host's public WireGuard key is persisted in its inventory file and is the
 authentication source for every peer. Prepare keys out of band before the
-first convergence: generate one key pair per host in the secret store (or run
-`wg genkey`/`wg pubkey` locally), distribute each private key to its host
+first convergence: `task node-new` generates one key pair per host into
+`~/.config/cvp/keys/` and references it from the operator file (or generate one
+in the secret store), distribute each private key to its host
 through the secret store or `wireguard_private_key`, and record each public
 key in the matching `inventory/host_vars/` file. The role fails when a host's
 selected private key does not derive the inventory public key, and when any
@@ -192,29 +197,31 @@ is still running** and resolving the interrupted state. Inspect every selected
 host: even a partial lock-acquisition failure can leave locks behind. Do not
 remove a lock merely to make a retry proceed.
 
-`task onboard` adds subsequent nodes to an initialized cluster; it rejects a
-cluster-init target and cannot bootstrap the first server. Once a joining
-host's inventory, WireGuard key, and administration path are prepared, run:
+`task node-join` joins one node (see `docs/runbooks/nodes.md`). For the sole
+cluster-init node it bootstraps the first server; for every later node it
+refuses a cluster-init target. Once `task node-new` has written the node, run:
 
 ```sh
-CVP_ONBOARD_NODE=<node> CVP_ONBOARD_CONFIRM=<node> task onboard
+task node-join -- <node> --confirm <node>
 ```
 
-It validates the target, runs `task test`, then checks the initialized API's
-`/readyz` and **all** cluster membership before the read-only target host probe.
+It validates the inventory, ensures operator access, and probes the target, then
+checks the initialized API's `/readyz` and **all** cluster membership.
 Every existing inventory node must be present, non-terminating, Ready, and match
 its role and mesh InternalIP; unexpected nodes or unconfirmed additional servers
 fail preflight. Only the named joining target may be absent. A new etcd server
-requires `CVP_ONBOARD_SERVER_CONFIRM=<node>`; an agent must not carry that gate.
+requires `--server-confirm <node>`; an agent must not carry that gate.
 The helper converges the **entire fleet** so every peer learns the node, repeating
 the membership preflight under lifecycle locks before host changes. It follows
 with the target's peer/MTU probe and full verification.
 
-The helper pins the persistent operator file's digest, or pins its absence, for
-every stage. Editing/removing a pinned file or introducing one into an
-absent-config run stops onboarding. `CVP_ONBOARD_SITE_VARS_FILE` is a deprecated
-onboarding-only alias for `CVP_OPERATOR_CONFIG_FILE` and requires the same
-structured format. Review storage impact and access before applying Ansible.
+The command pins the persistent operator file's digest and every referenced
+credential file, or pins the file's absence, for every stage. Editing/removing
+a pinned file or introducing one into an absent-config run stops the join.
+Progress is recorded so a rerun resumes after the last completed mutating stage;
+an interrupted `site` requires `--retry-reviewed` after inspection. `task
+onboard` (`CVP_ONBOARD_NODE`, `CVP_ONBOARD_CONFIRM`) remains as an alias; its
+`CVP_ONBOARD_SITE_VARS_FILE` is a deprecated alias for `CVP_OPERATOR_CONFIG_FILE`. Review storage impact and access before applying Ansible.
 
 The normal play changes host state. Do not run it against a live node until the
 host compatibility gate and recovery or accepted-loss review have passed. The
