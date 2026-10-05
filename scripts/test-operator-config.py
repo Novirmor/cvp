@@ -118,6 +118,47 @@ class OperatorConfigTests(unittest.TestCase):
                 result = self.load({}, success=False)
                 self.assertNotIn("synthetic-auth-key", result.stdout + result.stderr)
 
+    def private_file(self, name, content, mode=0o600):
+        path = self.directory / name
+        path.write_text(content)
+        path.chmod(mode)
+        return path
+
+    def test_private_credential_files_are_resolved_without_disclosure(self):
+        key = self.private_file("alpha.wg-private", "synthetic-file-wireguard-key\n")
+        self.write_config({"cvp_operator_hosts": {"alpha": {"wireguard_private_key": {"file": str(key)}}}})
+        result = self.load({"alpha": {"wireguard_private_key": "synthetic-file-wireguard-key"}})
+        self.assertNotIn("synthetic-file-wireguard-key", result.stdout + result.stderr)
+
+    def test_unsafe_credential_file_references_fail(self):
+        shared = self.private_file("shared.wg-private", "synthetic-key\n", 0o644)
+        multiline = self.private_file("multi.wg-private", "first\nsecond\n")
+        repository = ROOT / "ansible/inventory/group_vars/all.yml"
+        for values in (
+            {"wireguard_private_key": {"file": str(shared)}},
+            {"wireguard_private_key": {"file": str(multiline)}},
+            {"wireguard_private_key": {"file": "relative.wg-private"}},
+            {"wireguard_private_key": {"file": str(self.directory / "missing")}},
+            {"wireguard_private_key": {"file": str(repository)}},
+            {"wireguard_private_key": {"file": str(shared), "env": "FIXTURE"}},
+            {"storage_device": {"file": str(shared)}},
+        ):
+            with self.subTest(values=values):
+                self.write_config({"cvp_operator_hosts": {"alpha": values}})
+                self.load({}, success=False)
+
+    def test_changed_credential_file_fails_its_pin(self):
+        key = self.private_file("alpha.wg-private", "synthetic-original\n")
+        self.write_config({"cvp_operator_hosts": {"alpha": {"wireguard_private_key": {"file": str(key)}}}})
+        result = subprocess.run(["python3", "-B", str(HELPER), "operator-files-digest", str(self.config)],
+                                env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env["CVP_OPERATOR_FILES_SHA256"] = result.stdout.strip()
+        self.env["CVP_OPERATOR_CONFIG_SHA256"] = hashlib.sha256(self.config.read_bytes()).hexdigest()
+        self.load({"alpha": {"wireguard_private_key": "synthetic-original"}})
+        key.write_text("synthetic-replaced\n")
+        self.load({}, success=False)
+
     def test_pinned_absence_rejects_a_new_default_file(self):
         self.env["CVP_OPERATOR_CONFIG_ABSENT"] = "1"
         self.load({"alpha": {"cvp_operator_config_loaded": True}})

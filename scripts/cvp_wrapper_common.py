@@ -97,10 +97,25 @@ def operator_config(path, *, with_digest=False):
             raise ValueError("operator host keys must be inventory node names")
         validate_operator_values(values, per_host=True)
     validate_operator_values(defaults, per_host=False)
-    resolve_operator_values(defaults)
+    files = {}
+    resolve_operator_values(defaults, files)
     for values in hosts.values():
-        resolve_operator_values(values)
+        resolve_operator_values(values, files)
+    # Referenced credential files are pinned separately from the configuration
+    # text: a key file replaced mid-operation must stop the run too.
+    files_digest = credential_files_digest(files)
+    expected_files = os.environ.get("CVP_OPERATOR_FILES_SHA256")
+    if expected_files and files_digest != expected_files:
+        raise ValueError("a referenced credential file changed during the operation")
+    if with_digest == "files":
+        return data, digest, files_digest
     return (data, digest) if with_digest else data
+
+
+def credential_files_digest(files):
+    content = b"".join(name.encode() + b"\0" + hashlib.sha256(value).digest()
+                       for name, value in sorted(files.items()))
+    return hashlib.sha256(content).hexdigest()
 
 
 def validate_operator_values(values, *, per_host):
@@ -128,15 +143,29 @@ def validate_operator_values(values, *, per_host):
             raise ValueError("connection/identity overrides and global per-node inputs are forbidden")
 
 
-def resolve_operator_values(values):
+def credential_file(value, files):
+    if not isinstance(value, str):
+        raise ValueError("credential file references must name an absolute path")
+    path = external_path(value)
+    content = private_bytes(path)
+    files[str(path)] = content
+    try:
+        text = content.decode("utf-8")
+    except UnicodeError:
+        raise ValueError("referenced credential file must be UTF-8 text") from None
+    return text[:-1] if text.endswith("\n") else text
+
+
+def resolve_operator_values(values, files=None):
     credentials = {"wireguard_private_key", "tailscale_auth_key"}
+    files = {} if files is None else files
 
     def literal(value):
         if isinstance(value, str) and any(token in value for token in ("{{", "{%", "{#")):
-            raise ValueError("operator configuration is literal data; use {env: NAME} for supported credentials")
+            raise ValueError("operator configuration is literal data; use {env: NAME} or {file: PATH} for supported credentials")
         if isinstance(value, dict):
-            if "env" in value:
-                raise ValueError("environment references are allowed only for supported credential fields")
+            if "env" in value or "file" in value:
+                raise ValueError("credential references are allowed only for supported credential fields")
             for child in value.values():
                 literal(child)
         elif isinstance(value, list):
@@ -145,14 +174,18 @@ def resolve_operator_values(values):
 
     for key, value in values.items():
         if key in credentials and isinstance(value, dict):
-            if set(value) != {"env"} or not isinstance(value["env"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value["env"]):
-                raise ValueError("credential references must have exactly one env key naming an environment variable")
-            value = os.environ.get(value["env"], "")
+            if set(value) == {"file"}:
+                value = credential_file(value["file"], files)
+            elif set(value) == {"env"} and isinstance(value["env"], str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value["env"]):
+                value = os.environ.get(value["env"], "")
+            else:
+                raise ValueError("credential references must have exactly one env key naming an environment variable "
+                                 "or one file key naming an absolute private file")
             if not value or any(ord(character) < 32 for character in value):
                 raise ValueError("referenced credential is missing, empty, or contains control characters")
             values[key] = value
         if key in credentials and not isinstance(value, str):
-            raise ValueError("credentials must be literal strings or {env: NAME} references")
+            raise ValueError("credentials must be literal strings, {env: NAME}, or {file: PATH} references")
         literal(value)
 
 
@@ -215,7 +248,7 @@ def main():
             if values.get("ansible_connection", "ssh") not in {"ssh", "ansible.builtin.ssh"}:
                 raise ValueError("guarded host operations require the SSH connection plugin")
         return
-    if action in {"operator-load", "operator-config", "operator-inventory", "operator-digest"}:
+    if action in {"operator-load", "operator-config", "operator-inventory", "operator-digest", "operator-files-digest"}:
         try:
             import yaml
         except ImportError:
@@ -241,10 +274,13 @@ def main():
         return
     value = sys.argv[2]
     path = external_path(value)
-    if action in ("operator-config", "operator-inventory", "operator-digest"):
-        data, digest = operator_config(path, with_digest=True)
+    if action in ("operator-config", "operator-inventory", "operator-digest", "operator-files-digest"):
+        data, digest, files_digest = operator_config(path, with_digest="files")
         if action == "operator-digest":
             print(digest)
+            return
+        if action == "operator-files-digest":
+            print(files_digest)
             return
         if action == "operator-inventory":
             inventory = json.load(sys.stdin)
