@@ -1,0 +1,2 @@
+Include /etc/ssh/sshd_config.d/00-cvp-hardening.conf
+{{ base_sshd_main_config.content | b64decode | regex_replace('(?m)^Include /etc/ssh/sshd_config[.]d/00-cvp-hardening[.]conf(?:\\\\n)*(?:\r?\n)?', '') -}}

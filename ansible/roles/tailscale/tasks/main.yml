@@ -32,50 +32,59 @@
     name: "{{ 'tailscale=' ~ tailscale_package_version if tailscale_package_version | length > 0 else 'tailscale' }}"
     state: present
     update_cache: true
+  when: not ansible_check_mode
 
 - name: Enable the Tailscale service
   ansible.builtin.systemd_service:
     name: tailscaled.service
     state: started
     enabled: true
+  when: not ansible_check_mode
 
 - name: Read Tailscale backend state
   ansible.builtin.command: tailscale status --json
   register: tailscale_status
   changed_when: false
   failed_when: false
+  check_mode: false
+
+- name: Report deferred Tailscale provisioning in check mode
+  ansible.builtin.debug:
+    msg: Check mode reads existing Tailscale state; package installation, service startup, and enrollment are deferred.
+  when: ansible_check_mode
 
 - name: Enroll Tailscale when an external auth key is supplied
-  ansible.builtin.command:
-    argv: "{{ ['tailscale', 'up', '--auth-key=' ~ tailscale_auth_key,
-               '--hostname=' ~ node_name,
-               '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false')]
-             + (['--login-server=' ~ tailscale_login_server] if tailscale_login_server | length > 0 else [])
-             + (
-               ['--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
-               if tailscale_advertise_tags | length > 0
-               else []
-             )
-             + tailscale_extra_up_args }}"
-  no_log: true
+  ansible.builtin.include_tasks: enroll.yml
   when:
+    - not ansible_check_mode
     - tailscale_auth_key | length > 0
-    - tailscale_status.rc != 0 or 'Running' not in tailscale_status.stdout
+    - >-
+      tailscale_status.rc != 0 or
+      (tailscale_status.stdout | default('{}', true) | from_json).BackendState | default('') != 'Running'
+
+- name: Refresh the Tailscale backend state
+  ansible.builtin.command: tailscale status --json
+  register: tailscale_refreshed_status
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Select the refreshed Tailscale state
+  ansible.builtin.set_fact:
+    tailscale_status: "{{ tailscale_refreshed_status }}"
+  when: not ansible_check_mode
 
 - name: Reconcile mutable Tailscale settings on an enrolled host
   ansible.builtin.command:
     argv: "{{ ['tailscale', 'set',
                '--hostname=' ~ node_name,
-               '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false')]
-             + (
-               ['--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
-               if tailscale_advertise_tags | length > 0
-               else []
-             )
+               '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false'),
+               '--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
              + tailscale_extra_set_args }}"
   register: tailscale_reconcile
   changed_when: false
   when:
+    - not ansible_check_mode
     - tailscale_status.rc == 0
     - tailscale_status.stdout | trim | length > 0
     - (tailscale_status.stdout | from_json).BackendState | default('') == 'Running'

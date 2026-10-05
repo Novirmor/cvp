@@ -1,0 +1,18 @@
+---
+- name: Verify the live owned firewall against its applied policy
+  ansible.builtin.command:
+    argv: ["{{ firewall_state_helper }}", verify, --record, "{{ firewall_state_record }}"]
+  changed_when: false
+  check_mode: false
+  when: firewall_manage | bool
+
+- name: Read the firewall unit state
+  ansible.builtin.systemd_service:
+    name: nftables.service
+  register: firewall_verified_service
+  when: firewall_manage | bool
+
+- name: Require an active firewall unit
+  ansible.builtin.assert:
+    that: firewall_verified_service.status.ActiveState == 'active'
+  when: firewall_manage | bool

@@ -1,7 +1,0 @@
----
-- name: Restart the IPv6 ingress forwarders
-  ansible.builtin.systemd_service:
-    name: cvp-ingress-v6-{{ item }}.service
-    state: restarted
-    daemon_reload: true
-  loop: "{{ ingress_v6_ports }}"

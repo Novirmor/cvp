@@ -6,4 +6,5 @@ storage_mountpoint: /var/lib/rancher/k3s/storage
 storage_mount_options: defaults,noatime
 storage_manage_device: false
 storage_allow_format: false
+storage_format_confirmation: ""
 storage_directory_mode: "0750"

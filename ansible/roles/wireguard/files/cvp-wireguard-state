@@ -1,0 +1,251 @@
+#!/usr/bin/python3
+import argparse
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def run(argv, *, stdin=None, optional=False):
+    result = subprocess.run(argv, input=stdin, text=True, capture_output=True, timeout=30)
+    if result.returncode and not optional:
+        raise ValueError(f"{Path(argv[0]).name} failed; inspect the host configuration")
+    return result
+
+
+def key(value):
+    decoded = base64.b64decode(value, validate=True)
+    require(len(decoded) == 32 and decoded != bytes(32)
+            and base64.b64encode(decoded).decode() == value, "Invalid WireGuard key")
+    return value
+
+
+def desired(path):
+    sections = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line in ("[Interface]", "[Peer]"):
+            sections.append((line, {}))
+            continue
+        name, separator, value = line.partition("=")
+        require(sections and separator and name.strip() not in sections[-1][1], "Invalid WireGuard configuration")
+        sections[-1][1][name.strip()] = value.strip()
+    require(sections and sections[0][0] == "[Interface]"
+            and all(section == "[Peer]" for section, _ in sections[1:]), "Invalid WireGuard sections")
+    interface = sections[0][1]
+    require(set(interface) == {"Address", "ListenPort", "MTU", "PrivateKey", "SaveConfig"}
+            and interface["SaveConfig"].lower() == "false", "Unsupported interface properties; explicit maintenance is required")
+    address = ipaddress.ip_interface(interface["Address"])
+    require(address.version == 4 and address.network.prefixlen == 24, "Expected an IPv4 /24 WireGuard address")
+    private = key(interface["PrivateKey"])
+    public = run(["wg", "pubkey"], stdin=private + "\n").stdout.strip()
+    port, mtu = int(interface["ListenPort"]), int(interface["MTU"])
+    require(1 <= port <= 65535 and 1280 <= mtu <= 65535, "Invalid WireGuard port or MTU")
+    peers, networks = {}, set()
+    for _, peer in sections[1:]:
+        require({"PublicKey", "AllowedIPs"} <= set(peer)
+                and not set(peer) - {"PublicKey", "AllowedIPs", "Endpoint", "PersistentKeepalive"}, "Unsupported peer properties")
+        public_key = key(peer["PublicKey"])
+        require(public_key != public and public_key not in peers, "Duplicate or self-referential WireGuard peer key")
+        allowed = sorted(str(ipaddress.ip_network(value.strip())) for value in peer["AllowedIPs"].split(","))
+        require(all(ipaddress.ip_network(value).version == 4 and value.endswith("/32") for value in allowed), "Expected IPv4 /32 peer routes")
+        require(all(ipaddress.ip_network(value).subnet_of(address.network) for value in allowed),
+                "Peer routes outside the managed /24 require explicit routing maintenance")
+        require(not set(allowed) & networks and str(address.ip) + "/32" not in allowed, "Conflicting WireGuard addresses")
+        networks.update(allowed)
+        endpoint = peer.get("Endpoint", "")
+        if endpoint:
+            require(re.fullmatch(r"(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9_.-]+):[0-9]+", endpoint)
+                    and 1 <= int(endpoint.rsplit(":", 1)[1]) <= 65535, "Invalid peer endpoint")
+            host = endpoint.rsplit(":", 1)[0]
+            if host.startswith("["):
+                ipaddress.IPv6Address(host[1:-1])
+            elif re.fullmatch(r"[0-9.]+", host):
+                ipaddress.IPv4Address(host)
+        keepalive = int(peer.get("PersistentKeepalive", "0"))
+        require(0 <= keepalive <= 65535, "Invalid peer keepalive")
+        peers[public_key] = {"allowed": allowed, "keepalive": keepalive, "endpoint": endpoint}
+    return {"public": public, "port": port, "mtu": mtu, "address": str(address), "peers": peers,
+            "fingerprint": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+
+
+def live(interface):
+    result = run(["ip", "-d", "-j", "link", "show", "dev", interface], optional=True)
+    if result.returncode:
+        # Distinguish a missing interface from permission/tool failures.
+        links = json.loads(run(["ip", "-d", "-j", "link", "show"]).stdout)
+        require(not any(link["ifname"] == interface for link in links), "Cannot inspect WireGuard interface")
+        return None
+    link = json.loads(result.stdout)[0]
+    require(link.get("linkinfo", {}).get("info_kind") == "wireguard", "Interface is not WireGuard; explicit maintenance is required")
+    rows = run(["wg", "show", interface, "dump"]).stdout.splitlines()
+    header = rows[0].split("\t")
+    require(len(header) == 4, "Incomplete WireGuard interface state")
+    peers = {}
+    for row in rows[1:]:
+        public, psk, endpoint, allowed, _, _, _, keepalive = row.split("\t")
+        peers[public] = {"allowed": sorted(allowed.split(",")) if allowed != "(none)" else [],
+                         "keepalive": 0 if keepalive == "off" else int(keepalive),
+                         "endpoint": "" if endpoint == "(none)" else endpoint,
+                         "psk": psk}
+    addresses = json.loads(run(["ip", "-j", "address", "show", "dev", interface]).stdout)[0]["addr_info"]
+    return {"public": header[1], "port": int(header[2]), "fwmark": header[3], "peers": peers,
+            "mtu": link["mtu"], "up": "UP" in link["flags"],
+            "addresses": sorted(f"{value['local']}/{value['prefixlen']}" for value in addresses
+                                if value.get("family") != "inet6" or not ipaddress.ip_address(value["local"]).is_link_local)}
+
+
+def matches(wanted, observed):
+    if observed is None:
+        return False
+    if (observed["public"] != wanted["public"] or observed["port"] != wanted["port"]
+            or observed["fwmark"] not in ("off", "0", "0x0") or observed["mtu"] != wanted["mtu"]
+            or not observed["up"] or observed["addresses"] != [wanted["address"]]
+            or set(observed["peers"]) != set(wanted["peers"])):
+        return False
+    for public, peer in wanted["peers"].items():
+        actual = observed["peers"][public]
+        if (actual["allowed"] != peer["allowed"] or actual["keepalive"] != peer["keepalive"]
+                or actual["psk"] != "(none)" or (peer["endpoint"] and not actual["endpoint"])):
+            return False
+    return True
+
+
+def verify_routes(wanted, interface):
+    address = ipaddress.ip_interface(wanted["address"])
+    routes = json.loads(run(["ip", "-4", "-j", "route", "show", "table", "main", "exact", str(address.network)]).stdout)
+    require(isinstance(routes, list) and len(routes) == 1 and isinstance(routes[0], dict),
+            "Missing or ambiguous WireGuard mesh route; explicit routing maintenance is required")
+    route = routes[0]
+    require(route.get("dst") == str(address.network) and route.get("dev") == interface
+            and route.get("protocol") == "kernel" and route.get("scope") == "link"
+            and route.get("prefsrc") == str(address.ip)
+            and route.get("type", "unicast") == "unicast" and not route.get("flags", [])
+            and not any(route.get(field) for field in ("gateway", "via", "multipath", "nhid")),
+            "Conflicting WireGuard mesh route; explicit routing maintenance is required")
+    for peer in wanted["peers"].values():
+        for network in peer["allowed"]:
+            destination = str(ipaddress.ip_network(network).network_address)
+            result = json.loads(run(["ip", "-4", "-j", "route", "get", destination, "from", str(address.ip)]).stdout)
+            require(isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict),
+                    "Cannot establish the effective WireGuard peer route")
+            route = result[0]
+            require(route.get("dev") == interface and route.get("type", "unicast") == "unicast"
+                    and not route.get("flags", [])
+                    and not any(route.get(field) for field in ("gateway", "via", "multipath", "nhid")),
+                    "WireGuard peer route leaves the managed interface; explicit routing maintenance is required")
+
+
+def atomic_record(path, value):
+    descriptor, temporary = tempfile.mkstemp(prefix=".cvp-wg-", dir=Path(path).parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("inspect", "apply", "verify"))
+    parser.add_argument("--interface", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--record", required=True)
+    parser.add_argument("--temp-dir", default="/run")
+    args = parser.parse_args()
+    require(re.fullmatch(r"[A-Za-z0-9_=+.-]{1,15}", args.interface), "Invalid interface name")
+    for path in Path(args.record).parent.glob(".cvp-*-live.json"):
+        require(path == Path(args.record), "Another managed WireGuard interface exists; explicit maintenance is required")
+    for path in Path(args.record).parent.glob(".cvp-*-activation"):
+        require(path.name == f".cvp-{args.interface}-activation",
+                "Another managed WireGuard interface exists; explicit maintenance is required")
+    wanted = desired(args.config)
+    observed = live(args.interface)
+    if observed is not None and observed["up"] and wanted["address"] in observed["addresses"]:
+        verify_routes(wanted, args.interface)
+    previous = {}
+    try:
+        previous = json.loads(Path(args.record).read_text())
+        require(isinstance(previous, dict), "Invalid WireGuard activation record")
+    except FileNotFoundError:
+        previous = {}
+    if args.action in ("inspect", "apply"):
+        require(previous.get("address", wanted["address"]) == wanted["address"]
+                and previous.get("interface", args.interface) == args.interface,
+                "Changing WireGuard interface identity requires explicit coordinated maintenance")
+    if args.action == "inspect":
+        print(json.dumps({"present": observed is not None, "matches": matches(wanted, observed)}))
+        return
+    require(observed is not None, "WireGuard interface is absent; explicit service recovery is required")
+    if args.action == "verify":
+        require(matches(wanted, observed), "Live WireGuard state does not match inventory")
+        require(json.loads(Path(args.record).read_text())["fingerprint"] == wanted["fingerprint"],
+                "WireGuard configuration has not been successfully applied")
+        print(json.dumps({"verified": True}))
+        return
+    changed = not matches(wanted, observed) or previous.get("fingerprint") != wanted["fingerprint"]
+    if not changed:
+        print(json.dumps({"changed": False}))
+        return
+    atomic_record(args.record, {"fingerprint": "", "interface": args.interface, "address": wanted["address"],
+                               "endpoints": previous.get("endpoints", {})})
+    stripped = run(["wg-quick", "strip", args.config]).stdout
+    # Preserve authenticated roaming when the operator's endpoint intent is unchanged.
+    sections = stripped.split("[Peer]")
+    sections[0] += "\nFwMark = 0\n"
+    for index in range(1, len(sections)):
+        section = sections[index]
+        public = re.search(r"(?m)^PublicKey\s*=\s*(\S+)", section)[1]
+        endpoint = wanted["peers"][public]["endpoint"]
+        actual = observed["peers"].get(public, {}).get("endpoint", "")
+        if previous.get("endpoints", {}).get(public) == endpoint and actual:
+            section = re.sub(r"(?m)^Endpoint\s*=.*\n?", "", section)
+            section += f"\nEndpoint = {actual}\n"
+        section = re.sub(r"(?m)^PersistentKeepalive\s*=.*\n?", "", section)
+        section += f"\nPersistentKeepalive = {wanted['peers'][public]['keepalive']}\n"
+        section += "\nPresharedKey = " + base64.b64encode(bytes(32)).decode() + "\n"
+        sections[index] = section
+    descriptor, temporary = tempfile.mkstemp(prefix="cvp-wg-sync-", dir=args.temp_dir)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write("[Peer]".join(sections))
+        run(["wg", "syncconf", args.interface, temporary])
+    finally:
+        os.unlink(temporary)
+    if wanted["address"] not in observed["addresses"]:
+        run(["ip", "address", "add", wanted["address"], "dev", args.interface])
+    for address in observed["addresses"]:
+        if address != wanted["address"]:
+            run(["ip", "address", "del", address, "dev", args.interface])
+    if observed["mtu"] != wanted["mtu"] or not observed["up"]:
+        run(["ip", "link", "set", "dev", args.interface, "mtu", str(wanted["mtu"]), "up"])
+    require(matches(wanted, live(args.interface)), "WireGuard live verification failed after in-place reconciliation")
+    verify_routes(wanted, args.interface)
+    atomic_record(args.record, {"fingerprint": wanted["fingerprint"], "interface": args.interface,
+                               "address": wanted["address"],
+                               "endpoints": {public: peer["endpoint"] for public, peer in wanted["peers"].items()}})
+    print(json.dumps({"changed": True}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        sys.exit("WireGuard reconciliation failed; no restart was attempted. Check configuration and interface ownership; explicit maintenance may be required.")

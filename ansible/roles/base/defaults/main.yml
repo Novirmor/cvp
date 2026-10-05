@@ -22,5 +22,6 @@ base_admin_authorized_keys: []
 base_manage_sshd: false
 base_ssh_service_name: ssh
 base_ssh_port: 22
+base_sshd_validation_contexts: []
 base_journal_max_use: 500M
 base_journal_max_file_size: 50M

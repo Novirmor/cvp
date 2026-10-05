@@ -14,11 +14,14 @@ table inet cvp_filter {
     ct state invalid drop
     ct state established,related accept
     ip protocol icmp accept
-    ip6 nexthdr ipv6-icmp accept
+    meta l4proto ipv6-icmp accept
 
     # Administration is private by default: Tailscale, WireGuard, or an
     # explicitly supplied bootstrap CIDR can reach SSH and the API.
     iifname "tailscale0" tcp dport { {{ firewall_ssh_port }}, 6443 } accept
+{% if inventory_hostname in groups.get('ingress', []) and firewall_public_ingress_ports | length > 0 %}
+    iifname "tailscale0" tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endif %}
     iifname "{{ wireguard_interface }}" tcp dport { {{ firewall_ssh_port }}, 6443, 10250 } accept
 {% if inventory_hostname in groups.get('k3s_servers', []) %}
     ip saddr {{ k3s_cluster_cidr }} tcp dport 6443 accept
@@ -32,11 +35,14 @@ table inet cvp_filter {
 
     # WireGuard is authenticated by its peer keys. Restrict these sets to
     # stable provider endpoint CIDRs when those are available.
-{% if firewall_wireguard_ipv4_source_cidrs | length > 0 %}
-    iifname "{{ firewall_external_interface }}" udp dport {{ wireguard_port }} ip saddr { {{ firewall_wireguard_ipv4_source_cidrs | join(', ') }} } accept
+{% if firewall_external_ipv4_interface | length > 0 and firewall_wireguard_ipv4_source_cidrs | length > 0 %}
+    iifname "{{ firewall_external_ipv4_interface }}" udp dport {{ wireguard_port }} ip saddr { {{ firewall_wireguard_ipv4_source_cidrs | join(', ') }} } accept
 {% endif %}
-{% if firewall_wireguard_ipv6_source_cidrs | length > 0 %}
-    iifname "{{ firewall_external_interface }}" udp dport {{ wireguard_port }} ip6 saddr { {{ firewall_wireguard_ipv6_source_cidrs | join(', ') }} } accept
+{% if firewall_external_ipv6_interface | length > 0 and firewall_wireguard_ipv6_source_cidrs | length > 0 %}
+    iifname "{{ firewall_external_ipv6_interface }}" udp dport {{ wireguard_port }} ip6 saddr { {{ firewall_wireguard_ipv6_source_cidrs | join(', ') }} } accept
+{% endif %}
+{% if firewall_allow_dhcpv6 | bool and firewall_external_ipv6_interface | length > 0 %}
+    iifname "{{ firewall_external_ipv6_interface }}" ip6 saddr fe80::/10 udp sport 547 udp dport 546 accept
 {% endif %}
 
     # Flannel VXLAN and kubelet traffic are underlay-only.
@@ -50,17 +56,32 @@ table inet cvp_filter {
     # through the pod bridge rather than the underlay interface.
     ip saddr {{ k3s_cluster_cidr }} tcp dport 10250 accept
 {% endif %}
-{% if inventory_hostname in groups.get('ingress', []) %}
-    iifname "{{ firewall_external_interface }}" tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% if inventory_hostname in groups.get('ingress', []) and firewall_public_ingress_ports | length > 0 %}
+{% for interface in firewall_external_interfaces %}
+    iifname "{{ interface }}" tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endfor %}
 {% endif %}
   }
 
-  # K3s and Flannel install their own pod/service rules. Do not block their
-  # forwarding path with a second, competing policy table.
   chain forward {
     type filter hook forward priority filter; policy accept;
     ct state invalid drop
     ct state established,related accept
+{% for interface in firewall_external_interfaces %}
+    iifname "{{ interface }}" jump public_forward
+{% endfor %}
+  }
+
+  chain public_forward {
+{% if inventory_hostname in groups.get('ingress', []) and firewall_public_ingress_ports | length > 0 %}
+{% if firewall_public_ipv4_addresses | length > 0 %}
+    meta l4proto tcp ct status dnat ct original ip daddr { {{ firewall_public_ipv4_addresses | join(', ') }} } ct original proto-dst { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endif %}
+{% if firewall_public_ipv6_addresses | length > 0 %}
+    meta l4proto tcp ct status dnat ct original ip6 daddr { {{ firewall_public_ipv6_addresses | join(', ') }} } ct original proto-dst { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endif %}
+{% endif %}
+    drop
   }
 
   chain output {

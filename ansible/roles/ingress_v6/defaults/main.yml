@@ -3,3 +3,6 @@ ingress_v6_ports:
   - 80
   - 443
 ingress_v6_target_host: 127.0.0.1
+ingress_v6_max_children: 128
+ingress_v6_memory_max: 128M
+ingress_v6_connect_timeout: 10

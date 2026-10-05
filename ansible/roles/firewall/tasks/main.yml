@@ -1,4 +1,78 @@
 ---
+- name: Install administration preflight inspection tools
+  ansible.builtin.apt:
+    name: iproute2
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    policy_rc_d: 101
+  when: firewall_manage | bool
+
+- name: Read Tailscale state before firewall activation
+  ansible.builtin.command: tailscale status --json
+  register: firewall_tailscale_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: firewall_manage | bool
+
+- name: Read the remote SSH session before privilege escalation
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "import os; print(os.environ.get('SSH_CONNECTION', ''))"
+  become: false
+  vars:
+    ansible_become: false
+  register: firewall_remote_ssh_connection
+  changed_when: false
+  check_mode: false
+  when:
+    - firewall_manage | bool
+    - ansible_env.SSH_CONNECTION | default('') | length == 0
+
+- name: Verify the candidate firewall administration path
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', '../files/cvp-admin-access-check') }}"
+    stdin: >-
+      {{ {'firewall_ssh_port': firewall_ssh_port,
+          'base_ssh_port': base_ssh_port | default(22),
+          'ipv4_source_cidrs': firewall_ssh_ipv4_source_cidrs,
+          'ipv6_source_cidrs': firewall_ssh_ipv6_source_cidrs,
+          'ssh_connection': ansible_env.SSH_CONNECTION
+                            | default(firewall_remote_ssh_connection.stdout | default(''), true),
+          'tailscale_rc': firewall_tailscale_status.rc,
+           'tailscale_status': firewall_tailscale_status.stdout,
+           'wireguard_interface': wireguard_interface,
+           'wireguard_address': wireguard_address | default(''),
+          'wireguard_peer_addresses': groups.get(wireguard_peers_group | default('wireguard'), [])
+                                     | map('extract', hostvars, 'wireguard_address') | list} | to_json }}
+  register: firewall_admin_access
+  changed_when: false
+  check_mode: false
+  when: firewall_manage | bool
+
+- name: Require a verified private or temporary bootstrap administration path
+  ansible.builtin.assert:
+    that:
+      - >-
+        (((firewall_admin_access | default({})).get('stdout', '{}') | from_json).path
+         | default('')) in ['source-cidr', 'tailscale', 'wireguard']
+        or ((((firewall_admin_access | default({})).get('stdout', '{}') | from_json).path
+             | default('')) == 'connection-proof-unavailable'
+            and (firewall_ssh_ipv4_source_cidrs | length > 0 or firewall_ssh_ipv6_source_cidrs | length > 0))
+    fail_msg: >-
+      Refusing to activate a default-deny firewall without successful administration-path
+      preflight evidence. Tailscale Running and a private destination IP do not prove
+      ingress through a private interface. Stock unbound sshd sockets require an explicit
+      firewall_ssh_ipv4_source_cidrs or firewall_ssh_ipv6_source_cidrs entry matching
+      the actual client source. Check mode does not enroll Tailscale.
+  when: firewall_manage | bool
+
 - name: Require CIDR allowlists to be lists
   ansible.builtin.assert:
     that:
@@ -11,16 +85,15 @@
       -e '{"firewall_ssh_ipv4_source_cidrs":["203.0.113.10/32"]}'.
   when: firewall_manage | bool
 
-- name: Require a real external interface before enabling the firewall
+- name: Require real external interfaces before enabling the firewall
   ansible.builtin.assert:
     that:
-      - firewall_external_interface | length > 0
-      - firewall_external_interface in ansible_interfaces
-      - firewall_external_interface not in ['lo', wireguard_interface, 'tailscale0']
+      - firewall_external_interfaces | length > 0
+      - firewall_external_interfaces | difference(ansible_interfaces) | length == 0
+      - firewall_external_interfaces | intersect(['lo', wireguard_interface, 'tailscale0']) | length == 0
     fail_msg: >-
-      Set firewall_external_interface to the real public uplink. Neither a
-      usable default-route interface nor the declared interface was found;
-      refusing to render or reload a firewall with an ineffective ingress rule.
+      Set firewall_external_ipv4_interface and firewall_external_ipv6_interface
+      to the real public uplinks. At least one real external interface is required.
   when: firewall_manage | bool
 
 - name: Install nftables
@@ -28,27 +101,28 @@
     name: nftables
     state: present
     update_cache: true
+    policy_rc_d: 101
   when: firewall_manage | bool
 
-- name: Read Tailscale state before firewall activation
-  ansible.builtin.command: tailscale status --json
-  register: firewall_tailscale_status
-  changed_when: false
-  failed_when: false
+- name: Create the nftables service override directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/nftables.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
   when: firewall_manage | bool
 
-- name: Require a verified private or temporary bootstrap administration path
-  ansible.builtin.assert:
-    that:
-      - >-
-        firewall_ssh_ipv4_source_cidrs | length > 0
-        or firewall_ssh_ipv6_source_cidrs | length > 0
-        or (firewall_tailscale_status.rc == 0
-            and (firewall_tailscale_status.stdout | from_json).BackendState | default('') == 'Running')
-    fail_msg: >-
-      Refusing to activate a default-deny firewall without a temporary SSH
-      source CIDR or a Tailscale backend in state Running. An unenrolled or
-      stopped daemon is not an administration path.
+- name: Restrict nftables shutdown to the owned table
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nftables.service.d/90-cvp-ownership.conf
+    content: |
+      [Service]
+      ExecStop=
+      ExecStop=-/usr/sbin/nft delete table inet cvp_filter
+    owner: root
+    group: root
+    mode: "0644"
   when: firewall_manage | bool
 
 - name: Render the host firewall policy
@@ -58,12 +132,9 @@
     owner: root
     group: root
     mode: "0644"
-  notify: Validate and reload nftables
+    validate: /usr/sbin/nft -c -f %s
   when: firewall_manage | bool
 
-- name: Enable the host firewall
-  ansible.builtin.systemd_service:
-    name: nftables.service
-    state: started
-    enabled: true
-  when: firewall_manage | bool
+- name: Activate and verify the host firewall
+  ansible.builtin.include_tasks: activate.yml
+  when: firewall_manage | bool and not ansible_check_mode

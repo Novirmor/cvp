@@ -1,0 +1,111 @@
+---
+- name: Hash service activation inputs
+  ansible.builtin.stat:
+    path: "{{ service_input }}"
+    checksum_algorithm: sha256
+  loop: "{{ _cvp_service_inputs }}"
+  loop_control:
+    loop_var: service_input
+  register: _cvp_service_files
+
+- name: Require complete service inputs
+  ansible.builtin.assert:
+    that: service_file.stat.isreg | default(false) and service_file.stat.checksum is defined
+  loop: "{{ _cvp_service_files.results }}"
+  loop_control:
+    loop_var: service_file
+
+- name: Compute the service fingerprint
+  ansible.builtin.set_fact:
+    _cvp_service_desired: >-
+      {{ _cvp_service_files.results | map(attribute='stat.checksum')
+         | join(':') | hash('sha256') }}
+
+- name: Inspect the service activation record
+  ansible.builtin.stat:
+    path: "{{ _cvp_service_stamp }}"
+  register: _cvp_service_record_file
+
+- name: Reset the previous activation evidence
+  ansible.builtin.set_fact:
+    _cvp_service_previous: ""
+
+- name: Read the service activation record
+  ansible.builtin.slurp:
+    src: "{{ _cvp_service_stamp }}"
+  register: _cvp_service_record
+  when: _cvp_service_record_file.stat.exists
+
+- name: Select previous activation evidence
+  ansible.builtin.set_fact:
+    _cvp_service_previous: "{{ _cvp_service_record.content | b64decode | trim }}"
+  when: _cvp_service_record_file.stat.exists
+
+- name: Load and inspect the service unit
+  ansible.builtin.systemd_service:
+    name: "{{ _cvp_service_unit }}"
+    daemon_reload: true
+  register: _cvp_service_before
+
+- name: Decide whether the service has consumed these inputs
+  ansible.builtin.set_fact:
+    _cvp_service_needed: >-
+      {{ _cvp_service_before.status.ActiveState | default('inactive') != 'active'
+         or _cvp_service_before.status.InvocationID | default('') | length == 0
+         or _cvp_service_previous != _cvp_service_desired ~ ':'
+            ~ (_cvp_service_before.status.InvocationID | default('')) }}
+
+- name: Apply and verify service configuration
+  block:
+    - name: Invalidate service activation evidence
+      ansible.builtin.file:
+        path: "{{ _cvp_service_stamp }}"
+        state: absent
+      when: _cvp_service_needed | bool
+
+    - name: Apply pending service configuration
+      ansible.builtin.systemd_service:
+        name: "{{ _cvp_service_unit }}"
+        state: "{{ (_cvp_service_action | default('restarted')) if _cvp_service_needed | bool else 'started' }}"
+        enabled: "{{ _cvp_service_enabled | default(omit) }}"
+
+    - name: Wait for the configured service process
+      ansible.builtin.systemd_service:
+        name: "{{ _cvp_service_unit }}"
+      register: _cvp_service_after
+      until:
+        - _cvp_service_after.status.ActiveState | default('') == 'active'
+        - _cvp_service_after.status.MainPID | default('0') | int > 0
+        - _cvp_service_after.status.InvocationID | default('') | length > 0
+        - >-
+          not _cvp_service_needed or _cvp_service_action | default('restarted') == 'reloaded'
+          or _cvp_service_after.status.InvocationID != _cvp_service_before.status.InvocationID | default('')
+      retries: 10
+      delay: 1
+
+    - name: Verify the ingress listener belongs to the configured process
+      ansible.builtin.command:
+        argv: [ss, -H, -ltnp6, "sport = :{{ _cvp_service_probe_port }}"]
+      register: _cvp_service_listener
+      changed_when: false
+      until: _cvp_service_listener.stdout is search('pid=' ~ (_cvp_service_after.status.MainPID | string) ~ ',')
+      retries: 10
+      delay: 1
+      when: _cvp_service_probe_port is defined
+
+    - name: Record service configuration consumption
+      ansible.builtin.copy:
+        dest: "{{ _cvp_service_stamp }}"
+        content: "{{ _cvp_service_desired }}:{{ _cvp_service_after.status.InvocationID }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+  rescue:
+    - name: Remove failed service activation evidence
+      ansible.builtin.file:
+        path: "{{ _cvp_service_stamp }}"
+        state: absent
+
+    - name: Report unsuccessful service activation
+      ansible.builtin.fail:
+        msg: "{{ _cvp_service_unit }} activation failed; correct the failure and rerun convergence."

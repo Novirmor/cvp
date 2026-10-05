@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+import argparse
+import os
+import subprocess
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sshd", default="/usr/sbin/sshd")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--context", action="append", default=[])
+    parser.add_argument("--user", action="append", default=[])
+    args = parser.parse_args()
+    expected = {
+        "passwordauthentication": {"no"},
+        "kbdinteractiveauthentication": {"no"},
+        "permitrootlogin": {"prohibit-password", "without-password"},
+        "x11forwarding": {"no"},
+        "clientaliveinterval": {"300"},
+        "clientalivecountmax": {"2"},
+        "maxauthtries": {"4"},
+    }
+    connection = os.environ.get("CVP_SSH_CONNECTION", "").split()
+    if connection and len(connection) != 4:
+        parser.error("CVP_SSH_CONNECTION must contain four SSH connection fields")
+    contexts = list(args.context)
+    for user in args.user:
+        fields = ["user=" + user]
+        if connection:
+            fields.extend([
+                "addr=" + connection[0],
+                "host=" + connection[0],
+                "laddr=" + connection[2],
+                "lport=" + connection[3],
+            ])
+        contexts.append(",".join(fields))
+    subprocess.run([args.sshd, "-t", "-f", args.config], check=True)
+    for context in [None] + list(dict.fromkeys(contexts)):
+        command = [args.sshd, "-T", "-f", args.config]
+        if context is not None:
+            command.extend(["-C", context])
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        effective = dict(line.split(None, 1) for line in result.stdout.splitlines() if line.strip())
+        failures = [
+            f"{key}={effective.get(key, '<missing>')}"
+            for key, permitted in expected.items()
+            if effective.get(key) not in permitted
+        ]
+        if failures:
+            sys.exit(f"Unsafe SSH configuration ({context or 'global'}): " + ", ".join(failures))
+
+
+if __name__ == "__main__":
+    main()

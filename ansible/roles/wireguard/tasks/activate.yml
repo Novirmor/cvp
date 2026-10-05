@@ -1,0 +1,63 @@
+---
+- name: Validate desired and live WireGuard state before activation
+  ansible.builtin.command:
+    argv:
+      - "{{ wireguard_state_helper }}"
+      - inspect
+      - --interface
+      - "{{ wireguard_interface }}"
+      - --config
+      - "/etc/wireguard/{{ wireguard_interface }}.conf"
+      - --record
+      - "{{ wireguard_state_record }}"
+  register: wireguard_activation_inspection
+  changed_when: false
+  no_log: true
+
+- name: Read the WireGuard service state
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ wireguard_interface }}.service"
+  register: wireguard_activation_service
+
+- name: Require consistent WireGuard service ownership
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((wireguard_activation_inspection.stdout | from_json).present
+         and wireguard_activation_service.status.ActiveState | default('inactive') == 'active')
+        or (not (wireguard_activation_inspection.stdout | from_json).present
+            and wireguard_activation_service.status.ActiveState | default('inactive') in ['inactive', 'failed'])
+    fail_msg: >-
+      WireGuard interface/service ownership is inconsistent. Explicit maintenance
+      is required; convergence will not restart wg-quick or its K3s dependents.
+
+- name: Enable WireGuard boot configuration without cycling the interface
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ wireguard_interface }}.service"
+    enabled: true
+
+- name: Start a missing WireGuard interface
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ wireguard_interface }}.service"
+    state: started
+  when: not (wireguard_activation_inspection.stdout | from_json).present
+
+- name: Reconcile and verify WireGuard in place
+  ansible.builtin.command:
+    argv:
+      - "{{ wireguard_state_helper }}"
+      - apply
+      - --interface
+      - "{{ wireguard_interface }}"
+      - --config
+      - "/etc/wireguard/{{ wireguard_interface }}.conf"
+      - --record
+      - "{{ wireguard_state_record }}"
+  register: wireguard_activation_result
+  changed_when: (wireguard_activation_result.stdout | from_json).changed
+  no_log: true
+
+- name: Remove obsolete WireGuard activation evidence
+  ansible.builtin.file:
+    path: "{{ wireguard_activation_stamp }}"
+    state: absent

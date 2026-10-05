@@ -1,0 +1,30 @@
+---
+- name: Run the read-only storage inspector
+  ansible.builtin.command:
+    argv:
+      - timeout
+      - --kill-after=5s
+      - 600s
+      - /usr/bin/python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', role_path + '/files/storage_safety.py') }}"
+    stdin: "{{ _storage_inspection_input | to_json }}"
+  vars:
+    _storage_inspection_input:
+      action: "{{ _storage_inspection_action }}"
+      host: "{{ inventory_hostname }}"
+      device: "{{ storage_device }}"
+      mountpoint: "{{ storage_mountpoint }}"
+      filesystem: "{{ storage_filesystem }}"
+      mount_options: "{{ storage_mount_options }}"
+      directory_mode: "{{ storage_directory_mode }}"
+      manage_device: "{{ storage_manage_device | bool }}"
+      allow_format: "{{ storage_allow_format | bool }}"
+      format_confirmation: "{{ storage_format_confirmation }}"
+  register: _storage_inspection_command
+  changed_when: false
+  check_mode: false
+
+- name: Record the verified storage evidence
+  ansible.builtin.set_fact:
+    _storage_inspection: "{{ _storage_inspection_command.stdout | from_json }}"

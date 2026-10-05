@@ -1,0 +1,48 @@
+---
+- name: Require an external SSH key when managing the operator account
+  ansible.builtin.assert:
+    that:
+      - base_admin_authorized_keys is sequence
+      - base_admin_authorized_keys is not string
+      - base_admin_authorized_keys is not mapping
+      - base_admin_authorized_keys | length > 0
+      - >-
+        base_admin_authorized_keys | select('match', base_admin_key_pattern) | list | length
+        == base_admin_authorized_keys | length
+    fail_msg: Set base_admin_authorized_keys to a non-empty list of SSH public keys.
+  vars:
+    base_admin_key_pattern: '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]+={0,2}( [^\r\n]*)?\Z'
+
+- name: Validate each operator public key before replacing access
+  ansible.builtin.command:
+    argv: [ssh-keygen, -l, -f, /dev/stdin]
+    stdin: "{{ item }}"
+  loop: "{{ base_admin_authorized_keys }}"
+  changed_when: false
+  check_mode: false
+
+- name: Inspect the operator account for check-mode key installation
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ base_admin_user }}"
+    fail_key: false
+  register: base_admin_existing_account
+  when: ansible_check_mode
+
+- name: Report deferred key installation for a new check-mode account
+  ansible.builtin.debug:
+    msg: Check mode validated the public keys; installation awaits creation of the operator account.
+  when:
+    - ansible_check_mode
+    - base_admin_existing_account.ansible_facts.getent_passwd[base_admin_user] is none
+
+- name: Install the complete operator SSH key set
+  ansible.posix.authorized_key:
+    user: "{{ base_admin_user }}"
+    key: "{{ base_admin_authorized_keys | join('\n') }}"
+    state: present
+    exclusive: true
+    manage_dir: true
+  when: >-
+    not ansible_check_mode or
+    base_admin_existing_account.ansible_facts.getent_passwd[base_admin_user] is not none

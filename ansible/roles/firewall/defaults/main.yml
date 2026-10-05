@@ -1,6 +1,24 @@
 ---
 firewall_manage: true
+firewall_activation_stamp: /etc/.cvp-nftables-activation
+firewall_state_record: /etc/.cvp-nftables-live.json
+firewall_state_helper: /usr/local/sbin/cvp-firewall-state
 firewall_external_interface: ""
+firewall_external_ipv4_interface: >-
+  {{ firewall_external_interface | default(ansible_default_ipv4.interface | default(''), true) }}
+firewall_external_ipv6_interface: >-
+  {{ ansible_default_ipv6.interface | default(firewall_external_interface, true) }}
+firewall_external_interfaces: >-
+  {{ [firewall_external_ipv4_interface, firewall_external_ipv6_interface]
+     | reject('equalto', '') | unique | list }}
+firewall_public_ipv4_addresses: >-
+  {{ ([ansible_facts.get(firewall_external_ipv4_interface, {}).get('ipv4', {}).get('address', '')]
+      + (ansible_facts.get(firewall_external_ipv4_interface, {}).get('ipv4_secondaries', [])
+         | map(attribute='address') | list)) | reject('equalto', '') | unique | list }}
+firewall_public_ipv6_addresses: >-
+  {{ ansible_facts.get(firewall_external_ipv6_interface, {}).get('ipv6', [])
+     | map(attribute='address') | unique | list }}
+firewall_allow_dhcpv6: true
 firewall_public_ingress_ports:
   - 80
   - 443

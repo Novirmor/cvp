@@ -1,0 +1,45 @@
+---
+- name: Keep the enrollment credential out of extra command arguments
+  ansible.builtin.assert:
+    that:
+      - tailscale_extra_up_args is sequence
+      - tailscale_extra_up_args is not string
+      - tailscale_extra_up_args is not mapping
+      - tailscale_extra_up_args | select('match', '^-{1,2}auth-key(?:=|$)') | list | length == 0
+    fail_msg: Supply credentials only through tailscale_auth_key.
+  no_log: true
+
+- name: Enroll using a private ephemeral credential file
+  block:
+    - name: Allocate the enrollment credential file
+      ansible.builtin.tempfile:
+        state: file
+        path: "{{ tailscale_auth_key_temp_dir }}"
+        prefix: cvp-tailscale-auth-
+      register: tailscale_auth_file
+      no_log: true
+
+    - name: Populate the private enrollment credential file
+      ansible.builtin.copy:
+        dest: "{{ tailscale_auth_file.path }}"
+        content: "{{ tailscale_auth_key }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Authenticate Tailscale with the private credential file
+      ansible.builtin.command:
+        argv: "{{ ['tailscale', 'up', '--auth-key=file:' ~ tailscale_auth_file.path,
+                   '--hostname=' ~ node_name,
+                   '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false'),
+                   '--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
+                 + (['--login-server=' ~ tailscale_login_server] if tailscale_login_server | length > 0 else [])
+                 + tailscale_extra_up_args }}"
+      no_log: true
+      changed_when: true
+  always:
+    - name: Remove the enrollment credential file
+      ansible.builtin.file:
+        path: "{{ tailscale_auth_file.path }}"
+        state: absent
+      when: tailscale_auth_file.path is defined
+      no_log: true

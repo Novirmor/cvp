@@ -1,7 +1,13 @@
 ---
-- name: Require socat
+- name: Require bounded ingress connections
+  ansible.builtin.assert:
+    that:
+      - ingress_v6_max_children | int > 0
+      - ingress_v6_connect_timeout | int > 0
+
+- name: Require socat and listener inspection tools
   ansible.builtin.package:
-    name: socat
+    name: [socat, iproute2]
     state: present
 
 - name: Install the IPv6 ingress forwarder units
@@ -14,12 +20,15 @@
   loop: "{{ ingress_v6_ports }}"
   vars:
     ingress_v6_port: "{{ item }}"
-  notify: Restart the IPv6 ingress forwarders
 
-- name: Enable the IPv6 ingress forwarders
-  ansible.builtin.systemd_service:
-    name: cvp-ingress-v6-{{ item }}.service
-    state: started
-    enabled: true
-    daemon_reload: true
+- name: Activate and verify the IPv6 ingress forwarders
+  ansible.builtin.include_tasks: "{{ role_path }}/../base/tasks/activate-service.yml"
+  vars:
+    _cvp_service_unit: "cvp-ingress-v6-{{ item }}.service"
+    _cvp_service_enabled: true
+    _cvp_service_inputs:
+      - "/etc/systemd/system/cvp-ingress-v6-{{ item }}.service"
+    _cvp_service_stamp: "/etc/systemd/system/.cvp-ingress-v6-{{ item }}-activation"
+    _cvp_service_probe_port: "{{ item }}"
   loop: "{{ ingress_v6_ports }}"
+  when: not ansible_check_mode

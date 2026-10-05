@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+def canonical(value):
+    if isinstance(value, list):
+        return [canonical(item) for item in value]
+    if isinstance(value, dict):
+        return {key: canonical(item) for key, item in value.items() if key != "handle"}
+    return value
+
+
+def evidence(config, nft):
+    result = subprocess.run([nft, "-j", "list", "table", "inet", "cvp_filter"],
+                            capture_output=True, text=True, check=True, timeout=15)
+    rows = json.loads(result.stdout)["nftables"]
+    rows = [row for row in rows if "metainfo" not in row]
+    if not any(row.get("table", {}).get("name") == "cvp_filter" for row in rows):
+        raise ValueError("The live CVP firewall table is missing")
+    return {"config_sha256": hashlib.sha256(Path(config).read_bytes()).hexdigest(),
+            "table": canonical(rows)}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("record", "verify"))
+    parser.add_argument("--config", default="/etc/nftables.conf")
+    parser.add_argument("--record", default="/etc/.cvp-nftables-live.json")
+    parser.add_argument("--nft", default="/usr/sbin/nft")
+    args = parser.parse_args()
+    observed = evidence(args.config, args.nft)
+    if args.action == "verify":
+        if json.loads(Path(args.record).read_text()) != observed:
+            raise ValueError("Live CVP firewall differs from its successfully applied policy")
+        print("CVP firewall matches the applied policy")
+        return
+    descriptor, temporary = tempfile.mkstemp(prefix=".cvp-firewall-", dir=Path(args.record).parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(observed, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, args.record)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        sys.exit(f"Firewall evidence failed: {error}")

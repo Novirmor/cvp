@@ -1,0 +1,14 @@
+---
+- name: Exercise isolated host security regressions
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Test packet policy and temporary host-access fixtures
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -B
+          - "{{ playbook_dir }}/../../scripts/test_host_network_security.py"
+      changed_when: false

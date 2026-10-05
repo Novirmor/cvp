@@ -24,6 +24,27 @@
     state: present
     update_cache: true
 
+- name: Inspect WireGuard tools for check-mode validation
+  ansible.builtin.command: wg --version
+  register: wireguard_tools_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ansible_check_mode
+
+- name: Require explicit confirmation and matching inventory for key rotation
+  ansible.builtin.assert:
+    that:
+      - wireguard_rotation_confirm == inventory_hostname
+      - wireguard_private_key | trim | length > 0
+      - wireguard_public_key | default('') | trim | length > 0
+      - wireguard_manage_config | bool
+    fail_msg: >-
+      Rotation requires wireguard_rotation_confirm equal to this inventory host,
+      an externally supplied private key, its new inventory public key, and managed configuration.
+  when: wireguard_rotate_private_key | bool
+  no_log: true
+
 - name: Create WireGuard directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -53,6 +74,7 @@
   changed_when: false
   failed_when: false
   no_log: true
+  check_mode: false
   when: not wireguard_private_key_stat.stat.exists
 
 - name: Start with an externally supplied key when present
@@ -67,6 +89,7 @@
   when:
     - wireguard_private_key_stat.stat.exists
     - wireguard_private_key_slurp.content | default('') | length > 0
+    - not wireguard_rotate_private_key | bool
 
 - name: Prefer the key from the active interface
   ansible.builtin.set_fact:
@@ -75,19 +98,37 @@
   when:
     - not wireguard_private_key_stat.stat.exists
     - wireguard_existing_interface_key.stdout | default('') | trim | length > 0
+    - not wireguard_rotate_private_key | bool
 
 - name: Generate a host-local key only when no owner key exists
   ansible.builtin.command: wg genkey
   register: wireguard_generated_key
   changed_when: true
   no_log: true
-  when: wireguard_private_key_material | default('') | trim | length == 0
+  when:
+    - not ansible_check_mode
+    - wireguard_private_key_material | default('') | trim | length == 0
 
 - name: Keep the generated key for this convergence
   ansible.builtin.set_fact:
     wireguard_private_key_material: "{{ wireguard_generated_key.stdout | trim }}"
   no_log: true
   when: wireguard_generated_key is defined and wireguard_generated_key.stdout | default('') | trim | length > 0
+
+- name: Decide whether the selected WireGuard key can be validated
+  ansible.builtin.set_fact:
+    wireguard_can_validate_key: >-
+      {{ not ansible_check_mode or
+         (wireguard_private_key_material | default('') | trim | length > 0
+          and wireguard_tools_probe.rc | default(1) == 0) }}
+
+- name: Report deferred WireGuard check-mode work
+  ansible.builtin.debug:
+    msg: >-
+      Check mode does not generate or persist keys, render secret configuration,
+      or activate WireGuard. Key validation is {{ 'available' if wireguard_can_validate_key else
+      'deferred until a key and installed WireGuard tools are available' }}.
+  when: ansible_check_mode
 
 - name: Require usable private key material
   ansible.builtin.assert:
@@ -97,16 +138,7 @@
       No WireGuard private key was found or generated. Supply wireguard_private_key
       from an external secret source or permit host-local key generation.
   no_log: true
-
-- name: Persist a newly selected private key without exposing it
-  ansible.builtin.copy:
-    dest: "{{ wireguard_private_key_file }}"
-    content: "{{ wireguard_private_key_material | trim }}\n"
-    owner: root
-    group: root
-    mode: "0600"
-  no_log: true
-  when: not wireguard_private_key_stat.stat.exists
+  when: wireguard_can_validate_key | bool
 
 - name: Derive the public key
   ansible.builtin.command: wg pubkey
@@ -115,6 +147,8 @@
   register: wireguard_public_key_command
   changed_when: false
   no_log: true
+  check_mode: false
+  when: wireguard_can_validate_key | bool
 
 - name: Require the derived public key to match the persisted inventory key
   ansible.builtin.assert:
@@ -129,21 +163,49 @@
       rotation, or run a coordinated mesh-wide key rotation. Peers authenticate
       the inventory key, so a silent mismatch would partition the mesh.
   no_log: true
+  when: wireguard_can_validate_key | bool
 
-- name: Render the owner-managed WireGuard mesh
-  ansible.builtin.template:
-    src: wg0.conf.j2
-    dest: "/etc/wireguard/{{ wireguard_interface }}.conf"
+- name: Persist the validated private key without exposing it
+  ansible.builtin.copy:
+    dest: "{{ wireguard_private_key_file }}"
+    content: "{{ wireguard_private_key_material | trim }}\n"
     owner: root
     group: root
     mode: "0600"
   no_log: true
-  notify: Restart WireGuard
-  when: wireguard_manage_config | bool
+  when: not ansible_check_mode
 
-- name: Enable the WireGuard interface
-  ansible.builtin.systemd_service:
-    name: "wg-quick@{{ wireguard_interface }}.service"
-    state: started
-    enabled: true
-  when: wireguard_manage_config | bool
+- name: Install the in-place WireGuard reconciler
+  ansible.builtin.copy:
+    src: cvp-wireguard-state
+    dest: "{{ wireguard_state_helper }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: wireguard_manage_config | bool and not ansible_check_mode
+
+- name: Render the owner-managed WireGuard mesh
+  when: wireguard_manage_config | bool and not ansible_check_mode
+  block:
+    - name: Validate and install the WireGuard candidate
+      ansible.builtin.template:
+        src: wg0.conf.j2
+        dest: "/etc/wireguard/{{ wireguard_interface }}.conf"
+        owner: root
+        group: root
+        mode: "0600"
+        validate: >-
+          {{ wireguard_state_helper | quote }} inspect --interface {{ wireguard_interface | quote }}
+          --config %s --record {{ wireguard_state_record | quote }}
+      no_log: true
+  rescue:
+    - name: Report rejected WireGuard configuration
+      ansible.builtin.fail:
+        msg: >-
+          WireGuard candidate rejected before replacing boot configuration.
+          Correct key/peer data; interface or address identity changes require
+          explicit coordinated maintenance. No interface restart was attempted.
+
+- name: Activate and verify the WireGuard interface
+  ansible.builtin.include_tasks: activate.yml
+  when: wireguard_manage_config | bool and not ansible_check_mode

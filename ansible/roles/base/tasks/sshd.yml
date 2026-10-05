@@ -1,0 +1,77 @@
+---
+- name: Install the effective SSH configuration validator
+  ansible.builtin.copy:
+    src: cvp-validate-sshd
+    dest: /usr/local/sbin/cvp-validate-sshd
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Select SSH validation contexts
+  ansible.builtin.set_fact:
+    base_sshd_validation_argv: >-
+      {{ ['/usr/local/sbin/cvp-validate-sshd', '--config', '/etc/ssh/sshd_config']
+         + (base_sshd_validation_contexts | map('regex_replace', '^', '--context=') | list)
+         + (([ansible_user | default('root'), base_admin_user, 'root'] | unique)
+            | map('regex_replace', '^', '--user=') | list) }}
+
+- name: Create the SSH configuration directory
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the SSH hardening policy
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-cvp-hardening.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+      X11Forwarding no
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      MaxAuthTries 4
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Remove the obsolete lower-priority SSH policy
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d/50-cvp-hardening.conf
+    state: absent
+
+- name: Read the SSH main configuration
+  ansible.builtin.slurp:
+    src: /etc/ssh/sshd_config
+  register: base_sshd_main_config
+
+- name: Put the managed SSH policy before existing global settings
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+
+- name: Verify effective SSH authentication settings
+  ansible.builtin.command:
+    argv: "{{ base_sshd_validation_argv }}"
+  environment:
+    CVP_SSH_CONNECTION: "{{ ansible_env.SSH_CONNECTION | default('') }}"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Activate the verified SSH policy
+  ansible.builtin.include_tasks: activate-service.yml
+  vars:
+    _cvp_service_unit: "{{ base_ssh_service_name }}.service"
+    _cvp_service_action: reloaded
+    _cvp_service_inputs:
+      - /etc/ssh/sshd_config
+      - /etc/ssh/sshd_config.d/00-cvp-hardening.conf
+    _cvp_service_stamp: /etc/ssh/.cvp-sshd-activation
+  when: not ansible_check_mode

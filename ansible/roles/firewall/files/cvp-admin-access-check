@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+def port(value):
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
+        raise ValueError(f"Invalid TCP port: {value!r}")
+    number = int(value)
+    if not 1 <= number <= 65535:
+        raise ValueError(f"TCP port outside 1..65535: {value!r}")
+    return number
+
+
+def addresses(values):
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError("IP addresses must be a list of strings")
+    return [ipaddress.ip_address(value) for value in values]
+
+
+def networks(values, version):
+    if not isinstance(values, list):
+        raise ValueError("SSH source CIDRs must be lists")
+    result = []
+    for value in values:
+        if not isinstance(value, str) or "/" not in value:
+            raise ValueError(f"Invalid SSH source CIDR: {value!r}")
+        network = ipaddress.ip_network(value)
+        if network.version != version:
+            raise ValueError(f"Wrong address family for SSH source CIDR: {value}")
+        result.append(network)
+    return result
+
+
+def read_command(argv):
+    result = subprocess.run(argv, text=True, capture_output=True, timeout=30, check=False)
+    if result.returncode:
+        raise ValueError(f"{' '.join(argv)} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def configured_ports(output):
+    ports = []
+    for line in output.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2 or not re.fullmatch(r"[a-z][a-z0-9]*", fields[0]):
+            raise ValueError("Malformed sshd -T output")
+        if fields[0] == "port":
+            ports.append(port(fields[1]))
+    if not ports:
+        raise ValueError("sshd -T returned no effective Port")
+    return ports
+
+
+def endpoint(value, peer=False):
+    host, separator, number = value.rpartition(":")
+    if not separator or not host:
+        raise ValueError(f"Malformed listening socket endpoint: {value!r}")
+    if host.startswith("["):
+        closing = host.find("]")
+        if closing < 0 or (host[closing + 1:] and not host[closing + 1:].startswith("%")):
+            raise ValueError(f"Malformed listening socket address: {host!r}")
+        host = host[1:closing] + host[closing + 1:]
+    host, scoped, interface = host.partition("%")
+    if scoped and not re.fullmatch(r"[A-Za-z0-9_=+.-]{1,15}", interface):
+        raise ValueError("Malformed listening socket interface")
+    address = None if host == "*" else ipaddress.ip_address(host)
+    return address, None if peer and number == "*" else port(number)
+
+
+def listeners(output):
+    result = []
+    for line in output.splitlines():
+        fields = line.split()
+        if (len(fields) != 5 or fields[0] != "LISTEN"
+                or not fields[1].isdigit() or not fields[2].isdigit()):
+            raise ValueError("Malformed ss -H -ltn output")
+        result.append(endpoint(fields[3]))
+        endpoint(fields[4], peer=True)
+    return result
+
+
+def socket_endpoint(value):
+    address, number = endpoint(value)
+    if address is None:
+        raise ValueError("Wildcard established socket address")
+    interface = value.rpartition(":")[0].strip("[]").partition("%")[2]
+    return address, number, interface
+
+
+def bootstrap_cidr_guidance(client=None):
+    if client is None:
+        return ("SSH_CONNECTION is unavailable, so the actual client source cannot be checked. "
+                "Set firewall_ssh_ipv4_source_cidrs or firewall_ssh_ipv6_source_cidrs in this host's "
+                "external operator settings to the independently verified source address the host sees "
+                "(/32 for IPv4 or /128 for IPv6). Tailscale Running does not replace this requirement.")
+    variable = f"firewall_ssh_ipv{client.version}_source_cidrs"
+    cidr = f"{client}/{client.max_prefixlen}"
+    return (f"Set {variable} to {json.dumps([cidr])} in this host's external operator settings, "
+            "explicitly matching the current SSH client source observed by the host. "
+            "For a Tailscale session use that client's Tailscale source IP, not its public egress IP.")
+
+
+def private_interface(client, destination, client_port, server_port, interface):
+    found = []
+    for line in read_command(["ss", "-H", "-tn", "state", "established"]).splitlines():
+        fields = line.split()
+        if len(fields) != 4 or not all(value.isdigit() for value in fields[:2]):
+            raise ValueError("Malformed established socket evidence")
+        local, local_port, bound = socket_endpoint(fields[2])
+        peer, peer_port, _ = socket_endpoint(fields[3])
+        if (local, local_port, peer, peer_port) == (destination, server_port, client, client_port):
+            found.append(bound)
+    if found != [interface]:
+        raise ValueError("Private SSH ingress is unproven: stock unbound sshd sockets cannot supply "
+                         "kernel interface-binding evidence, even when SSH to a private IP succeeds. "
+                         + bootstrap_cidr_guidance(client))
+    routes = json.loads(read_command([
+        "ip", f"-{client.version}", "-j", "route", "get", str(client), "from", str(destination),
+        "ipproto", "tcp", "sport", str(server_port), "dport", str(client_port),
+    ]))
+    if (not isinstance(routes, list) or len(routes) != 1 or not isinstance(routes[0], dict)
+            or routes[0].get("dev") != interface or routes[0].get("type", "unicast") != "unicast"
+            or any(routes[0].get(key) for key in ("gateway", "via", "multipath", "nhid"))
+            or routes[0].get("flags", [])):
+        raise ValueError("Private SSH return route does not match its bound ingress interface. "
+                         + bootstrap_cidr_guidance(client))
+
+
+def check(policy):
+    if not isinstance(policy, dict):
+        raise ValueError("Administration policy must be a JSON object")
+    managed_port = port(policy["firewall_ssh_port"])
+    if port(policy["base_ssh_port"]) != managed_port:
+        raise ValueError("firewall_ssh_port must equal base_ssh_port")
+    cidrs = networks(policy["ipv4_source_cidrs"], 4) + networks(policy["ipv6_source_cidrs"], 6)
+    connection = policy.get("ssh_connection", "")
+    if not isinstance(connection, str):
+        raise ValueError("SSH_CONNECTION must be a string")
+    connection = connection or os.environ.get("SSH_CONNECTION", "")
+    session = None
+    if connection:
+        fields = connection.split()
+        if len(fields) != 4:
+            raise ValueError("Malformed SSH_CONNECTION: expected client IP/port and server IP/port")
+        client, destination = addresses([fields[0], fields[2]])
+        client_port = port(fields[1])
+        if port(fields[3]) != managed_port:
+            raise ValueError("Current SSH server local port differs from firewall_ssh_port/base_ssh_port")
+        if client.version != destination.version:
+            raise ValueError("SSH_CONNECTION IP address families differ")
+        session = client, destination
+    tailscale = {}
+    tailscale_rc = policy.get("tailscale_rc", 1)
+    if not isinstance(tailscale_rc, int) or isinstance(tailscale_rc, bool):
+        raise ValueError("Tailscale command status must be an integer")
+    if tailscale_rc == 0:
+        tailscale = json.loads(policy["tailscale_status"])
+        if not isinstance(tailscale, dict) or not isinstance(tailscale.get("BackendState"), str):
+            raise ValueError("Malformed Tailscale status")
+    running = tailscale.get("BackendState") == "Running"
+    self_status = tailscale.get("Self", {})
+    if not isinstance(self_status, dict):
+        raise ValueError("Malformed Tailscale Self status")
+    self_ips = addresses(self_status.get("TailscaleIPs", []))
+    wg_address = policy.get("wireguard_address", "")
+    if not isinstance(wg_address, str):
+        raise ValueError("WireGuard address must be a string")
+    wg_ip = ipaddress.ip_address(wg_address) if wg_address else None
+    wg_peers = addresses(policy.get("wireguard_peer_addresses", []))
+    effective_ports = configured_ports(read_command(["sshd", "-T"]))
+    if effective_ports != [managed_port]:
+        raise ValueError(f"sshd effective ports {effective_ports} must be exactly [{managed_port}]; extra ports are unmodeled")
+    sockets = listeners(read_command(["ss", "-H", "-ltn"]))
+    managed_sockets = [address for address, number in sockets if number == managed_port]
+    if not managed_sockets:
+        raise ValueError(f"No actual TCP listener on managed SSH port {managed_port}")
+    if session is None:
+        if not cidrs:
+            raise ValueError("connection-proof-unavailable: " + bootstrap_cidr_guidance())
+        return {"path": "connection-proof-unavailable", "port": managed_port}
+    client, destination = session
+    if not any(address is None or address == destination
+               or (address.version == destination.version and address.is_unspecified)
+               for address in managed_sockets):
+        raise ValueError("No managed SSH listener covers the current server destination IP")
+    if any(client in network for network in cidrs):
+        path = "source-cidr"
+    elif running and destination in self_ips:
+        private_interface(client, destination, client_port, managed_port, "tailscale0")
+        path = "tailscale"
+    elif destination == wg_ip and client in wg_peers:
+        interface = policy.get("wireguard_interface", "wg0")
+        if not isinstance(interface, str) or not re.fullmatch(r"[A-Za-z0-9_=+.-]{1,15}", interface):
+            raise ValueError("Invalid WireGuard interface")
+        private_interface(client, destination, client_port, managed_port, interface)
+        path = "wireguard"
+    else:
+        raise ValueError("Current SSH connection is not permitted by the candidate firewall policy. "
+                         + bootstrap_cidr_guidance(client))
+    return {"path": path, "port": managed_port}
+
+
+def main():
+    try:
+        print(json.dumps(check(json.load(sys.stdin)), sort_keys=True))
+    except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
+        print(f"Administration-path preflight failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

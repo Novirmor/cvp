@@ -1,0 +1,6 @@
+---
+- name: Verify the desired storage device UUID and filesystem at the exact mountpoint
+  ansible.builtin.include_tasks: inspect.yml
+  vars:
+    _storage_inspection_action: verify
+  when: storage_enabled | bool

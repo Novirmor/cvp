@@ -17,6 +17,7 @@
   register: base_virt
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: Require a conclusive virtualization detection
   ansible.builtin.assert:
@@ -58,6 +59,7 @@
     state: present
     update_cache: true
     cache_valid_time: 3600
+    policy_rc_d: 101
 
 - name: Persist required kernel modules
   ansible.builtin.copy:
@@ -98,6 +100,7 @@
   register: base_overlay_fs
   changed_when: false
   failed_when: false
+  check_mode: false
   when: base_env == 'lxc'
 
 # An LXC guest cannot load modules or persist module loads; the host kernel
@@ -141,6 +144,7 @@
   register: base_lxc_access
   changed_when: false
   failed_when: false
+  check_mode: false
   when: base_env == 'lxc'
 
 - name: Refuse unsupported container capabilities
@@ -168,6 +172,7 @@
   register: base_lxc_sysctl_values
   changed_when: false
   failed_when: false
+  check_mode: false
   when: base_env == 'lxc'
 
 - name: Check LXC guest sysctl writability without changing values
@@ -177,6 +182,7 @@
   register: base_lxc_sysctl_writable
   changed_when: false
   failed_when: false
+  check_mode: false
   when:
     - base_env == 'lxc'
     - item.key not in base_lxc_host_sysctls
@@ -217,6 +223,7 @@
   register: base_ra_writable
   changed_when: false
   failed_when: false
+  check_mode: false
   when: base_env == 'lxc'
 
 - name: Require writable IPv6 router advertisement controls in LXC
@@ -232,6 +239,7 @@
   ansible.builtin.command: swapon --show --noheadings
   register: base_swap_devices
   changed_when: false
+  check_mode: false
   when: base_disable_swap | bool
 
 - name: Require LXC host to provide swap-free operation
@@ -297,6 +305,7 @@
     name: systemd-timesyncd.service
     state: started
     enabled: true
+  when: not ansible_check_mode
 
 - name: Create the operator account
   ansible.builtin.user:
@@ -308,26 +317,8 @@
     state: present
   when: base_manage_admin_user | bool
 
-- name: Require an external SSH key when managing the operator account
-  ansible.builtin.assert:
-    that:
-      - base_admin_authorized_keys | length > 0
-      - >-
-        base_admin_authorized_keys
-        | select('match', '^ssh-(rsa|ed25519|ecdsa) ')
-        | list | length == base_admin_authorized_keys | length
-    fail_msg: >-
-      Set base_admin_authorized_keys to one or more externally supplied public
-      keys before enabling base_manage_admin_user.
-  when: base_manage_admin_user | bool
-
-- name: Install operator SSH keys
-  ansible.posix.authorized_key:
-    user: "{{ base_admin_user }}"
-    key: "{{ item }}"
-    state: present
-    manage_dir: true
-  loop: "{{ base_admin_authorized_keys }}"
+- name: Reconcile the operator SSH key set
+  ansible.builtin.include_tasks: authorized-keys.yml
   when: base_manage_admin_user | bool
 
 - name: Grant passwordless administrative access
@@ -340,30 +331,8 @@
     validate: visudo -cf %s
   when: base_manage_admin_user | bool
 
-- name: Install SSH hardening drop-in
-  ansible.builtin.file:
-    path: /etc/ssh/sshd_config.d
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-  when: base_manage_sshd | bool
-
-- name: Install SSH hardening drop-in
-  ansible.builtin.copy:
-    dest: /etc/ssh/sshd_config.d/50-cvp-hardening.conf
-    content: |
-      PasswordAuthentication no
-      KbdInteractiveAuthentication no
-      PermitRootLogin prohibit-password
-      X11Forwarding no
-      ClientAliveInterval 300
-      ClientAliveCountMax 2
-      MaxAuthTries 4
-    owner: root
-    group: root
-    mode: "0644"
-  notify: Reload SSH
+- name: Reconcile and verify SSH hardening
+  ansible.builtin.include_tasks: sshd.yml
   when: base_manage_sshd | bool
 
 - name: Create the journald drop-in directory
@@ -385,4 +354,12 @@
     owner: root
     group: root
     mode: "0644"
-  notify: Restart journald
+
+- name: Activate bounded journal retention
+  ansible.builtin.include_tasks: activate-service.yml
+  vars:
+    _cvp_service_unit: systemd-journald.service
+    _cvp_service_inputs:
+      - /etc/systemd/journald.conf.d/30-cvp-retention.conf
+    _cvp_service_stamp: /etc/systemd/journald.conf.d/.cvp-activation
+  when: not ansible_check_mode
