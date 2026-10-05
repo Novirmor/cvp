@@ -24,3 +24,10 @@ deny contains sprintf("%s: hostPath volume %q is forbidden", [workload_ref(input
 	some v in object.get(pod_spec(input), "volumes", [])
 	"hostPath" in object.keys(v)
 }
+
+deny contains sprintf("%s: container %q hostPort is forbidden", [workload_ref(input), c.name]) if {
+	input.kind in workload_kinds
+	some c in all_containers(input)
+	some port in object.get(c, "ports", [])
+	object.get(port, "hostPort", 0) != 0
+}

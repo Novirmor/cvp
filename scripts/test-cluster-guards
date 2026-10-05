@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parent.parent
+preflight = runpy.run_path(str(ROOT / "scripts/cluster-bootstrap-preflight"))
+ingress = runpy.run_path(str(ROOT / "scripts/cluster-ingress-ready"))
+inputs = runpy.run_path(str(ROOT / "scripts/cluster-manifest-inputs"))
+
+
+def must_fail(function, *args):
+    try:
+        function(*args)
+    except (ValueError, subprocess.CalledProcessError, ingress["Pending"]):
+        return
+    raise AssertionError("expected rejection")
+
+
+def test_published(directory):
+    local = directory / "local"
+    remote = directory / "remote.git"
+    local.mkdir()
+    remote.mkdir()
+    env = preflight["git_environment"]()
+
+    def git(path, *args):
+        return preflight["git"](path, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args, env=env)
+
+    git(local, "init", "-b", "main")
+    git(remote, "init", "--bare")
+    (local / "cluster").mkdir()
+    source_file = local / "cluster/source.yaml"
+    source_file.write_text("placeholder\n")
+    git(local, "add", "cluster")
+    git(local, "commit", "-m", "fixture")
+    git(local, "push", str(remote), "main")
+    verify = preflight["verify_published"]
+    assert verify(local, str(remote), "main", env) == git(local, "rev-parse", "HEAD")
+    source_file.write_text("reviewed-url\n")
+    must_fail(verify, local, str(remote), "main", env)
+    git(local, "add", "cluster")
+    git(local, "commit", "-m", "reviewed fixture")
+    must_fail(verify, local, str(remote), "main", env)
+    git(local, "push", str(remote), "main")
+    assert verify(local, str(remote), "main", env) == git(local, "rev-parse", "HEAD")
+    for flag in ("assume-unchanged", "skip-worktree"):
+        git(local, "update-index", "--" + flag, "cluster/source.yaml")
+        source_file.write_text("hidden changed source\n")
+        assert not git(local, "status", "--porcelain", "--", "cluster")
+        must_fail(verify, local, str(remote), "main", env)
+        source_file.write_text("reviewed-url\n")
+        git(local, "update-index", "--no-" + flag, "cluster/source.yaml")
+    snapshot = directory / "snapshot"
+    revision = verify(local, str(remote), "main", env, snapshot=snapshot)
+    source_file.write_text("changed after verification\n")
+    assert (snapshot / "cluster/source.yaml").read_text() == "reviewed-url\n"
+    preflight["assert_branch"](snapshot, {"url": str(remote), "branch": "main", "revision": revision}, "ssh")
+    git(local, "add", "cluster")
+    git(local, "commit", "-m", "raced branch")
+    git(local, "push", str(remote), "main")
+    must_fail(preflight["assert_branch"], snapshot, {"url": str(remote), "branch": "main", "revision": revision}, "ssh")
+    git(local, "reset", "--hard", revision)
+    git(remote, "update-ref", "refs/heads/main", revision)
+    decoy = directory / "decoy"
+    git(directory, "clone", "--branch", "main", str(remote), str(decoy))
+    redirected = {
+        "GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy),
+        "GIT_INDEX_FILE": str(decoy / ".git/index"),
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": str(decoy),
+    }
+    with patch.dict(os.environ, redirected):
+        assert Path(preflight["git"](local, "rev-parse", "--show-toplevel")) == local
+        assert Path(preflight["git"](local, "rev-parse", "--show-toplevel", env={**env, **redirected})) == local
+        assert verify(local, str(remote), "main", {**env, **redirected}) == git(local, "rev-parse", "HEAD")
+        source_file.write_text("dirty actual checkout\n")
+        for supplied_env in (env, {**env, **redirected}):
+            try:
+                verify(local, str(remote), "main", supplied_env)
+            except ValueError as error:
+                assert "commit and publish all cluster changes" in str(error), str(error)
+            else:
+                raise AssertionError("a clean redirected Git checkout concealed dirty actual cluster files")
+        source_file.write_text("reviewed-url\n")
+        must_fail(verify, local / "cluster", str(remote), "main", env)
+    (local / "cluster/untracked.yaml").write_text("kind: Secret\n")
+    must_fail(verify, local, str(remote), "main", env)
+    source = {"apiVersion": "source.toolkit.fluxcd.io/v1", "kind": "GitRepository", "metadata": {"name": "flux-system", "namespace": "flux-system"}, "spec": {"url": "ssh://git@github.com/reviewed/repo.git", "ref": {"branch": "main"}, "secretRef": {"name": "flux-system"}, "suspend": False}}
+    assert preflight["source_branch"](source, source["spec"]["url"]) == "main"
+    with patch.dict(os.environ, {**redirected, "GIT_CONFIG_COUNT": "invalid"}):
+        assert preflight["source_branch"](source, source["spec"]["url"]) == "main"
+    must_fail(preflight["source_branch"], source, source["spec"]["url"] + "-suffix")
+    for value in (None, True, "false"):
+        bad = copy.deepcopy(source)
+        bad["spec"]["suspend"] = value
+        must_fail(preflight["source_branch"], bad, source["spec"]["url"])
+    source["spec"]["ref"]["commit"] = "deadbeef"
+    must_fail(preflight["source_branch"], source, source["spec"]["url"])
+
+
+def test_bootstrap_fail_closed(directory):
+    binary = directory / "bin"
+    binary.mkdir()
+    marker = directory / "kubectl-called"
+    kubectl = binary / "kubectl"
+    kubectl.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 99\n")
+    kubectl.chmod(0o700)
+    dummy = directory / "input"
+    dummy.write_text("unused-fixture\n")
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{binary}:{env['PATH']}",
+        "FLUX_GITHUB_OWNER": "cvp-negative-bootstrap-fixture",
+        "FLUX_GITHUB_REPOSITORY": "must-not-match",
+        "FLUX_KUBE_CONTEXT": "must-not-contact",
+        "FLUX_GIT_SSH_KEY_FILE": str(dummy),
+        "FLUX_GIT_KNOWN_HOSTS_FILE": str(dummy),
+        "SOPS_AGE_KEY_FILE": str(dummy),
+    })
+    result = subprocess.run(["bash", "scripts/bootstrap-flux"], cwd=ROOT, env=env, text=True, capture_output=True)
+    assert result.returncode and "preflight failed" in result.stderr, result.stderr
+    assert not marker.exists(), "bootstrap called kubectl before rejecting unpublished source"
+
+
+def test_sops(directory, schema=False):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("SOPS_")}
+    key = directory / "age.key"
+    subprocess.run(["age-keygen", "-o", str(key)], capture_output=True, check=True)
+    recipient = subprocess.check_output(["age-keygen", "-y", str(key)], text=True).strip()
+    plaintext = {
+        "apiVersion": "v1", "kind": "Secret", "metadata": {"name": "disposable-fixture"},
+        "data": {"password": base64.b64encode(b"fixture-only").decode()}, "stringData": {"username": "fixture-only"},
+    }
+    path = directory / "secret.json"
+    path.write_text(json.dumps(plaintext))
+    encrypted = subprocess.check_output([
+        "sops", "--encrypt", "--age", recipient, "--encrypted-regex", "^(data|stringData)$",
+        "--input-type", "json", "--output-type", "yaml", str(path),
+    ], cwd=directory, env=env, text=True)
+    result = subprocess.run([
+        "conftest", "test", "-", "--parser", "yaml", "--policy", str(ROOT / "tests/policy"),
+    ], input=encrypted, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    sanitized = list(inputs["schema_input"](encrypted))
+    obj = json.loads(sanitized[0])
+    assert "sops" not in obj and obj["data"]["password"] == "" and obj["stringData"]["username"] == ""
+    if schema:
+        command = ["kubeconform", "-strict", "-kubernetes-version", "1.35.0"]
+        invalid = subprocess.run(command, input=encrypted, text=True, capture_output=True)
+        assert invalid.returncode and "sops" in invalid.stdout, invalid.stdout + invalid.stderr
+        valid = subprocess.run(command, input="\n---\n".join(sanitized), text=True, capture_output=True)
+        assert valid.returncode == 0, valid.stdout + valid.stderr
+    env["SOPS_AGE_KEY_FILE"] = str(key)
+    encrypted_path = directory / "secret.sops.yaml"
+    encrypted_path.write_text(encrypted)
+    recovered = json.loads(subprocess.check_output([
+        "sops", "--decrypt", "--output-type", "json", str(encrypted_path),
+    ], cwd=directory, env=env, text=True))
+    assert recovered == plaintext
+    generator = directory / "Kustomization"
+    generator.write_text("kind: Kustomization\nsecretGenerator:\n- name: test\n  literals: [password=fixture]\n")
+    assert generator in inputs["source_files"](directory)
+    result = subprocess.run([
+        "conftest", "test", str(generator), "--parser", "yaml", "--policy", str(ROOT / "tests/policy"),
+    ], text=True, capture_output=True)
+    assert result.returncode and "secretGenerator is forbidden" in result.stdout
+
+
+def test_list_wrappers(directory):
+    source_root = directory / "list-sources"
+    source_root.mkdir()
+    source_file = source_root / "unreferenced.yaml"
+    secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "fixture"}, "stringData": {"password": "fixture-only"}}
+    secret_list = {"apiVersion": "v1", "kind": "SecretList", "items": [{"metadata": {"name": "fixture"}, "data": {"password": base64.b64encode(b"fixture-only").decode()}}]}
+    wrappers = [
+        {"apiVersion": "v1", "kind": "List", "items": [secret]},
+        secret_list,
+        {"apiVersion": "v1", "kind": "List", "items": [secret_list]},
+        {"apiVersion": "v1", "kind": "SecretList", "items": []},
+        [{"apiVersion": "v1", "kind": "List", "items": [secret]}],
+    ]
+    for wrapper in wrappers:
+        text = json.dumps(wrapper)
+        source_file.write_text(text)
+        source = subprocess.run([
+            "python3", "scripts/cluster-manifest-inputs", "sources", "--root", str(source_root),
+        ], cwd=ROOT, capture_output=True, text=True)
+        assert source.returncode and "resource list wrappers are forbidden" in source.stdout, source.stdout + source.stderr
+        rendered = subprocess.run([
+            "conftest", "test", "-", "--parser", "yaml", "--policy", str(ROOT / "tests/policy"),
+        ], input=text, capture_output=True, text=True)
+        assert rendered.returncode and "resource list wrappers are forbidden" in rendered.stdout, rendered.stdout + rendered.stderr
+        try:
+            list(inputs["schema_input"](text))
+        except ValueError as error:
+            assert "resource list wrappers are forbidden" in str(error)
+        else:
+            raise AssertionError("schema input accepted a resource list wrapper")
+    print(f"cluster secret lists: {len(wrappers)} wrapper cases rejected in source, render and schema paths")
+    for metadata in ({}, {"metadata": None}, {"metadata": []}, {"metadata": "invalid"}):
+        obj = {"apiVersion": "v1", "kind": "Secret", "stringData": {"password": "fixture-only"}, **metadata}
+        source_file.write_text(json.dumps(obj))
+        result = subprocess.run([
+            "python3", "scripts/cluster-manifest-inputs", "sources", "--root", str(source_root),
+        ], cwd=ROOT, capture_output=True, text=True)
+        assert result.returncode and "must be SOPS encrypted" in result.stdout, result.stdout + result.stderr
+
+
+def test_ingress():
+    chart_version = "39.0.701+up39.0.7"
+    ready = {"conditions": [{"type": "Ready", "status": "True"}]}
+    labels = {"cvp.io/ingress": "true", "svccontroller.k3s.cattle.io/enablelb": "true", "svccontroller.k3s.cattle.io/lbpool": "public"}
+    expected = {"spec": {"valuesContent": "fixture"}}
+    ports = {"web": {"port": 8000, "exposedPort": 80, "protocol": "TCP"}, "websecure": {"port": 8443, "exposedPort": 443, "protocol": "TCP"}}
+    container = {"name": "traefik", "args": ["--entryPoints.web.http.redirections.entryPoint.to=:443", "--entryPoints.web.address=:8000/tcp", "--entryPoints.websecure.address=:8443/tcp"], "ports": [{"name": name, "containerPort": port["port"], "protocol": port["protocol"]} for name, port in ports.items()]}
+    state = {
+        "config": copy.deepcopy(expected), "expected_values": {"nodeSelector": {"cvp.io/ingress": "true"}},
+        "expected_ports": ports,
+        "chart": {"metadata": {"uid": "chart"}, "status": {"jobName": "helm-install-traefik"}},
+        "release": {"name": "traefik", "namespace": "kube-system", "version": 7, "info": {"status": "deployed", "description": "Upgrade complete"}, "config": {"nodeSelector": {"cvp.io/ingress": "true"}}},
+        "release_metadata": {"name": "traefik", "namespace": "kube-system", "revision": 7, "status": "deployed", "chart": "traefik", "version": chart_version, "appVersion": "3.6.13", "deployedAt": "2026-10-03T00:00:00Z"},
+        "release_values": {"nodeSelector": {"cvp.io/ingress": "true"}},
+        "job": {"metadata": {"ownerReferences": [{"uid": "chart"}]}, "status": {"conditions": [{"type": "Complete", "status": "True"}]}},
+        "nodes": {"items": [{"metadata": {"name": "ingress", "labels": labels}, "status": ready}]},
+        "deployment": {"metadata": {"generation": 2}, "spec": {"replicas": 1, "template": {"spec": {"nodeSelector": {"cvp.io/ingress": "true"}, "containers": [copy.deepcopy(container)]}}}, "status": {"observedGeneration": 2, "replicas": 1, "updatedReplicas": 1, "readyReplicas": 1, "availableReplicas": 1}},
+        "service": {"metadata": {"uid": "service", "labels": {"svccontroller.k3s.cattle.io/lbpool": "public"}}, "spec": {"selector": {"app.kubernetes.io/name": "traefik"}, "type": "LoadBalancer", "externalTrafficPolicy": "Local", "allocateLoadBalancerNodePorts": True, "ports": [{"name": "web", "port": 80, "targetPort": "web", "protocol": "TCP", "nodePort": 30080}, {"name": "websecure", "port": 443, "targetPort": "websecure", "protocol": "TCP", "nodePort": 30443}]}},
+        "daemonsets": {"items": [{"metadata": {"name": "svclb-traefik-a1b2c3d4", "uid": "ds", "generation": 2, "ownerReferences": [{"uid": "service"}]}, "spec": {"template": {"spec": {"nodeSelector": {"svccontroller.k3s.cattle.io/enablelb": "true", "svccontroller.k3s.cattle.io/lbpool": "public"}}}}, "status": {"observedGeneration": 2, "desiredNumberScheduled": 1, "currentNumberScheduled": 1, "updatedNumberScheduled": 1, "numberReady": 1, "numberAvailable": 1}}]},
+        "lb_pods": {"items": [{"metadata": {"ownerReferences": [{"uid": "ds"}]}, "spec": {"nodeName": "ingress"}, "status": ready}]},
+        "traefik_pods": {"items": [{"metadata": {"uid": "pod"}, "spec": {"nodeName": "ingress", "containers": [copy.deepcopy(container)]}, "status": ready}]},
+        "endpoints": {"items": [{"ports": [{"name": name, "port": port["port"], "protocol": port["protocol"]} for name, port in ports.items()], "endpoints": [{"nodeName": "ingress", "conditions": {"ready": True}, "targetRef": {"uid": "pod"}}]}]},
+    }
+    check = ingress["check"]
+    check(state, expected, chart_version)
+    changes = [
+        lambda s: s["config"]["spec"].update({"valuesContent": "old"}),
+        lambda s: s["release"]["info"].update({"status": "pending-upgrade"}),
+        lambda s: s["release_metadata"].update({"version": "old"}),
+        lambda s: s["release_metadata"].update({"revision": 8}),
+        lambda s: s["release_metadata"].update({"status": "superseded"}),
+        lambda s: s["release_metadata"].update({"name": "other"}),
+        lambda s: s["release_metadata"].update({"namespace": "other"}),
+        lambda s: s["release_metadata"].update({"chart": "other"}),
+        lambda s: s.update({"release_values": {}}),
+        lambda s: s["chart"].update({"status": {"conditions": [{"type": "Failed", "status": "True"}]}}),
+        lambda s: s["job"].update({"status": {}}),
+        lambda s: s["job"]["metadata"].update({"ownerReferences": [{"uid": "old"}]}),
+        lambda s: s["deployment"]["status"].update({"observedGeneration": 1}),
+        lambda s: s["deployment"]["status"].update({"updatedReplicas": 0}),
+        lambda s: s["deployment"]["spec"]["template"]["spec"]["containers"][0].update({"args": []}),
+        lambda s: s["nodes"]["items"][0]["metadata"]["labels"].pop("svccontroller.k3s.cattle.io/lbpool"),
+        lambda s: s["nodes"]["items"].append({"metadata": {"name": "other", "labels": {"svccontroller.k3s.cattle.io/enablelb": "true"}}}),
+        lambda s: s["service"]["spec"].update({"allocateLoadBalancerNodePorts": False}),
+        lambda s: s["service"]["spec"].update({"type": "NodePort"}),
+        lambda s: s["service"]["spec"]["ports"][0].pop("nodePort"),
+        lambda s: s["daemonsets"].update({"items": []}),
+        lambda s: s["daemonsets"]["items"][0]["metadata"].update({"ownerReferences": [{"uid": "old"}]}),
+        lambda s: s["daemonsets"]["items"][0]["status"].update({"desiredNumberScheduled": 0}),
+        lambda s: s["daemonsets"]["items"][0]["status"].update({"numberMisscheduled": 1}),
+        lambda s: s["daemonsets"]["items"][0]["spec"]["template"]["spec"]["nodeSelector"].pop("svccontroller.k3s.cattle.io/lbpool"),
+        lambda s: s["lb_pods"]["items"][0]["spec"].update({"nodeName": "other"}),
+        lambda s: s["traefik_pods"].update({"items": []}),
+        lambda s: s["endpoints"]["items"][0]["endpoints"][0].update({"nodeName": "other"}),
+        lambda s: s["endpoints"]["items"][0]["endpoints"][0]["conditions"].update({"ready": False}),
+    ]
+    for change in changes:
+        bad = copy.deepcopy(state)
+        change(bad)
+        must_fail(check, bad, expected, chart_version)
+    print(f"cluster ingress readiness: {len(changes)} independent failure cases and healthy hashed-name fixture passed")
+    test_ingress_ports(state, expected, chart_version)
+    test_ingress_snapshot(state, expected, chart_version)
+    test_ingress_deadlines(state, expected, chart_version)
+
+
+def test_ingress_ports(state, expected, chart_version):
+    check = ingress["check"]
+    cases = 0
+    for index, name in enumerate(("web", "websecure")):
+        numeric = copy.deepcopy(state)
+        numeric["service"]["spec"]["ports"][index]["targetPort"] = state["expected_ports"][name]["port"]
+        check(numeric, expected, chart_version)
+        changes = [
+            lambda s: s["service"]["spec"]["ports"][index].update({"targetPort": 1}),
+            lambda s: s["service"]["spec"]["ports"][index].update({"targetPort": "missing"}),
+            lambda s: s["service"]["spec"]["ports"][index].update({"targetPort": ("websecure", "web")[index]}),
+            lambda s: s["service"]["spec"]["ports"][index].pop("targetPort"),
+            lambda s: s["service"]["spec"]["ports"][index].update({"protocol": "UDP"}),
+            lambda s: s["service"]["spec"]["ports"][index].update({"name": "other"}),
+            lambda s: s["endpoints"]["items"][0]["ports"][index].update({"port": 1}),
+            lambda s: s["endpoints"]["items"][0]["ports"][index].update({"port": None}),
+            lambda s: s["endpoints"]["items"][0]["ports"][index].update({"protocol": "UDP"}),
+            lambda s: s["endpoints"]["items"][0]["ports"][index].update({"name": "other"}),
+            lambda s: s["endpoints"]["items"][0]["ports"].pop(index),
+            lambda s: (s["service"]["spec"]["ports"][index].update({"targetPort": 1}), s["endpoints"]["items"][0]["ports"][index].update({"port": 1})),
+        ]
+        for spec in (lambda s: s["deployment"]["spec"]["template"]["spec"], lambda s: s["traefik_pods"]["items"][0]["spec"]):
+            changes += [
+                lambda s, spec=spec: spec(s)["containers"][0]["ports"][index].update({"containerPort": 1}),
+                lambda s, spec=spec: spec(s)["containers"][0]["ports"][index].update({"protocol": "UDP"}),
+                lambda s, spec=spec: spec(s)["containers"][0]["ports"].pop(index),
+                lambda s, spec=spec: spec(s)["containers"][0]["args"].__setitem__(index + 1, f"--entryPoints.{name}.address=:1/tcp"),
+                lambda s, spec=spec: spec(s)["containers"][0]["args"].__setitem__(index + 1, f"--entryPoints.{name}.address=:{state['expected_ports'][name]['port']}/udp"),
+                lambda s, spec=spec: spec(s)["containers"][0]["args"].__setitem__(index + 1, f"--entryPoints.{name}.address=127.0.0.1:{state['expected_ports'][name]['port']}/tcp"),
+                lambda s, spec=spec: spec(s)["containers"][0]["args"].__setitem__(index + 1, f"--entryPoints.{name}.address=[::1]:{state['expected_ports'][name]['port']}/tcp"),
+                lambda s, spec=spec: spec(s)["containers"].append({"name": "sidecar", "ports": [copy.deepcopy(spec(s)["containers"][0]["ports"][index])]}),
+            ]
+        for change in changes:
+            bad = copy.deepcopy(state)
+            change(bad)
+            must_fail(check, bad, expected, chart_version)
+            cases += 1
+    bad = copy.deepcopy(state)
+    other = copy.deepcopy(bad["traefik_pods"]["items"][0])
+    other["metadata"]["uid"] = "other-pod"
+    other["spec"]["containers"][0]["ports"][0]["containerPort"] = 1
+    bad["traefik_pods"]["items"].append(other)
+    other_slice = copy.deepcopy(bad["endpoints"]["items"][0])
+    other_slice["endpoints"][0]["targetRef"]["uid"] = "other-pod"
+    other_slice["ports"][0]["port"] = 1
+    bad["endpoints"]["items"].append(other_slice)
+    must_fail(check, bad, expected, chart_version)
+    bad = copy.deepcopy(state)
+    other_slice = copy.deepcopy(bad["endpoints"]["items"][0])
+    other_slice["ports"][1]["port"] = 1
+    bad["endpoints"]["items"].append(other_slice)
+    must_fail(check, bad, expected, chart_version)
+    custom = copy.deepcopy(state)
+    for index, name in enumerate(("web", "websecure")):
+        port = 18000 + index
+        custom["expected_ports"][name]["port"] = port
+        custom["service"]["spec"]["ports"][index]["targetPort"] = port
+        custom["endpoints"]["items"][0]["ports"][index]["port"] = port
+        for spec in (custom["deployment"]["spec"]["template"]["spec"], custom["traefik_pods"]["items"][0]["spec"]):
+            spec["containers"][0]["args"][index + 1] = f"--entryPoints.{name}.address=:{port}/tcp"
+            spec["containers"][0]["ports"][index]["containerPort"] = port
+    check(custom, expected, chart_version)
+    print(f"cluster ingress ports: {cases + 2} HTTP/HTTPS, named target, listener, protocol and per-pod/slice failures rejected; numeric and reviewed custom listeners passed")
+
+
+def test_ingress_snapshot(state, expected, chart_version):
+    context = "snapshot-test-context"
+    lb_selector = "svccontroller.k3s.cattle.io/svcname=traefik,svccontroller.k3s.cattle.io/svcnamespace=kube-system"
+    namespace = ["-n", "kube-system"]
+    reads = [
+        (namespace + ["get", "helmchart", "traefik"], "chart"),
+        (namespace + ["get", "service", "traefik"], "service"),
+        (namespace + ["get", "helmchartconfig", "traefik"], "config"),
+        (namespace + ["get", "job", "helm-install-traefik"], "job"),
+        (["get", "nodes"], "nodes"),
+        (namespace + ["get", "deployment", "traefik"], "deployment"),
+        (namespace + ["get", "daemonsets", "-l", lb_selector], "daemonsets"),
+        (namespace + ["get", "pods", "-l", lb_selector], "lb_pods"),
+        (namespace + ["get", "pods", "-l", "app.kubernetes.io/name=traefik"], "traefik_pods"),
+        (namespace + ["get", "endpointslices", "-l", "kubernetes.io/service-name=traefik"], "endpoints"),
+    ]
+    kubectl_reads = {
+        tuple(["kubectl", f"--context={context}", "--request-timeout=15s", *command, "-o", "json"]): key
+        for command, key in reads
+    }
+    helm_prefix = ["helm", "--kube-context", context, "-n", "kube-system"]
+    status_command = [*helm_prefix, "status", "traefik", "-o", "json"]
+    metadata_command = [*helm_prefix, "get", "metadata", "traefik", "--revision", "7", "-o", "json"]
+    values_command = [*helm_prefix, "get", "values", "traefik", "--revision", "7", "-o", "json"]
+
+    def collect(fixture, final_status=None, failure=None):
+        calls = []
+
+        def output(command, **kwargs):
+            assert kwargs.get("timeout") == 20
+            calls.append(command)
+            if command == status_command:
+                result = final_status if final_status is not None and calls.count(status_command) == 2 else fixture["release"]
+            elif command == metadata_command:
+                result = fixture["release_metadata"]
+            elif command == values_command:
+                result = fixture["release_values"]
+            elif tuple(command) in kubectl_reads:
+                result = fixture[kubectl_reads[tuple(command)]]
+            else:
+                raise AssertionError(f"unexpected snapshot command: {command}")
+            if failure == command:
+                raise subprocess.CalledProcessError(1, command)
+            return json.dumps(result)
+
+        with patch.object(ingress["subprocess"], "check_output", side_effect=output):
+            result = ingress["snapshot"](context, lambda: 20)
+        result["expected_values"] = fixture["expected_values"]
+        result["expected_ports"] = fixture["expected_ports"]
+        ingress["check"](result, expected, chart_version)
+        return result, calls
+
+    assert "chart" not in state["release"]
+    result, calls = collect(state)
+    assert result["release_metadata"] == state["release_metadata"] and result["release_values"] == state["release_values"]
+    assert calls.count(status_command) == 2 and calls.count(metadata_command) == calls.count(values_command) == 1
+    assert calls.index(status_command) < calls.index(metadata_command) < calls.index(values_command)
+    assert {tuple(command) for command in calls} == set(kubectl_reads) | {tuple(status_command), tuple(metadata_command), tuple(values_command)}
+    for key, change in (
+        ("release_metadata", {"version": "old"}),
+        ("release_metadata", {"revision": 8}),
+        ("release_metadata", {"status": "superseded"}),
+        ("release_values", {"nodeSelector": {"cvp.io/ingress": "false"}}),
+    ):
+        bad = copy.deepcopy(state)
+        bad[key].update(change)
+        must_fail(collect, bad)
+    for revision in (None, 0, -1, "7", True):
+        bad = copy.deepcopy(state)
+        bad["release"]["version"] = revision
+        must_fail(collect, bad)
+    for change in ({"version": 8}, {"info": {"status": "superseded"}}):
+        final = {**state["release"], **change}
+        must_fail(collect, state, final)
+    must_fail(collect, state, None, metadata_command)
+    must_fail(collect, state, None, values_command)
+    print("cluster ingress snapshot: Helm 4 status without chart, revision-bound metadata/values and collection races passed")
+
+
+def test_ingress_deadlines(state, expected, chart_version):
+    modes = ("healthy", "render-expired", "parser-expired", "between-reads", "slow-success", "slow-check", "retry-sleep", "subprocess-timeout")
+    archive = b"reviewed-chart-fixture"
+    values = {**state["expected_values"], "ports": {"web": {"port": 8001, "expose": {"default": True}}, "websecure": {"expose": {"default": True}}}}
+    rendered = {"spec": {"valuesContent": json.dumps(values)}}
+    defaults = {"ports": state["expected_ports"]}
+    fixture = copy.deepcopy(state)
+    fixture["expected_values"] = fixture["release_values"] = values
+    fixture["config"] = rendered
+    fixture["expected_ports"]["web"]["port"] = 8001
+    fixture["endpoints"]["items"][0]["ports"][0]["port"] = 8001
+    for spec in (fixture["deployment"]["spec"]["template"]["spec"], fixture["traefik_pods"]["items"][0]["spec"]):
+        spec["containers"][0]["args"][1] = "--entryPoints.web.address=:8001/tcp"
+        spec["containers"][0]["ports"][0]["containerPort"] = 8001
+    with tempfile.TemporaryDirectory(prefix="cvp-ingress-deadlines-") as directory:
+        root = Path(directory)
+        pin_path = root / "cluster/infrastructure/ingress/packaged-chart.json"
+        pin_path.parent.mkdir(parents=True)
+        chart = f"traefik-{chart_version}.tgz"
+        pin_path.write_text(json.dumps({"chart": chart, "sha256": hashlib.sha256(archive).hexdigest()}))
+        for mode in modes:
+            clock = SimpleNamespace(now=0.0)
+            calls, sleeps, checks = [], [], []
+            status_reads = 0
+
+            def sleep(seconds):
+                assert 0 <= seconds <= 8 - clock.now, (mode, seconds, clock.now)
+                sleeps.append(seconds)
+                clock.now += seconds
+
+            def output(command, **kwargs):
+                nonlocal status_reads
+                assert clock.now < 8, (mode, command, clock.now)
+                assert kwargs["timeout"] == min(20, 8 - clock.now), (mode, command, kwargs)
+                calls.append((command, kwargs["timeout"]))
+                clock.now += 0.25
+                if command[0] == "kustomize":
+                    if mode == "render-expired":
+                        clock.now = 8
+                    return json.dumps(rendered)
+                if command[0] == "conftest":
+                    if mode == "parser-expired":
+                        clock.now = 8
+                    return kwargs["input"]
+                if command[:2] == ["helm", "pull"]:
+                    (Path(command[-1]) / chart).write_bytes(archive)
+                    return ""
+                if command[:3] == ["helm", "show", "values"]:
+                    return json.dumps(defaults)
+                if command[0] == "kubectl":
+                    kind = command[command.index("get") + 1]
+                    keys = {"helmchart": "chart", "service": "service", "helmchartconfig": "config", "job": "job", "nodes": "nodes", "deployment": "deployment", "daemonsets": "daemonsets", "endpointslices": "endpoints"}
+                    key = ("lb_pods" if "svccontroller.k3s.cattle.io/svcname=traefik" in command[command.index("-l") + 1] else "traefik_pods") if kind == "pods" else keys[kind]
+                    if mode == "between-reads":
+                        clock.now = 8
+                    if mode == "retry-sleep":
+                        clock.now = 7.5
+                        raise ingress["Pending"]("fixture operation pending")
+                    if mode == "subprocess-timeout":
+                        clock.now = 8
+                        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                elif "status" in command:
+                    status_reads += 1
+                    if mode == "slow-success" and status_reads == 2:
+                        clock.now = 8
+                    key = "release"
+                elif "metadata" in command:
+                    key = "release_metadata"
+                elif "values" in command:
+                    key = "release_values"
+                else:
+                    raise AssertionError(command)
+                return json.dumps(fixture[key])
+
+            def check(snapshot, reviewed, version):
+                assert reviewed == rendered and version == chart_version
+                assert snapshot["expected_ports"]["web"]["port"] == 8001
+                assert snapshot["expected_ports"]["websecure"]["port"] == defaults["ports"]["websecure"]["port"]
+                ingress["check"](snapshot, reviewed, version)
+                checks.append(clock.now)
+                if mode == "slow-check":
+                    clock.now = 8
+
+            timer = SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep)
+            with patch.object(ingress["subprocess"], "check_output", side_effect=output), patch.dict(ingress["wait"].__globals__, {"time": timer, "check": check}), patch("builtins.print") as printed:
+                try:
+                    ingress["wait"]("snapshot-test-context", root, 8)
+                except ValueError as error:
+                    assert mode != "healthy" and "ingress readiness timed out" in str(error), (mode, error)
+                    assert not printed.called, mode
+                    if mode == "retry-sleep":
+                        assert "fixture operation pending" in str(error)
+                else:
+                    assert mode == "healthy" and printed.call_count == 1, mode
+            kubectl_calls = [command for command, _ in calls if command[0] == "kubectl"]
+            if mode == "render-expired":
+                assert len(calls) == 1 and not kubectl_calls
+            if mode == "parser-expired":
+                assert len(calls) == 2 and not kubectl_calls
+            if mode in ("between-reads", "retry-sleep", "subprocess-timeout"):
+                assert len(kubectl_calls) == 1
+            if mode in ("slow-success", "slow-check"):
+                assert status_reads == 2
+                assert len(checks) == (1 if mode == "slow-check" else 0)
+            assert sleeps == ([0.5] if mode == "retry-sleep" else []), (mode, sleeps)
+            assert all(later < earlier for (_, earlier), (_, later) in zip(calls, calls[1:])), (mode, calls)
+        pin_path.write_text(json.dumps({"chart": chart, "sha256": "wrong"}))
+        clock.now = 0
+        with patch.object(ingress["subprocess"], "check_output", side_effect=output), patch.dict(ingress["reviewed"].__globals__, {"time": timer}):
+            must_fail(ingress["reviewed"], root, lambda: 8 - clock.now)
+    print(f"cluster ingress deadlines: {len(modes)} fake-clock setup/read/success/retry cases and remaining subprocess budgets passed; pinned defaults and reviewed port override verified")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--schema", action="store_true", help="also verify the SOPS schema stream against downloaded Kubernetes schemas")
+    args = parser.parse_args()
+    with tempfile.TemporaryDirectory(prefix="cvp-cluster-guards-") as directory:
+        directory = Path(directory)
+        test_published(directory)
+        test_bootstrap_fail_closed(directory)
+        test_sops(directory, args.schema)
+        test_list_wrappers(directory)
+    test_ingress()
+    print("cluster guards: environment-isolated Git publication preflight, pre-mutation rejection and disposable SOPS round-trip passed")
+
+
+if __name__ == "__main__":
+    main()

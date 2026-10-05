@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import urllib.request
+
+
+def parse(text):
+    return json.loads(subprocess.check_output(
+        ["conftest", "parse", "-", "--parser", "yaml"], input=text, text=True,
+    ))
+
+
+def asset(name, url):
+    if directory := os.environ.get("CVP_CLUSTER_ASSET_DIR"):
+        return (Path(directory) / name).read_bytes()
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return response.read()
+
+
+def main():
+    pin = json.loads(Path("cluster/infrastructure/ingress/packaged-chart.json").read_text())
+    version = pin["k3sVersion"]
+    inventory = parse(Path("ansible/inventory/group_vars/all.yml").read_text())
+    assert inventory["k3s_version"] == version, "review packaged Traefik pin when upgrading K3s"
+    prefix = f"https://raw.githubusercontent.com/k3s-io/k3s/{version}"
+    manifest = parse(asset(f"k3s-{version}-traefik.yaml", f"{prefix}/manifests/traefik.yaml").decode())
+    chart = next(obj for obj in manifest if obj["metadata"]["name"] == "traefik")
+    assert chart["spec"]["chart"].rsplit("/", 1)[1] == pin["chart"], "packaged chart version changed"
+    archive = asset(pin["chart"], f"https://k3s-io.github.io/k3s-charts/assets/traefik/{pin['chart']}")
+    assert hashlib.sha256(archive).hexdigest() == pin["sha256"], "packaged chart checksum changed"
+    source = asset(f"k3s-{version}-servicelb.go", f"{prefix}/pkg/cloudprovider/servicelb.go").decode()
+    assert 'if localTraffic {' in source and 'strconv.Itoa(int(port.NodePort))' in source, "review K3s Local ServiceLB NodePort requirement"
+
+    config = parse(subprocess.check_output([
+        "kustomize", "build", "cluster/infrastructure/ingress/overlays/k3s",
+    ], text=True))
+    values = parse(config["spec"]["valuesContent"])
+    with tempfile.TemporaryDirectory(prefix="cvp-cluster-chart-") as directory:
+        directory = Path(directory)
+        chart_path = directory / pin["chart"]
+        chart_path.write_bytes(archive)
+        defaults = directory / "packaged-values.yaml"
+        defaults.write_text(chart["spec"]["valuesContent"])
+        overrides = directory / "config-values.json"
+        overrides.write_text(json.dumps(values))
+        command = [
+            "helm", "template", "traefik", str(chart_path), "--namespace", "kube-system",
+            "--kube-version", version.split("+", 1)[0].removeprefix("v"),
+            "--values", str(defaults), "--values", str(overrides),
+            "--set-string", "global.systemDefaultRegistry=",
+        ]
+        rendered = parse(subprocess.check_output(command, text=True))
+        service = next(obj for obj in rendered if obj["kind"] == "Service" and obj["metadata"]["name"] == "traefik")
+        deployment = next(obj for obj in rendered if obj["kind"] == "Deployment")
+        pod = deployment["spec"]["template"]["spec"]
+        args = [arg.lower() for arg in pod["containers"][0]["args"]]
+        assert "--entrypoints.web.http.redirections.entrypoint.to=:443" in args, args
+        assert "--entrypoints.web.http.redirections.entrypoint.scheme=https" in args
+        assert pod["nodeSelector"]["cvp.io/ingress"] == "true"
+        assert service["metadata"]["labels"]["svccontroller.k3s.cattle.io/lbpool"] == "public"
+        assert service["spec"]["externalTrafficPolicy"] == "Local"
+        assert service["spec"]["allocateLoadBalancerNodePorts"] is True
+        assert {port["port"] for port in service["spec"]["ports"]} == {80, 443}
+        assert "--providers.kubernetescrd" not in args
+
+        legacy = parse(config["spec"]["valuesContent"])
+        legacy["ports"]["web"]["redirectTo"] = legacy["ports"]["web"].pop("http")["redirections"]["entryPoint"]
+        overrides.write_text(json.dumps(legacy))
+        invalid = subprocess.run(command, text=True, capture_output=True)
+        if invalid.returncode == 0:
+            old = next(obj for obj in parse(invalid.stdout) if obj["kind"] == "Deployment")
+            old_args = [arg.lower() for arg in old["spec"]["template"]["spec"]["containers"][0]["args"]]
+            assert "--entrypoints.web.http.redirections.entrypoint.to=:443" not in old_args
+        else:
+            assert "redirectTo" in invalid.stderr, invalid.stderr
+    print(f"packaged Traefik {pin['chart']}: render, redirect, placement, ServiceLB and legacy regression passed")
+
+
+if __name__ == "__main__":
+    main()

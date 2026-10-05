@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+
+class Pending(Exception):
+    pass
+
+
+class DeadlineExpired(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Pending(message)
+
+
+def subset(expected, actual):
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(key in actual and subset(value, actual[key]) for key, value in expected.items())
+    return expected == actual
+
+
+def condition(obj, name):
+    return any(c["type"] == name and c["status"] == "True" for c in obj.get("status", {}).get("conditions", []))
+
+
+def rollout(obj, daemonset=False):
+    status = obj.get("status", {})
+    require(status.get("observedGeneration", -1) >= obj["metadata"]["generation"], "controller has not observed the latest workload generation")
+    if daemonset:
+        require(status.get("desiredNumberScheduled") == 1, "ServiceLB must target exactly the ingress node")
+        require(all(status.get(key) == 1 for key in ("currentNumberScheduled", "updatedNumberScheduled", "numberReady", "numberAvailable")), "ServiceLB rollout is not ready")
+        require(status.get("numberMisscheduled", 0) == 0, "ServiceLB has misplaced pods")
+    else:
+        count = obj["spec"].get("replicas", 1)
+        require(count > 0 and all(status.get(key) == count for key in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")), "Traefik rollout is not ready")
+
+
+def port_mapping(spec, service_ports, expected_ports):
+    containers = spec.get("containers", [])
+    traefik = [container for container in containers if container.get("name") == "traefik"]
+    require(len(traefik) == 1, "Traefik container is missing or ambiguous")
+    args = [arg.lower() for arg in traefik[0].get("args", [])]
+    mapping = {}
+    for port in service_ports:
+        name = port.get("name")
+        require(name in expected_ports, "Traefik Service has an unreviewed port name")
+        expected = expected_ports[name]
+        protocol = port.get("protocol", "TCP")
+        require(port["port"] == expected["exposedPort"] and protocol == expected["protocol"] == "TCP", f"Traefik {name} Service port/protocol differs from the reviewed values")
+        prefix = f"--entrypoints.{name}.address="
+        addresses = [arg.removeprefix(prefix) for arg in args if arg.startswith(prefix)]
+        require(len(addresses) == 1, f"Traefik {name} listener is missing or ambiguous")
+        listener = re.fullmatch(r":([0-9]+)(?:/(tcp|udp))?", addresses[0])
+        require(listener is not None and int(listener[1]) == expected["port"] and (listener[2] or "tcp").upper() == protocol, f"Traefik {name} listener differs from the reviewed values")
+        target = port.get("targetPort", port["port"])
+        if isinstance(target, str):
+            require(target == (expected.get("targetPort") or name), f"Traefik {name} named targetPort differs from the reviewed values")
+            matches = [(container, item) for container in containers for item in container.get("ports", []) if item.get("name") == target and item.get("protocol", "TCP") == protocol]
+            require(len(matches) == 1 and matches[0][0] is traefik[0], f"Traefik {name} named targetPort does not resolve to its container")
+            target = matches[0][1].get("containerPort")
+        require(type(target) is int and target == expected["port"], f"Traefik {name} targetPort does not reach the reviewed listener")
+        mapping[name] = (target, protocol)
+    require(len(service_ports) == len(mapping) == len(expected_ports), "Traefik Service lacks the reviewed public ports")
+    return mapping
+
+
+def check(snapshot, expected, chart_version):
+    config, chart, release = (snapshot[key] for key in ("config", "chart", "release"))
+    metadata = snapshot["release_metadata"]
+    require(config["spec"] == expected["spec"], "live HelmChartConfig differs from the reviewed configuration")
+    require(not condition(chart, "Failed"), "K3s HelmChart reports a failed operation")
+    require(release.get("info", {}).get("status") == "deployed", "latest Helm release is not deployed")
+    require(metadata.get("revision") == release.get("version") and metadata.get("status") == "deployed", "Helm metadata does not describe the deployed status revision")
+    require(metadata.get("name") == release.get("name") == "traefik" and metadata.get("namespace") == release.get("namespace") == "kube-system", "Helm release identity does not match Traefik")
+    require(metadata.get("chart") == "traefik" and metadata.get("version") == chart_version, "deployed Traefik chart is not the reviewed packaged version")
+    require(subset(snapshot["expected_values"], snapshot["release_values"]), "deployed release has not consumed the reviewed HelmChartConfig values")
+    job = snapshot["job"]
+    require(condition(job, "Complete") and not condition(job, "Failed") and not job["metadata"].get("deletionTimestamp"), "K3s chart operation has not completed")
+    require(any(ref.get("uid") == chart["metadata"]["uid"] for ref in job["metadata"].get("ownerReferences", [])), "chart Job is not owned by the current HelmChart")
+
+    ingress = [node for node in snapshot["nodes"]["items"] if node["metadata"].get("labels", {}).get("cvp.io/ingress") == "true"]
+    require(len(ingress) == 1, "exactly one node must have cvp.io/ingress=true")
+    node_name = ingress[0]["metadata"]["name"]
+    for node in snapshot["nodes"]["items"]:
+        labels = node["metadata"].get("labels", {})
+        if node["metadata"]["name"] == node_name:
+            require(labels.get("svccontroller.k3s.cattle.io/enablelb") == "true" and labels.get("svccontroller.k3s.cattle.io/lbpool") == "public", "ingress node lacks the ServiceLB pool labels")
+            require(condition(node, "Ready"), "ingress node is not Ready")
+        else:
+            require(not any(key.startswith("svccontroller.k3s.cattle.io/") and key.rsplit("/", 1)[1] in ("enablelb", "lbpool") for key in labels), "another node carries ServiceLB placement labels")
+
+    deployment, service = snapshot["deployment"], snapshot["service"]
+    rollout(deployment)
+    template = deployment["spec"]["template"]["spec"]
+    require(template.get("nodeSelector", {}).get("cvp.io/ingress") == "true", "Traefik has not adopted ingress placement")
+    args = [arg.lower() for container in template["containers"] for arg in container.get("args", [])]
+    require("--entrypoints.web.http.redirections.entrypoint.to=:443" in args, "Traefik has not adopted the public HTTPS redirect")
+    require(service["spec"].get("externalTrafficPolicy") == "Local" and service["spec"].get("allocateLoadBalancerNodePorts", True), "ServiceLB Local traffic requires allocated NodePorts")
+    require(service["spec"].get("type") == "LoadBalancer", "Traefik Service is not a LoadBalancer")
+    require(service["metadata"].get("labels", {}).get("svccontroller.k3s.cattle.io/lbpool") == "public", "Traefik Service is not in the public pool")
+    require({port["port"] for port in service["spec"]["ports"]} == {80, 443} and all(port.get("nodePort", 0) > 0 for port in service["spec"]["ports"]), "Traefik Service ports are not allocated")
+    expected_ports = snapshot["expected_ports"]
+    port_mapping(template, service["spec"]["ports"], expected_ports)
+    daemonsets = snapshot["daemonsets"]["items"]
+    require(len(daemonsets) == 1, "expected exactly one ServiceLB DaemonSet for traefik")
+    daemonset = daemonsets[0]
+    require(any(ref.get("uid") == service["metadata"]["uid"] for ref in daemonset["metadata"].get("ownerReferences", [])), "ServiceLB DaemonSet belongs to an obsolete Service")
+    require(subset({"svccontroller.k3s.cattle.io/enablelb": "true", "svccontroller.k3s.cattle.io/lbpool": "public"}, daemonset.get("spec", {}).get("template", {}).get("spec", {}).get("nodeSelector", {})), "ServiceLB DaemonSet has not adopted the public node pool")
+    rollout(daemonset, daemonset=True)
+    lb_pods = [pod for pod in snapshot["lb_pods"]["items"] if not pod["metadata"].get("deletionTimestamp") and any(ref.get("uid") == daemonset["metadata"]["uid"] for ref in pod["metadata"].get("ownerReferences", []))]
+    require(len(lb_pods) == 1 and condition(lb_pods[0], "Ready") and lb_pods[0]["spec"].get("nodeName") == node_name, "ServiceLB pod is not Ready on the ingress node")
+    pods = {pod["metadata"]["uid"]: pod for pod in snapshot["traefik_pods"]["items"] if condition(pod, "Ready") and not pod["metadata"].get("deletionTimestamp") and pod["spec"].get("nodeName") == node_name}
+    require(bool(pods), "no Ready Traefik pod on the ingress node")
+    mappings = {uid: port_mapping(pod["spec"], service["spec"]["ports"], expected_ports) for uid, pod in pods.items()}
+    endpoints = []
+    for item in snapshot["endpoints"]["items"]:
+        ready = [endpoint for endpoint in item.get("endpoints", []) if endpoint.get("conditions", {}).get("ready") is True]
+        for endpoint in ready:
+            uid = endpoint.get("targetRef", {}).get("uid")
+            require(uid in mappings, "Traefik EndpointSlice targets a pod that is not Ready locally")
+            ports = item.get("ports", [])
+            actual = {port.get("name"): (port.get("port"), port.get("protocol", "TCP")) for port in ports}
+            require(len(ports) == len(actual) and actual == mappings[uid], "Traefik EndpointSlice ports/protocol do not match the Ready pod listeners")
+        endpoints.extend(ready)
+    require(bool(endpoints) and all(endpoint.get("nodeName") == node_name and endpoint.get("targetRef", {}).get("uid") in pods for endpoint in endpoints), "Traefik Service lacks Ready local pod endpoints")
+
+
+def parse(text, budget):
+    return json.loads(subprocess.check_output(["conftest", "parse", "-", "--parser", "yaml"], input=text, text=True, timeout=budget()))
+
+
+def snapshot(context, budget):
+    def helm(*args):
+        return json.loads(subprocess.check_output([
+            "helm", "--kube-context", context, "-n", "kube-system", *args, "-o", "json",
+        ], text=True, stderr=subprocess.PIPE, timeout=budget()))
+
+    def get(kind, name=None, selector=None, cluster=False):
+        command = ["kubectl", f"--context={context}", "--request-timeout=15s"]
+        if not cluster:
+            command += ["-n", "kube-system"]
+        command += ["get", kind]
+        if name:
+            command.append(name)
+        if selector:
+            command += ["-l", selector]
+        return json.loads(subprocess.check_output(command + ["-o", "json"], text=True, stderr=subprocess.PIPE, timeout=budget()))
+
+    lb_selector = "svccontroller.k3s.cattle.io/svcname=traefik,svccontroller.k3s.cattle.io/svcnamespace=kube-system"
+    chart = get("helmchart", "traefik")
+    require(bool(chart.get("status", {}).get("jobName")), "HelmChart has no operation Job yet")
+    service = get("service", "traefik")
+    selector = ",".join(f"{key}={value}" for key, value in service["spec"]["selector"].items())
+    release = helm("status", "traefik")
+    revision = release.get("version")
+    require(type(revision) is int and revision > 0, "Helm status lacks a valid release revision")
+    require(release.get("info", {}).get("status") == "deployed", "latest Helm release is not deployed")
+    metadata = helm("get", "metadata", "traefik", "--revision", str(revision))
+    require(metadata.get("revision") == revision, "Helm metadata revision changed during collection")
+    values = helm("get", "values", "traefik", "--revision", str(revision))
+    state = {
+        "config": get("helmchartconfig", "traefik"), "chart": chart,
+        "release": release, "release_metadata": metadata, "release_values": values,
+        "job": get("job", chart["status"]["jobName"]), "nodes": get("nodes", cluster=True),
+        "service": service, "deployment": get("deployment", "traefik"),
+        "daemonsets": get("daemonsets", selector=lb_selector), "lb_pods": get("pods", selector=lb_selector),
+        "traefik_pods": get("pods", selector=selector),
+        "endpoints": get("endpointslices", selector="kubernetes.io/service-name=traefik"),
+    }
+    latest = helm("status", "traefik")
+    require(latest.get("version") == revision and latest.get("info", {}).get("status") == "deployed", "Helm release changed during ingress collection; retrying")
+    return state
+
+
+def reviewed(root, budget):
+    expected = parse(subprocess.check_output(["kustomize", "build", str(root / "cluster/infrastructure/ingress/overlays/k3s")], text=True, timeout=budget()), budget)
+    values = parse(expected["spec"]["valuesContent"], budget)
+    budget()
+    pin = json.loads((root / "cluster/infrastructure/ingress/packaged-chart.json").read_text())
+    with tempfile.TemporaryDirectory(prefix="cvp-ingress-chart-") as directory:
+        url = f"https://k3s-io.github.io/k3s-charts/assets/traefik/{pin['chart']}"
+        subprocess.check_output(["helm", "pull", url, "--destination", directory], text=True, stderr=subprocess.PIPE, timeout=budget())
+        budget()
+        archive = Path(directory) / pin["chart"]
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != pin["sha256"]:
+            raise ValueError("packaged Traefik chart checksum differs from the reviewed pin")
+        defaults = parse(subprocess.check_output(["helm", "show", "values", str(archive)], text=True, stderr=subprocess.PIPE, timeout=budget()), budget)
+    ports = {name: {**defaults["ports"][name], **values["ports"][name]} for name in ("web", "websecure")}
+    budget()
+    return expected, values, ports, pin["chart"].removeprefix("traefik-").removesuffix(".tgz")
+
+
+def wait(context, root, timeout):
+    deadline = time.monotonic() + timeout
+    pending = "no ready snapshot collected"
+
+    def budget():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeadlineExpired
+        return min(20, remaining)
+
+    try:
+        expected, values, ports, version = reviewed(root, budget)
+        while True:
+            try:
+                budget()
+                state = snapshot(context, budget)
+                state["expected_values"] = values
+                state["expected_ports"] = ports
+                budget()
+                check(state, expected, version)
+                budget()
+                print("Traefik chart operation, rollout and local ServiceLB endpoints are ready; verify the external HTTP/TLS path separately.")
+                return
+            except (Pending, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                pending = str(error)
+                budget()
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
+    except (DeadlineExpired, subprocess.TimeoutExpired) as error:
+        raise ValueError(f"ingress readiness timed out: {pending}; {error}") from error
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--context", required=True)
+    parser.add_argument("--timeout", default="5m")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    args = parser.parse_args()
+    match = re.fullmatch(r"([1-9][0-9]*)(s|m)", args.timeout)
+    if not match:
+        parser.error("timeout must be a positive integer followed by s or m")
+    wait(args.context, args.root, int(match[1]) * (60 if match[2] == "m" else 1))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))

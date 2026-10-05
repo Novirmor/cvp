@@ -5,6 +5,7 @@ metadata:
   name: flux-system
   namespace: flux-system
 spec:
+  suspend: false
   interval: 1m
   ref:
     branch: main

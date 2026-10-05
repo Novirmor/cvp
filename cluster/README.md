@@ -46,8 +46,15 @@ context only after reviewing the rendered output.
    `flux-system/source.yaml` with the reviewed repository URL and review the
    branch. Set `FLUX_GITHUB_OWNER` and `FLUX_GITHUB_REPOSITORY` explicitly to
    match that URL (`ssh://git@github.com/<owner>/<repository>.git`). Replace
-   the example owner and repository below before running the helper against an explicit context with
-   the temporary deploy key and recovered age identity:
+   the example owner and repository below. Commit and push all `cluster/`
+   changes to the configured branch before running the helper. Its SSH preflight
+    fetches that branch with the reviewed deploy key and known_hosts file, compares
+    actual cluster file bytes with the fetched commit (including files hidden by
+    Git index flags), and validates a private, commit-addressed snapshot before
+    contacting Kubernetes. All bootstrap applies and the ingress check use that
+    snapshot. The fetched source URL and branch must match the reviewed inputs.
+    Then use an explicit context with the temporary
+   deploy key and recovered age identity:
 
      ```sh
      FLUX_GITHUB_OWNER=example-owner \
@@ -60,19 +67,33 @@ context only after reviewing the rendered output.
      ```
 
 5. Verify the ordered Flux Kustomizations. The root `flux-system`
-   Kustomization owns the source and the `policy` Kustomization. `policy`
+   Kustomization owns the source and every child Kustomization. `policy`
    gates `infrastructure` and the reserved, suspended `data` layer;
    `infrastructure` gates the suspended `apps` smoke layer and `operations`.
    The root itself runs with `wait: false` and health checks on the six Flux
    controller Deployments, so suspended children that never reconcile cannot
-   block root readiness on a fresh bootstrap; every child gates its own
-   rollout with its own wait:
+   block root readiness on a fresh bootstrap. Infrastructure also uses
+   `wait: false`, so its explicit Traefik Deployment health check is honored.
+   Other active children use their own wait. The bootstrap helper additionally
+    requires the source artifact and every active child to be Ready at the verified
+    commit and current generation, with reconciliation enabled. It also checks the
+    deployed packaged chart version and values, completed K3s chart
+   Job, Traefik rollout, and Ready ServiceLB/local pod endpoints on the selected
+   ingress node. Repeat this read-only gate after any ingress change:
 
    ```sh
    flux get sources git -n flux-system
    flux get kustomizations -n flux-system
    kubectl -n flux-system get events --sort-by=.lastTimestamp
-   ```
+    python3 scripts/cluster-ingress-ready --context reviewed-cluster-context --timeout 5m
+    ```
+
+    Keep the published branch unchanged during bootstrap. Branch changes are
+    checked before applies and around readiness collection, including after the
+    ingress check; a race fails bootstrap without undoing completed applies.
+    Bootstrap rejects source filters/includes, `.sourceignore`, cluster symlinks,
+    and transformations of the four directly applied bootstrap manifests. Move
+    such changes into the direct manifests and keep Flux paths inside `cluster/`.
 
 6. Keep `data`, `apps`, and both operations CronJobs suspended until the
    corresponding service, image, secret, egress, and recovery review is
@@ -123,10 +144,19 @@ kubectl kustomize cluster/operations/overlays/cluster
    Verify that the Traefik pod actually rescheduled to the new node and that
    the svclb-traefik DaemonSet has a ready pod with a local endpoint there;
    `externalTrafficPolicy: Local` requires the ingress node to run Traefik
-   itself. Only then cut over the external DNS target and verify the public
+   itself. The pinned K3s ServiceLB forwards local traffic through the allocated
+   Service NodePorts, so `allocateLoadBalancerNodePorts` must remain true.
+   Only then cut over the external DNS target and verify the public
    route before declaring recovery. The smoke workload's
    `cvp.io/compute=true` affinity follows the surviving labeled nodes
    when recovering from node loss.
+
+ServiceLB DaemonSets have a Service-UID suffix; discover them with both
+`svccontroller.k3s.cattle.io/svcname=traefik` and
+`svccontroller.k3s.cattle.io/svcnamespace=kube-system`, not an exact
+`svclb-traefik` name. Flux readiness alone cannot prove the asynchronous K3s
+chart operation or external connectivity; complete the gate in
+`docs/runbooks/cluster.md`.
 
 The K3s datastore/token backup and application data backup are separate recovery
 units. A backup is not accepted until a disposable restore drill succeeds.

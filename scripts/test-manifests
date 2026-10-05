@@ -27,26 +27,14 @@ expected_violations=(
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-for overlay in \
-  cluster \
-  cluster/infrastructure/policy/overlays/cluster \
-  cluster/infrastructure/ingress/overlays/k3s \
-  cluster/apps/overlays/smoke \
-  cluster/operations/overlays/cluster \
-  cluster/data/overlays/cluster; do
-  printf 'rendering %s\n' "$overlay"
-  render="$tmp_dir/$(printf '%s' "$overlay" | tr '/' '_').render.yaml"
-  kustomize build "$overlay" > "$render"
-  kubeconform \
-    -ignore-missing-schemas \
-    -schema-location 'default' \
-    -schema-location 'https://schemas.fluxoperator.dev/catalog/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-    -kubernetes-version 1.35.0 \
-    -strict \
-    -summary \
-    < "$render"
-  conftest test "$render" --policy "$policy_dir"
-done
+python3 scripts/cluster-manifest-inputs sources
+python3 scripts/test-cluster-policy --schema
+python3 scripts/test-cluster-guards --schema
+python3 scripts/test-cluster-traefik
+
+python3 scripts/test-cluster-manifests
+python3 scripts/test-cluster-bootstrap
+python3 scripts/cluster-manifest-inputs validate
 
 printf 'checking policy fixtures\n'
 conftest test "$policy_dir/fixtures/compliant-workload.yaml" --policy "$policy_dir"

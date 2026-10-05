@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import sys
+import time
+
+
+BUILD_OVERRIDES = runpy.run_path(str(Path(__file__).resolve().parent / "cluster-manifest-inputs"))["BUILD_OVERRIDES"]
+
+
+class Pending(Exception):
+    pass
+
+
+class DeadlineExpired(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Pending(message)
+
+
+def subset(expected, actual):
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(key in actual and subset(value, actual[key]) for key, value in expected.items())
+    return expected == actual
+
+
+def check_identity(obj, expected):
+    metadata = obj.get("metadata", {})
+    name = expected["metadata"]["name"]
+    require(all(obj.get(field) == expected[field] for field in ("apiVersion", "kind")) and all(metadata.get(field) == expected["metadata"][field] for field in ("name", "namespace")), f"{name} identity differs from the verified resource")
+    require(not metadata.get("deletionTimestamp"), f"{name} is deleting")
+
+
+def ready(obj, expected):
+    check_identity(obj, expected)
+    metadata, spec, status = obj["metadata"], obj["spec"], obj.get("status", {})
+    name = metadata["name"]
+    require(spec.get("suspend", False) is False, f"{name} is suspended")
+    require(subset(expected["spec"], spec), f"{name} has not adopted the verified spec")
+    generation = metadata["generation"]
+    require(status.get("observedGeneration", -1) >= generation, f"{name} has stale observedGeneration")
+    conditions = status.get("conditions", [])
+    require(any(c.get("type") == "Ready" and c.get("status") == "True" and c.get("observedGeneration", -1) >= generation for c in conditions), f"{name} is not Ready at its current generation")
+    require(not any(c.get("type") in {"Stalled", "Reconciling"} and c.get("status") == "True" for c in conditions), f"{name} is still reconciling or stalled")
+
+
+def check(source, children, verified):
+    revision = f"{verified['branch']}@sha1:{verified['revision']}"
+    ready(source, verified["source"])
+    require(source["spec"].get("ref") == verified["source"]["spec"]["ref"], "source ref differs from the verified branch")
+    require(not any(source["spec"].get(key) for key in ("ignore", "include", "recurseSubmodules", "sparseCheckout")), "source has unverified artifact overrides")
+    require(source.get("status", {}).get("artifact", {}).get("revision") == revision, "source artifact is not the verified commit")
+    for expected in verified["reconciliations"]:
+        key = (expected["metadata"]["namespace"], expected["metadata"]["name"])
+        require(key in children, f"{key[1]} is missing")
+        obj = children[key]
+        if expected["spec"].get("suspend", False):
+            check_identity(obj, expected)
+            require(obj.get("spec", {}).get("suspend") is True, f"{key[1]} must remain suspended")
+            require(subset(expected["spec"], obj["spec"]), f"{key[1]} has not adopted the verified spec")
+        else:
+            ready(obj, expected)
+            require(obj.get("status", {}).get("lastAppliedRevision") == revision, f"{key[1]} has not applied the verified commit")
+        require(not any(obj["spec"].get(field) for field in BUILD_OVERRIDES), f"{key[1]} has unverified build overrides")
+        require(obj["spec"]["sourceRef"].get("namespace", key[0]) == "flux-system", f"{key[1]} uses an unverified source namespace")
+
+
+def wait(context, snapshot, timeout):
+    verified = json.loads((snapshot / "verified.json").read_text())
+    preflight = runpy.run_path(str(Path(__file__).resolve().parent / "cluster-bootstrap-preflight"))
+    deadline = time.monotonic() + timeout
+    pending = "no ready snapshot collected"
+    last_check = None
+
+    def budget():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeadlineExpired
+        return min(20, remaining)
+
+    def timed_out():
+        detail = f"; last check: {last_check}" if last_check is not None and str(last_check) != pending else ""
+        return ValueError(f"Flux revision readiness timed out: {pending}{detail}")
+
+    def get(kind, namespace, name):
+        try:
+            return json.loads(subprocess.check_output([
+                "kubectl", f"--context={context}", "--request-timeout=15s", "-n", namespace,
+                "get", kind, name, "-o", "json",
+            ], text=True, stderr=subprocess.PIPE, timeout=budget()))
+        except subprocess.CalledProcessError as error:
+            raise Pending(f"cannot read {kind} {namespace}/{name}: {error}") from error
+
+    while True:
+        try:
+            preflight["assert_branch"](snapshot, verified, timeout=budget())
+            source = get("gitrepository", "flux-system", "flux-system")
+            children = {(obj["metadata"]["namespace"], obj["metadata"]["name"]): get("kustomization", obj["metadata"]["namespace"], obj["metadata"]["name"]) for obj in verified["reconciliations"]}
+            check(source, children, verified)
+            check(get("gitrepository", "flux-system", "flux-system"), children, verified)
+            preflight["assert_branch"](snapshot, verified, timeout=budget())
+            budget()
+            print(f"Flux source and active reconcilers are Ready at {verified['revision']}; reviewed suspended reconcilers match their declared state")
+            return
+        except DeadlineExpired as error:
+            raise timed_out() from error
+        except (Pending, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            last_check = error
+            if isinstance(error, Pending):
+                pending = str(error)
+            if time.monotonic() >= deadline:
+                raise timed_out() from error
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--context", required=True)
+    parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument("--timeout", default="5m")
+    args = parser.parse_args()
+    match = re.fullmatch(r"([1-9][0-9]*)(s|m)", args.timeout)
+    if not match:
+        parser.error("timeout must be a positive integer followed by s or m")
+    wait(args.context, args.snapshot, int(match[1]) * (60 if match[2] == "m" else 1))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))

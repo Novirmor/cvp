@@ -13,6 +13,14 @@ cd "$root_dir"
 : "${FLUX_BOOTSTRAP_TIMEOUT:=5m}"
 
 command -v kubectl >/dev/null || { printf '%s\n' 'kubectl is required' >&2; exit 1; }
+for tool in python3 conftest git ssh helm kustomize kubeconform; do
+  command -v "$tool" >/dev/null || { printf '%s is required\n' "$tool" >&2; exit 1; }
+done
+
+[[ "$FLUX_BOOTSTRAP_TIMEOUT" =~ ^[1-9][0-9]*[sm]$ ]] || {
+  printf '%s\n' 'FLUX_BOOTSTRAP_TIMEOUT must be a positive integer followed by s or m' >&2
+  exit 1
+}
 
 [[ "$FLUX_KUBE_CONTEXT" != -* ]] || {
   printf '%s\n' 'FLUX_KUBE_CONTEXT must name a Kubernetes context' >&2
@@ -26,11 +34,10 @@ for required_file in "$FLUX_GIT_SSH_KEY_FILE" "$FLUX_GIT_KNOWN_HOSTS_FILE" "$SOP
   }
 done
 
-expected_url="ssh://git@github.com/${FLUX_GITHUB_OWNER}/${FLUX_GITHUB_REPOSITORY}.git"
-grep -Fq "url: ${expected_url}" cluster/flux-system/source.yaml || {
-  printf 'cluster/flux-system/source.yaml must declare %s\n' "$expected_url" >&2
-  exit 1
-}
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+snapshot="$tmp_dir/snapshot"
+python3 scripts/cluster-bootstrap-preflight prepare --snapshot "$snapshot"
 
 kubectl config get-contexts -o name | grep -Fqx "$FLUX_KUBE_CONTEXT" || {
   printf 'Kubernetes context does not exist: %s\n' "$FLUX_KUBE_CONTEXT" >&2
@@ -39,8 +46,9 @@ kubectl config get-contexts -o name | grep -Fqx "$FLUX_KUBE_CONTEXT" || {
 
 kubectl --context="$FLUX_KUBE_CONTEXT" cluster-info >/dev/null
 
-kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/namespace.yaml
-kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/gotk-components.yaml
+python3 scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/namespace.yaml"
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/gotk-components.yaml"
 kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
   --for=condition=Available deployment --all --timeout="$FLUX_BOOTSTRAP_TIMEOUT"
 
@@ -53,14 +61,11 @@ kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system create secret generic sops
   --from-file=age.agekey="$SOPS_AGE_KEY_FILE" --dry-run=client -o yaml | \
   kubectl --context="$FLUX_KUBE_CONTEXT" apply -f -
 
-kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/source.yaml
-kubectl --context="$FLUX_KUBE_CONTEXT" apply -f cluster/flux-system/sync.yaml
-kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
-  --for=condition=Ready gitrepository/flux-system --timeout="$FLUX_BOOTSTRAP_TIMEOUT"
-
-for reconciliation in flux-system policy infrastructure operations; do
-  kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
-    --for=condition=Ready "kustomization/${reconciliation}" --timeout="$FLUX_BOOTSTRAP_TIMEOUT"
-done
+python3 scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/source.yaml"
+kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/sync.yaml"
+python3 scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
+python3 scripts/cluster-ingress-ready --context "$FLUX_KUBE_CONTEXT" --root "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
+python3 scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
 
 printf 'Flux bootstrap complete for context %s.\n' "$FLUX_KUBE_CONTEXT"

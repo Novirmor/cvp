@@ -5,6 +5,7 @@ metadata:
   name: flux-system
   namespace: flux-system
 spec:
+  suspend: false
   healthChecks:
     - apiVersion: apps/v1
       kind: Deployment

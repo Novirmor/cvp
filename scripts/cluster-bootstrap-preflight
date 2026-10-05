@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+def git_environment(env=None):
+    clean = {key: value for key, value in (os.environ if env is None else env).items() if not key.startswith("GIT_")}
+    clean.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"})
+    return clean
+
+
+def git(directory, *args, env=None, ssh_command=None, timeout=60):
+    clean = git_environment(env)
+    if ssh_command is not None:
+        clean["GIT_SSH_COMMAND"] = ssh_command
+    return subprocess.check_output(
+        ["git", "-C", str(directory), *args], text=True, env=clean,
+        stderr=subprocess.PIPE, timeout=timeout,
+    ).strip()
+
+
+def source_branch(source, expected_url):
+    if not isinstance(source, dict) or not isinstance(source.get("metadata"), dict) or not isinstance(source.get("spec"), dict):
+        raise ValueError("bootstrap source must have metadata and spec maps")
+    if (source.get("apiVersion"), source.get("kind"), source["metadata"].get("namespace"), source["metadata"].get("name")) != ("source.toolkit.fluxcd.io/v1", "GitRepository", "flux-system", "flux-system"):
+        raise ValueError("expected the flux-system GitRepository")
+    spec = source["spec"]
+    if spec.get("url") != expected_url:
+        raise ValueError(f"source URL must equal {expected_url}")
+    if spec.get("suspend") is not False or spec.get("secretRef") != {"name": "flux-system"}:
+        raise ValueError("bootstrap source must explicitly set suspend: false and use the flux-system deploy key")
+    if any(spec.get(key) for key in ("ignore", "include", "recurseSubmodules", "sparseCheckout")):
+        raise ValueError("bootstrap source filtering, includes and submodules are unsupported")
+    ref = spec.get("ref", {})
+    if not isinstance(ref, dict) or set(ref) != {"branch"} or not isinstance(ref["branch"], str):
+        raise ValueError("bootstrap requires exactly one reviewed source ref.branch")
+    git(Path.cwd(), "check-ref-format", "refs/heads/" + ref["branch"])
+    return ref["branch"]
+
+
+def verify_published(root, url, branch, env, ssh_command=None, snapshot=None):
+    root = Path(root).resolve()
+    actual_root = Path(git(root, "rev-parse", "--show-toplevel", env=env)).resolve()
+    if actual_root != root:
+        raise ValueError("Git worktree root does not match the expected bootstrap checkout")
+    local_tree = git(root, "rev-parse", "HEAD:cluster", env=env)
+    with tempfile.TemporaryDirectory(prefix="cvp-flux-preflight-") as temporary:
+        destination = Path(snapshot) if snapshot is not None else Path(temporary) / "snapshot"
+        destination.mkdir(mode=0o700)
+        repository = destination / ".git"
+        repository.mkdir()
+        git(repository, "init", "--bare", env=env)
+        git(repository, "-c", "core.hooksPath=/dev/null", "fetch", "--no-tags", "--depth=1", url,
+            "refs/heads/" + branch, env=env, ssh_command=ssh_command)
+        remote_tree = git(repository, "rev-parse", "FETCH_HEAD:cluster", env=env)
+        revision = git(repository, "rev-parse", "FETCH_HEAD", env=env)
+        if local_tree != remote_tree:
+            raise ValueError("published branch cluster/ differs from the reviewed local tree; push it before bootstrap")
+        names = git(repository, "ls-tree", "-rz", "--name-only", revision, env=env).split("\0")
+        if any(Path(name).name == ".sourceignore" for name in names) or (root / ".sourceignore").exists():
+            raise ValueError("bootstrap does not support .sourceignore filtering")
+        exported = set()
+        for entry in git(repository, "ls-tree", "-rz", revision, "--", "cluster", env=env).split("\0"):
+            if not entry:
+                continue
+            header, name = entry.split("\t", 1)
+            mode, kind, oid = header.split()
+            if not (destination / name).resolve().is_relative_to(destination / "cluster") or any(character in name for character in ("\n", "\r", "\t")):
+                raise ValueError(f"unsupported cluster pathname: {name!r}")
+            if kind != "blob" or mode not in ("100644", "100755"):
+                raise ValueError(f"bootstrap requires regular cluster files: {name}")
+            content = subprocess.check_output(["git", "-C", str(repository), "cat-file", "blob", oid], env=git_environment(env))
+            local = root / name
+            if local.is_symlink() or not local.is_file() or local.read_bytes() != content:
+                raise ValueError(f"commit and publish all cluster changes: working-tree bytes differ for {name}")
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(0o444)
+            exported.add(name)
+        local_files = set()
+        for path in (root / "cluster").rglob("*"):
+            if path.is_symlink():
+                raise ValueError(f"bootstrap requires regular cluster files: {path}")
+            if path.is_file():
+                local_files.add(path.relative_to(root).as_posix())
+        if local_files != exported:
+            raise ValueError("commit and publish all cluster changes: unpublished or missing cluster files")
+    return revision
+
+
+def ssh_command():
+    key = str(Path(os.environ["FLUX_GIT_SSH_KEY_FILE"]).resolve())
+    hosts = str(Path(os.environ["FLUX_GIT_KNOWN_HOSTS_FILE"]).resolve())
+    if any(character in hosts for character in ('"', "\n", "\r")):
+        raise ValueError("unsupported known_hosts pathname")
+    return shlex.join([
+        "ssh", "-F", "/dev/null", "-i", key, "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "-o", f'UserKnownHostsFile="{hosts}"', "-o", "GlobalKnownHostsFile=/dev/null",
+    ])
+
+
+def assert_branch(snapshot, verified, command=None, timeout=60):
+    current = git(Path(snapshot) / ".git", "ls-remote", "--exit-code", verified["url"], "refs/heads/" + verified["branch"], ssh_command=command or ssh_command(), timeout=timeout)
+    if current.split() != [verified["revision"], "refs/heads/" + verified["branch"]]:
+        raise ValueError("published branch changed during bootstrap; review and retry")
+
+
+def prepare(root, snapshot, url, command):
+    inputs = runpy.run_path(str(Path(__file__).resolve().parent / "cluster-manifest-inputs"))
+    source = inputs["documents"]((root / "cluster/flux-system/source.yaml").read_text())[0]
+    branch = source_branch(source, url)
+    revision = verify_published(root, url, branch, os.environ, ssh_command=command, snapshot=snapshot)
+    fetched = inputs["documents"]((snapshot / "cluster/flux-system/source.yaml").read_text())[0]
+    if source_branch(fetched, url) != branch:
+        raise ValueError("fetched source branch differs from the reviewed branch")
+    objects = inputs["validate"](snapshot / "cluster")
+    for name in ("namespace.yaml", "gotk-components.yaml", "source.yaml", "sync.yaml"):
+        for obj in inputs["documents"]((snapshot / "cluster/flux-system" / name).read_text()):
+            if obj not in objects:
+                raise ValueError(f"bootstrap input {name} differs from its validated render; update the direct manifest")
+    rendered_source = [obj for obj in objects if obj.get("kind") == "GitRepository" and obj["metadata"].get("namespace") == "flux-system" and obj["metadata"]["name"] == "flux-system"]
+    if rendered_source != [fetched]:
+        raise ValueError("rendered source differs from the verified bootstrap source")
+    reconciliations = [obj for obj in objects if obj.get("apiVersion") == inputs["FLUX_API"] and obj.get("kind") == "Kustomization"]
+    if any(type(obj["spec"].get("suspend")) is not bool for obj in reconciliations):
+        raise ValueError("bootstrap reconcilers must explicitly declare suspend: true or false")
+    active = {(obj["metadata"]["namespace"], obj["metadata"]["name"]) for obj in reconciliations if not obj["spec"]["suspend"]}
+    if not {("flux-system", name) for name in ("flux-system", "policy", "infrastructure", "operations")} <= active:
+        raise ValueError("required bootstrap reconcilers must be present and active")
+    verified = {"url": url, "branch": branch, "revision": revision, "source": fetched, "reconciliations": reconciliations}
+    assert_branch(snapshot, verified, command)
+    (snapshot / "verified.json").write_text(json.dumps(verified))
+    print(f"Verified published cluster tree at {branch}@{revision}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("prepare", "check-branch"))
+    parser.add_argument("--snapshot", required=True, type=Path)
+    args = parser.parse_args()
+    if args.mode == "check-branch":
+        assert_branch(args.snapshot, json.loads((args.snapshot / "verified.json").read_text()))
+        return
+    owner = os.environ["FLUX_GITHUB_OWNER"]
+    repository = os.environ["FLUX_GITHUB_REPOSITORY"]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repository):
+        raise ValueError("invalid GitHub owner or repository")
+    prepare(Path(__file__).resolve().parent.parent, args.snapshot.resolve(), f"ssh://git@github.com/{owner}/{repository}.git", ssh_command())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, KeyError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        sys.exit(f"Flux bootstrap preflight failed: {error}")

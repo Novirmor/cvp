@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parent.parent
+preflight = runpy.run_path(str(ROOT / "scripts/cluster-bootstrap-preflight"))
+readiness = runpy.run_path(str(ROOT / "scripts/cluster-bootstrap-ready"))
+
+
+class FixtureClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def expire(self, seconds):
+        self.now += 3600
+
+
+def run_ready_fixture():
+    module = runpy.run_path(str(ROOT / "scripts/cluster-bootstrap-ready"))
+    clock = FixtureClock()
+    timer = SimpleNamespace(monotonic=clock.monotonic, sleep=clock.expire)
+    with patch.dict(module["wait"].__globals__, {"time": timer}):
+        try:
+            module["main"]()
+        except (ValueError, OSError, subprocess.CalledProcessError) as error:
+            sys.exit(str(error))
+
+
+def stub(tool):
+    state_path = Path(os.environ["CVP_BOOTSTRAP_TEST_STATE"])
+    state = json.loads(state_path.read_text())
+    args = sys.argv[1:]
+    with Path(state["log"]).open("a") as log:
+        log.write(json.dumps([tool, *args]) + "\n")
+    if tool == "ssh":
+        assert "git@github.com" in args and any("git-upload-pack" in arg for arg in args), args
+        if state["mode"] == "early-branch-race" and sum(json.loads(line)[0] == "ssh" for line in Path(state["log"]).read_text().splitlines()) == 2:
+            preflight["git"](state["remote"], "update-ref", "refs/heads/main", state["race"])
+        os.execvp("git-upload-pack", ["git-upload-pack", state["remote"]])
+    if tool == "ingress":
+        snapshot = Path(args[args.index("--root") + 1])
+        assert snapshot == Path(state["snapshot"])
+        assert (snapshot / "cluster/infrastructure/ingress/packaged-chart.json").is_file()
+        if state["mode"] == "branch-race":
+            preflight["git"](state["remote"], "update-ref", "refs/heads/main", state["race"])
+        if state["mode"] == "late-resumed-apps":
+            state["live"]["Kustomization/apps"]["spec"]["suspend"] = False
+            state_path.write_text(json.dumps(state))
+        return
+    assert tool == "kubectl"
+    if args == ["config", "get-contexts", "-o", "name"]:
+        print("reviewed-context")
+        if state["mode"] == "local-mutation":
+            (Path(state["root"]) / "cluster/flux-system/source.yaml").write_text("changed after verification\n")
+            (Path(state["root"]) / "cluster/flux-system/gotk-components.yaml").write_text("changed after verification\n")
+        return
+    assert "--context=reviewed-context" in args, args
+    if "apply" in args:
+        value = args[args.index("-f") + 1]
+        if value == "-":
+            secret = json.load(sys.stdin)
+            assert secret["kind"] == "Secret" and secret["metadata"]["name"] in {"flux-system", "sops-age"}
+            state.setdefault("secrets", []).append(secret["metadata"]["name"])
+            state_path.write_text(json.dumps(state))
+            return
+        path = Path(value)
+        assert not path.is_relative_to(Path(state["root"])), "applied mutable local checkout"
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == state["files"][path.name], path
+        snapshot = path.parents[2]
+        assert (snapshot / "verified.json").is_file()
+        state["snapshot"] = str(snapshot)
+        state["verified"] = json.loads((snapshot / "verified.json").read_text())
+        assert state["verified"]["revision"] == state["revision"]
+        if "live" not in state:
+            state["live"] = {}
+            if state["mode"] == "recover-suspended":
+                for obj in [state["verified"]["source"], *state["verified"]["reconciliations"]]:
+                    obj = copy.deepcopy(obj)
+                    obj["spec"]["suspend"] = True
+                    state["live"][obj["kind"] + "/" + obj["metadata"]["name"]] = obj
+        if path.name == "source.yaml":
+            assert set(state["secrets"]) == {"flux-system", "sops-age"}
+            desired = state["verified"]["source"]
+            assert desired["spec"]["suspend"] is False and desired["spec"]["ref"] == {"branch": "main"}
+            state["live"]["GitRepository/flux-system"] = desired
+        if path.name == "sync.yaml":
+            desired = next(obj for obj in state["verified"]["reconciliations"] if obj["metadata"]["name"] == "flux-system")
+            assert desired["spec"]["suspend"] is False and desired["spec"]["wait"] is False
+            assert all(obj["kind"] == "Deployment" for obj in desired["spec"]["healthChecks"])
+            state["live"]["Kustomization/flux-system"] = desired
+            if not state["live"]["GitRepository/flux-system"]["spec"]["suspend"]:
+                for obj in state["verified"]["reconciliations"]:
+                    state["live"]["Kustomization/" + obj["metadata"]["name"]] = obj
+        state_path.write_text(json.dumps(state))
+        return
+    if "create" in args:
+        assert "--dry-run=client" in args
+        for argument in args:
+            if argument.startswith("--from-file="):
+                assert Path(argument.split("=", 2)[2]).resolve() == Path(state["key"])
+        print(json.dumps({"apiVersion": "v1", "kind": "Secret", "metadata": {"namespace": "flux-system", "name": args[args.index("generic") + 1]}}))
+        return
+    if "get" in args:
+        assert "--request-timeout=15s" in args
+        kind, name = args[args.index("get") + 1:args.index("get") + 3]
+        verified = state["verified"]
+        key = ("GitRepository/" if kind == "gitrepository" else "Kustomization/") + name
+        if kind == "kustomization" and state["mode"] == f"missing-{name}":
+            sys.exit(1)
+        if key not in state["live"]:
+            sys.exit(1)
+        expected = state["live"][key]
+        if kind == "kustomization" and state["mode"] == f"resumed-{name}":
+            expected = copy.deepcopy(expected)
+            expected["spec"]["suspend"] = False
+        obj = healthy(expected, verified)
+        mode = state["mode"]
+        if kind == "gitrepository" and mode == "stale-source":
+            obj["status"]["artifact"]["revision"] = "main@sha1:" + "0" * 40
+        if name == "operations":
+            if mode == "stale-child":
+                obj["status"]["lastAppliedRevision"] = "main@sha1:" + "0" * 40
+            if mode == "stale-generation":
+                obj["status"]["observedGeneration"] = 1
+            if mode == "suspended-child":
+                obj["spec"]["suspend"] = True
+        print(json.dumps(obj))
+        return
+    assert "cluster-info" in args or "wait" in args and "--for=condition=Available" in args, args
+
+
+def healthy(expected, verified):
+    obj = copy.deepcopy(expected)
+    obj["metadata"]["generation"] = 2
+    if obj["spec"].get("suspend", False):
+        obj.pop("status", None)
+        return obj
+    obj["status"] = {
+        "observedGeneration": 2,
+        "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 2}],
+        "artifact": {"revision": f"main@sha1:{verified['revision']}"},
+        "lastAppliedRevision": f"main@sha1:{verified['revision']}",
+    }
+    return obj
+
+
+def check_readiness(verified):
+    source = healthy(verified["source"], verified)
+    children = {(obj["metadata"]["namespace"], obj["metadata"]["name"]): healthy(obj, verified) for obj in verified["reconciliations"]}
+    for name in ("apps", "data"):
+        assert "status" not in children[("flux-system", name)]
+    readiness["check"](source, children, verified)
+    stale_suspended = copy.deepcopy(children)
+    for name in ("apps", "data"):
+        stale_suspended[("flux-system", name)]["status"] = {"observedGeneration": 0, "lastAppliedRevision": "old", "conditions": [{"type": "Ready", "status": "False"}]}
+    readiness["check"](source, stale_suspended, verified)
+    later = copy.deepcopy(verified)
+    later["revision"] = "b" * 40
+    readiness["check"](healthy(later["source"], later), {key: healthy(obj, later) for key, obj in children.items()}, later)
+    assert verified["source"]["spec"]["ref"] == {"branch": "main"}
+    changes = [
+        lambda s, c: s["spec"].update(suspend=True),
+        lambda s, c: s["spec"].update(url="ssh://git@example.invalid/other.git"),
+        lambda s, c: s["spec"].update(ref={"branch": "other"}),
+        lambda s, c: s["spec"]["ref"].update(commit=verified["revision"]),
+        lambda s, c: s["spec"].update(ignore="cluster/operations/**"),
+        lambda s, c: s["spec"].update(include=[{"repository": {"name": "other"}}]),
+        lambda s, c: s["status"].update(observedGeneration=1),
+        lambda s, c: s["status"]["conditions"][0].update(observedGeneration=1),
+        lambda s, c: s["status"]["artifact"].update(revision="main@sha1:" + "f" * 40),
+        lambda s, c: c[("flux-system", "operations")]["spec"].update(suspend=True),
+        lambda s, c: c[("flux-system", "operations")]["spec"].update(path="./cluster/other"),
+        lambda s, c: c[("flux-system", "operations")]["spec"].update(targetNamespace="default"),
+        lambda s, c: c[("flux-system", "operations")]["status"].update(observedGeneration=1),
+        lambda s, c: c[("flux-system", "operations")]["status"]["conditions"][0].update(observedGeneration=1),
+        lambda s, c: c[("flux-system", "operations")]["status"].update(lastAppliedRevision="main@sha1:" + "f" * 40),
+        lambda s, c: c[("flux-system", "operations")]["status"]["conditions"].append({"type": "Reconciling", "status": "True"}),
+        lambda s, c: c[("flux-system", "operations")]["metadata"].update(deletionTimestamp="2026-01-01T00:00:00Z"),
+    ]
+    for name in ("apps", "data"):
+        key = ("flux-system", name)
+        changes.extend([
+            lambda s, c, k=key: c[k].update(healthy({**c[k], "spec": {**c[k]["spec"], "suspend": False}}, verified)),
+            lambda s, c, k=key: c.pop(k),
+            lambda s, c, k=key: c[k]["metadata"].update(name="other"),
+            lambda s, c, k=key: c[k]["metadata"].update(namespace="other"),
+            lambda s, c, k=key: c[k].update(kind="GitRepository"),
+            lambda s, c, k=key: c[k].update(apiVersion="kustomize.toolkit.fluxcd.io/v1beta2"),
+            lambda s, c, k=key: c[k]["metadata"].update(deletionTimestamp="2026-01-01T00:00:00Z"),
+            lambda s, c, k=key: c[k]["spec"].update(path="./cluster/other"),
+        ])
+    for mutate in changes:
+        s, c = copy.deepcopy((source, children))
+        mutate(s, c)
+        try:
+            readiness["check"](s, c, verified)
+        except readiness["Pending"]:
+            pass
+        else:
+            raise AssertionError("accepted stale/suspended/unverified reconciliation")
+    print(f"bootstrap readiness: {len(changes)} independent rejection cases and status-free/stale-status suspended resources passed")
+
+
+def check_wait_deadlines(verified):
+    cases = [(name, mode) for name in ("apps", "data") for mode in ("oversleep", "later-timeout")]
+    cases += [(None, "expired-before-get"), (None, "first-get-timeout")]
+    with tempfile.TemporaryDirectory(prefix="cvp-readiness-clock-") as directory:
+        snapshot = Path(directory)
+        (snapshot / "verified.json").write_text(json.dumps(verified))
+        for missing, mode in cases:
+            clock = FixtureClock()
+            calls, branches = [], []
+
+            def branch(*args, **kwargs):
+                assert clock.now < 60 and kwargs["timeout"] > 0
+                branches.append(clock.now)
+                if mode == "expired-before-get":
+                    clock.expire(0)
+
+            def output(command, **kwargs):
+                assert clock.now < 60 and kwargs["timeout"] == 20, (mode, command, kwargs)
+                before = clock.now
+                time.sleep(0)
+                assert clock.now == before, "readiness clock leaked into subprocess polling"
+                kind, name = command[command.index("get") + 1:command.index("get") + 3]
+                calls.append((kind, name))
+                if mode == "first-get-timeout" or mode == "later-timeout" and calls.count(("gitrepository", "flux-system")) == 2:
+                    clock.expire(0)
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                if kind == "kustomization" and name == missing:
+                    raise subprocess.CalledProcessError(1, command, stderr="fixture NotFound")
+                obj = verified["source"] if kind == "gitrepository" else next(obj for obj in verified["reconciliations"] if obj["metadata"]["name"] == name)
+                return json.dumps(healthy(obj, verified))
+
+            sleep = clock.expire if mode == "oversleep" else clock.sleep
+            timer = SimpleNamespace(monotonic=clock.monotonic, sleep=sleep)
+            with patch.object(readiness["runpy"], "run_path", return_value={"assert_branch": branch}), patch.object(readiness["subprocess"], "check_output", side_effect=output), patch.dict(readiness["wait"].__globals__, {"time": timer}):
+                try:
+                    readiness["wait"]("reviewed-context", snapshot, 60)
+                except ValueError as error:
+                    message = str(error)
+                    assert "readiness timed out" in message, message
+                    if missing:
+                        assert f"cannot read kustomization flux-system/{missing}" in message, message
+                        assert calls.count(("kustomization", missing)) == 1, calls
+                    else:
+                        assert "no ready snapshot collected" in message, message
+                    if mode == "later-timeout":
+                        assert "last check:" in message and "timed out after 20 seconds" in message, message
+                        assert calls.count(("gitrepository", "flux-system")) == 2 and len(branches) == 2, calls
+                    if mode == "oversleep":
+                        assert calls.count(("gitrepository", "flux-system")) == 1 and len(branches) == 1, calls
+                    if mode == "expired-before-get":
+                        assert not calls and len(branches) == 1, calls
+                else:
+                    raise AssertionError((missing, mode, "accepted an expired readiness check"))
+    print(f"bootstrap deadlines: {len(cases)} fake-clock failure-retention and exhausted-budget cases passed")
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix="cvp-bootstrap-orchestration-") as directory:
+        directory = Path(directory)
+        root, remote, binary = directory / "checkout", directory / "remote.git", directory / "bin"
+        root.mkdir()
+        remote.mkdir()
+        binary.mkdir()
+        shutil.copytree(ROOT / "cluster", root / "cluster")
+        shutil.copytree(ROOT / "tests/policy", root / "tests/policy")
+        (root / "scripts").mkdir()
+        for name in ("bootstrap-flux", "cluster-bootstrap-preflight", "cluster-manifest-inputs"):
+            shutil.copyfile(ROOT / "scripts" / name, root / "scripts" / name)
+        (root / "scripts/cluster-bootstrap-ready").write_text(f"import runpy\nrunpy.run_path({str(Path(__file__).resolve())!r})['run_ready_fixture']()\n")
+        gotk = root / "cluster/flux-system/gotk-components.yaml"
+        docs = json.loads(subprocess.check_output(["conftest", "parse", str(gotk)], text=True))
+        gotk.write_text("\n---\n".join(json.dumps(obj) for obj in docs if obj["kind"] != "CustomResourceDefinition"))
+        source = root / "cluster/flux-system/source.yaml"
+        source.write_text(source.read_text().replace("ssh://git@example.invalid/repository.git", "ssh://git@github.com/reviewed/repository.git"))
+        for tool in ("kubectl", "ssh"):
+            path = binary / tool
+            path.write_text(f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(Path(__file__).resolve())!r})['stub']({tool!r})\n")
+            path.chmod(0o700)
+        (root / "scripts/cluster-ingress-ready").write_text(f"import runpy\nrunpy.run_path({str(Path(__file__).resolve())!r})['stub']('ingress')\n")
+        key = directory / "external-key"
+        key.write_text("disposable outside-Git fixture\n")
+        env = preflight["git_environment"]()
+
+        def git(path, *args):
+            return preflight["git"](path, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args, env=env)
+
+        git(root, "init", "-b", "main")
+        git(remote, "init", "--bare")
+        git(root, "add", "cluster")
+        git(root, "commit", "-m", "published bootstrap fixture")
+        revision = git(root, "rev-parse", "HEAD")
+        (root / "race.txt").write_text("different commit, same cluster tree\n")
+        git(root, "add", "race.txt")
+        git(root, "commit", "-m", "branch race fixture")
+        race = git(root, "rev-parse", "HEAD")
+        git(root, "push", str(remote), "main")
+        files = {name: hashlib.sha256((root / "cluster/flux-system" / name).read_bytes()).hexdigest() for name in ("namespace.yaml", "gotk-components.yaml", "source.yaml", "sync.yaml")}
+        state_path = directory / "state.json"
+        log = directory / "calls.jsonl"
+        env.update({
+            "PATH": f"{binary}:{os.environ['PATH']}", "CVP_BOOTSTRAP_TEST_STATE": str(state_path),
+            "FLUX_GITHUB_OWNER": "reviewed", "FLUX_GITHUB_REPOSITORY": "repository",
+            "FLUX_KUBE_CONTEXT": "reviewed-context", "FLUX_BOOTSTRAP_TIMEOUT": "60s",
+            "FLUX_GIT_SSH_KEY_FILE": str(key), "FLUX_GIT_KNOWN_HOSTS_FILE": str(key), "SOPS_AGE_KEY_FILE": str(key),
+        })
+        for mode in ("healthy", "fresh-suspended", "recover-suspended", "local-mutation", "assume-unchanged", "skip-worktree", "early-branch-race", "stale-source", "stale-child", "stale-generation", "suspended-child", "resumed-apps", "resumed-data", "missing-apps", "missing-data", "late-resumed-apps", "branch-race"):
+            git(root, "reset", "--hard", revision)
+            git(remote, "update-ref", "refs/heads/main", revision)
+            log.write_text("")
+            if mode in {"assume-unchanged", "skip-worktree"}:
+                git(root, "update-index", "--" + mode, "cluster/flux-system/source.yaml")
+                source.write_text(source.read_text() + "\n# hidden unpublished bytes\n")
+                assert not git(root, "status", "--porcelain", "--", "cluster")
+            state_path.write_text(json.dumps({"root": str(root), "remote": str(remote), "revision": revision, "race": race, "mode": mode, "log": str(log), "files": files, "key": str(key)}))
+            result = subprocess.run(["bash", str(root / "scripts/bootstrap-flux")], cwd=root, env=env, text=True, capture_output=True, timeout=180)
+            if mode in {"assume-unchanged", "skip-worktree", "early-branch-race"}:
+                marker = "branch changed" if mode == "early-branch-race" else "working-tree bytes differ"
+                assert result.returncode and marker in result.stderr, (mode, result.stdout, result.stderr)
+                assert not any(json.loads(line)[0] == "kubectl" for line in log.read_text().splitlines())
+                if mode != "early-branch-race":
+                    git(root, "update-index", "--no-" + mode, "cluster/flux-system/source.yaml")
+                print(f"bootstrap orchestration: {mode} rejected before Kubernetes")
+                continue
+            if mode in {"healthy", "fresh-suspended", "recover-suspended", "local-mutation"}:
+                assert result.returncode == 0 and "Flux bootstrap complete" in result.stdout, (mode, result.stdout, result.stderr)
+            else:
+                marker = "branch changed" if mode == "branch-race" else "readiness timed out"
+                assert result.returncode and marker in result.stderr and "Flux bootstrap complete" not in result.stdout, (mode, result.stdout, result.stderr)
+                causes = {"stale-source": "source artifact", "stale-child": "operations has not applied", "stale-generation": "operations has stale", "suspended-child": "operations is suspended", "resumed-apps": "apps must remain suspended", "resumed-data": "data must remain suspended", "missing-apps": "cannot read kustomization flux-system/apps", "missing-data": "cannot read kustomization flux-system/data", "late-resumed-apps": "apps must remain suspended"}
+                if mode in causes:
+                    assert causes[mode] in result.stderr, (mode, result.stderr)
+            state = json.loads(state_path.read_text())
+            assert not Path(state["snapshot"]).exists(), "bootstrap snapshot was not cleaned up"
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            if mode in {"healthy", "fresh-suspended", "recover-suspended", "local-mutation", "late-resumed-apps", "branch-race"}:
+                assert any(call[0] == "ingress" for call in calls)
+            else:
+                assert not any(call[0] == "ingress" for call in calls), "ingress ran before Flux revision gate passed"
+            if mode == "healthy":
+                check_readiness(state["verified"])
+                check_wait_deadlines(state["verified"])
+            if mode == "fresh-suspended":
+                for name in ("apps", "data"):
+                    assert any(call[0] == "kubectl" and ["get", "kustomization", name] == call[call.index("get"):call.index("get") + 3] for call in calls if "get" in call)
+                    assert "status" not in healthy(state["live"]["Kustomization/" + name], state["verified"])
+            if mode == "recover-suspended":
+                assert state["live"]["GitRepository/flux-system"]["spec"]["suspend"] is False
+                for name in ("flux-system", "policy", "infrastructure", "operations"):
+                    assert state["live"]["Kustomization/" + name]["spec"]["suspend"] is False
+                for name in ("apps", "data"):
+                    assert state["live"]["Kustomization/" + name]["spec"]["suspend"] is True
+            print(f"bootstrap orchestration: {mode} passed")
+
+
+if __name__ == "__main__":
+    main()

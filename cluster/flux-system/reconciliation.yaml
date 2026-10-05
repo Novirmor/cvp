@@ -6,6 +6,7 @@ metadata:
   namespace: flux-system
 spec:
   deletionPolicy: Orphan
+  suspend: false
   interval: 10m
   path: ./cluster/infrastructure/policy/overlays/cluster
   prune: true
@@ -28,14 +29,11 @@ spec:
       kind: Deployment
       name: traefik
       namespace: kube-system
-    - apiVersion: apps/v1
-      kind: DaemonSet
-      name: svclb-traefik
-      namespace: kube-system
   interval: 10m
   path: ./cluster/infrastructure/ingress/overlays/k3s
   prune: true
-  wait: true
+  suspend: false
+  wait: false
   timeout: 5m
   sourceRef:
     kind: GitRepository
@@ -100,6 +98,7 @@ spec:
   interval: 10m
   path: ./cluster/operations/overlays/cluster
   prune: true
+  suspend: false
   wait: true
   timeout: 5m
   sourceRef:

@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SCHEMA_COMMAND = [
+    "kubeconform", "-ignore-missing-schemas", "-schema-location", "default",
+    "-schema-location", "https://schemas.fluxoperator.dev/catalog/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json",
+    "-kubernetes-version", "1.35.0", "-strict", "-summary",
+]
+FLUX_API = "kustomize.toolkit.fluxcd.io/v1"
+BUILD_OVERRIDES = {"targetNamespace", "namePrefix", "nameSuffix", "patches", "images", "postBuild", "components", "commonMetadata", "kubeConfig"}
+CONTROLLERS = {"helm-controller", "kustomize-controller", "source-controller", "notification-controller", "image-reflector-controller", "image-automation-controller"}
+CLUSTER_KINDS = {"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding", "PersistentVolume", "StorageClass", "PriorityClass", "IngressClass", "Node", "CSIDriver", "CSINode", "VolumeAttachment", "MutatingWebhookConfiguration", "ValidatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def reject_resource_lists(value):
+    if isinstance(value, dict):
+        kind = value.get("kind", "")
+        if isinstance(kind, str) and kind.endswith("List"):
+            raise ValueError("resource list wrappers are forbidden; use separate manifest documents")
+        for item in value.values():
+            reject_resource_lists(item)
+    elif isinstance(value, list):
+        for item in value:
+            reject_resource_lists(item)
+
+
+def documents(text):
+    if not text.strip():
+        return []
+    result = subprocess.run(
+        ["conftest", "parse", "-", "--parser", "yaml"],
+        input=text, text=True, capture_output=True, check=True,
+    )
+    parsed = json.loads(result.stdout)
+    reject_resource_lists(parsed)
+    return parsed if isinstance(parsed, list) else [parsed]
+
+
+def schema_input(text):
+    for document in documents(text):
+        if not document:
+            continue
+        if document.get("kind") == "Secret" and "sops" in document:
+            document.pop("sops")
+            for section in ("data", "stringData"):
+                if section in document:
+                    if not isinstance(document[section], dict):
+                        raise ValueError(f"Secret {section} must be a map")
+                    document[section] = {key: "" for key in document[section]}
+        yield json.dumps(document)
+
+
+def source_files(root):
+    return sorted(
+        path for path in root.rglob("*")
+        if path.is_file() and (
+            path.suffix in (".yaml", ".yml", ".json")
+            or path.name == "Kustomization"
+        )
+    )
+
+
+def check_sources(root):
+    files = source_files(root)
+    require(files, "no cluster manifest sources found")
+    subprocess.run([
+        "conftest", "test", *map(str, files), "--parser", "yaml",
+        "--policy", str(ROOT / "tests/policy/secrets.rego"),
+        "--policy", str(ROOT / "tests/policy/helpers.rego"),
+    ], check=True)
+
+
+def check_build_inputs(root):
+    for config in root.rglob("*"):
+        if config.name not in {"kustomization.yaml", "kustomization.yml", "Kustomization"} or not config.is_file():
+            continue
+        parsed = documents(config.read_text())
+        require(len(parsed) == 1 and isinstance(parsed[0], dict), f"invalid Kustomize configuration: {config}")
+        obj = parsed[0]
+        paths = []
+        for key in ("resources", "bases", "components", "crds", "generators", "transformers", "configurations"):
+            paths.extend(obj.get(key) or [])
+        for key in ("patches", "patchesStrategicMerge", "patchesJson6902", "replacements"):
+            for patch in obj.get(key) or []:
+                if isinstance(patch, dict) and patch.get("path"):
+                    paths.append(patch["path"])
+                elif isinstance(patch, str) and "\n" not in patch:
+                    paths.append(patch)
+        for generator in obj.get("configMapGenerator") or []:
+            paths.extend(value.split("=", 1)[-1] for value in generator.get("files") or [])
+            paths.extend(generator.get("envs") or [])
+            if generator.get("env"):
+                paths.append(generator["env"])
+        if (obj.get("openapi") or {}).get("path"):
+            paths.append(obj["openapi"]["path"])
+        for value in paths:
+            require(isinstance(value, str) and value and not Path(value).is_absolute(), f"{config}: build input must be a relative local path: {value}")
+            target = (config.parent / value).resolve()
+            require(target.is_relative_to(root) and target.exists(), f"{config}: build input must exist within cluster: {value}")
+
+
+def render_graph(root):
+    root = root.resolve()
+    check_build_inputs(root)
+    pending, renders, objects = [root], {}, {}
+    while pending:
+        path = pending.pop(0)
+        if path in renders:
+            continue
+        require(path.is_relative_to(root) and path.is_dir(), f"Flux path must be a local directory within {root}: {path}")
+        text = subprocess.check_output(["kustomize", "build", str(path)], text=True)
+        renders[path] = text
+        for obj in documents(text):
+            if not obj:
+                continue
+            metadata = obj.get("metadata") or {}
+            key = (obj["apiVersion"].split("/")[0] if "/" in obj["apiVersion"] else "", obj["kind"], metadata.get("namespace", ""), metadata.get("name", ""))
+            require(key not in objects or objects[key] == obj, f"conflicting rendered resource: {key}")
+            objects[key] = obj
+            if obj["apiVersion"].split("/")[0] != "kustomize.toolkit.fluxcd.io" or obj.get("kind") != "Kustomization":
+                continue
+            require(obj["apiVersion"] == FLUX_API, f"unsupported Flux Kustomization API version: {obj['apiVersion']}")
+            spec = obj["spec"]
+            require(not any(spec.get(field) for field in BUILD_OVERRIDES), f"{key}: unsupported Flux build overrides; put transformations in the local Kustomize overlay")
+            source = spec["sourceRef"]
+            require(source.get("kind") == "GitRepository" and source.get("name") == "flux-system" and source.get("namespace", metadata.get("namespace")) == "flux-system", f"uncovered Flux source: {key}")
+            value = spec.get("path", "")
+            require(isinstance(value, str) and value and not Path(value).is_absolute(), f"invalid Flux path: {value}")
+            target = (root.parent / value).resolve()
+            require(target.is_relative_to(root), f"Flux path escapes cluster: {value}")
+            pending.append(target)
+    return renders, list(objects.values())
+
+
+def positive(value):
+    match = re.fullmatch(r"\+?([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+|[numkKMGTPE]|[KMGTPE]i)?", str(value))
+    return bool(match and float(match[1]) > 0)
+
+
+def system_resource(obj):
+    kind, name = obj["kind"], obj["metadata"]["name"]
+    if obj["metadata"].get("namespace") == "kube-system":
+        return (obj["apiVersion"], kind, name) == ("helm.cattle.io/v1", "HelmChartConfig", "traefik")
+    if kind in {"Deployment", "ServiceAccount"}:
+        return name in CONTROLLERS
+    if (kind, name) in {
+        ("ResourceQuota", "critical-pods"), ("Service", "source-controller"),
+        ("Service", "notification-controller"), ("Service", "webhook-receiver"),
+        ("NetworkPolicy", "allow-egress"), ("NetworkPolicy", "allow-scraping"),
+        ("NetworkPolicy", "allow-webhooks"),
+    }:
+        return True
+    return (obj["apiVersion"] == FLUX_API and kind == "Kustomization") or (obj["apiVersion"] == "source.toolkit.fluxcd.io/v1" and kind == "GitRepository" and name == "flux-system")
+
+
+def check_namespaces(objects):
+    namespaces = {obj["metadata"]["name"]: obj for obj in objects if obj["kind"] == "Namespace"}
+    custom_cluster = {(obj["spec"]["group"], obj["spec"]["names"]["kind"]) for obj in objects if obj["kind"] == "CustomResourceDefinition" and obj["spec"]["scope"] == "Cluster"}
+    for obj in objects:
+        kind = obj["kind"]
+        if kind in CLUSTER_KINDS or (obj["apiVersion"].split("/")[0], kind) in custom_cluster:
+            continue
+        metadata = obj.get("metadata") or {}
+        namespace = metadata.get("namespace")
+        require(isinstance(namespace, str) and namespace, f"{kind}/{metadata.get('name')}: explicit namespace required")
+        if namespace in {"kube-system", "flux-system"}:
+            require(system_resource(obj), f"unapproved system resource: {namespace}/{kind}/{metadata.get('name')}")
+        if namespace != "kube-system":
+            require(namespace in namespaces, f"{kind}/{metadata.get('name')}: namespace {namespace} lacks a managed security baseline")
+    for name, obj in namespaces.items():
+        labels = obj["metadata"].get("labels") or {}
+        for mode in ("enforce", "audit", "warn"):
+            require(labels.get(f"pod-security.kubernetes.io/{mode}") == "restricted" and labels.get(f"pod-security.kubernetes.io/{mode}-version") == "v1.35", f"namespace {name}: {mode} PSA must be restricted at v1.35")
+        if name == "flux-system":
+            continue
+        resources = [item for item in objects if (item.get("metadata") or {}).get("namespace") == name]
+        require(any(item["kind"] == "NetworkPolicy" and item["spec"].get("podSelector") == {} and set(item["spec"].get("policyTypes", [])) == {"Ingress", "Egress"} and not item["spec"].get("ingress") and not item["spec"].get("egress") for item in resources), f"namespace {name}: missing all-pod ingress/egress default-deny")
+        keys = {"pods"} | {f"{section}.{resource}" for section in ("requests", "limits") for resource in ("cpu", "memory", "ephemeral-storage")}
+        require(any(item["kind"] == "ResourceQuota" and not item["spec"].get("scopes") and not item["spec"].get("scopeSelector") and all(positive(item["spec"].get("hard", {}).get(key, "")) for key in keys) for item in resources), f"namespace {name}: missing bounded ResourceQuota")
+        require(any(item["kind"] == "LimitRange" and any(limit.get("type") == "Container" and all(positive(limit.get(section, {}).get(key, "")) for section in ("default", "defaultRequest", "min", "max") for key in ("cpu", "memory", "ephemeral-storage")) for limit in item["spec"].get("limits", [])) for item in resources), f"namespace {name}: missing bounded container LimitRange")
+
+
+def validate(root, schema=True):
+    check_sources(root)
+    renders, objects = render_graph(root)
+    check_namespaces(objects)
+    with tempfile.TemporaryDirectory(prefix="cvp-manifests-") as directory:
+        for index, (path, text) in enumerate(renders.items()):
+            print(f"validating {path}", flush=True)
+            rendered = Path(directory) / f"{index}.yaml"
+            rendered.write_text(text)
+            subprocess.run(["conftest", "test", str(rendered), "--policy", str(ROOT / "tests/policy")], check=True)
+            if schema:
+                subprocess.run(SCHEMA_COMMAND, input="\n---\n".join(schema_input(text)), text=True, check=True)
+    return objects
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("sources", "schema", "validate"))
+    parser.add_argument("--root", type=Path, default=Path("cluster"))
+    args = parser.parse_args()
+    if args.mode == "sources":
+        check_sources(args.root)
+    elif args.mode == "validate":
+        validate(args.root)
+    else:
+        # The original stream must pass conftest before this schema-only copy is used.
+        print("\n---\n".join(schema_input(sys.stdin.read())))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))

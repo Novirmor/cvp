@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+import argparse
+import copy
+import json
+from pathlib import Path
+import subprocess
+import runpy
+import tempfile
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--schema", action="store_true")
+    args = parser.parse_args()
+    fixtures = json.loads(subprocess.check_output([
+        "conftest", "parse", "tests/policy/fixtures/compliant-workload.yaml",
+    ], text=True))
+    base = fixtures[0]
+    cases = []
+
+    def add(name, mutate=lambda obj: None, expected=None, original=base):
+        obj = copy.deepcopy(original)
+        mutate(obj)
+        cases.append((name, obj, expected))
+
+    def spec(obj):
+        return obj["spec"]["template"]["spec"]
+
+    def container(obj):
+        return spec(obj)["containers"][0]
+
+    add("baseline")
+    add("cronjob-baseline", original=fixtures[1])
+    for field in ("hostNetwork", "hostIPC", "hostPID"):
+        add(field, lambda o, f=field: spec(o).update({f: True}), field)
+    add("hostPath", lambda o: spec(o).update({
+        "volumes": [{"name": "host", "hostPath": {"path": "/"}}],
+    }), "hostPath")
+    for field, value, marker in (
+        ("privileged", True, "privileged"),
+        ("allowPrivilegeEscalation", True, "allowPrivilegeEscalation"),
+        ("readOnlyRootFilesystem", False, "readOnlyRootFilesystem"),
+        ("runAsNonRoot", False, "run as non-root"),
+        ("runAsUser", 0, "uid 0"),
+        ("seccompProfile", {"type": "Unconfined"}, "seccompProfile"),
+        ("seccompProfile", {}, "seccompProfile"),
+        ("capabilities", {"drop": ["ALL"], "add": ["NET_ADMIN"]}, "must not add"),
+        ("capabilities", {"drop": ["NET_RAW"]}, "drop ALL"),
+    ):
+        for location in ("containers", "initContainers", "ephemeralContainers"):
+            def change(obj, f=field, v=value, loc=location):
+                target = copy.deepcopy(container(obj))
+                target["name"] = "target"
+                target["securityContext"][f] = v
+                spec(obj)[loc] = [target]
+            add(f"{location}-{field}-{len(cases)}", change, marker)
+    add("missing-capabilities", lambda o: container(o)["securityContext"].pop("capabilities"), "drop ALL")
+    add("missing-nonroot", lambda o: spec(o)["securityContext"].pop("runAsNonRoot"), "run as non-root")
+    add("missing-seccomp", lambda o: spec(o)["securityContext"].pop("seccompProfile"), "seccompProfile")
+    add("pod-root-uid", lambda o: spec(o)["securityContext"].update({"runAsUser": 0}), "uid 0")
+
+    def safe_override(obj):
+        spec(obj)["securityContext"].update({
+            "runAsNonRoot": False, "runAsUser": 0,
+            "seccompProfile": {"type": "Unconfined"},
+        })
+        container(obj)["securityContext"].update({
+            "runAsNonRoot": True, "runAsUser": 101,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        })
+    add("safe-container-overrides", safe_override)
+    add("hostPort", lambda o: container(o).update({"ports": [{"containerPort": 8080, "hostPort": 8080}]}), "hostPort")
+    add("zero-hostPort", lambda o: container(o).update({"ports": [{"containerPort": 8080, "hostPort": 0}]}))
+    add("mutable-image", lambda o: container(o).update({"image": "nginx:1.27"}), "pinned by digest")
+    add("latest-image", lambda o: container(o).update({"image": "nginx:latest"}), ":latest")
+
+    nullable_cases = []
+    for field in ("initContainers", "ephemeralContainers"):
+        add(f"safe-null-{field}", lambda o, f=field: spec(o).update({f: None}))
+        def insecure(obj, f=field):
+            spec(obj).update({f: None, "containers": [{"name": "web", "image": "nginx:latest", "securityContext": {"privileged": True}}]})
+        add(f"null-{field}-insecure-main", insecure, "privileged")
+        nullable_cases.append(cases[-1])
+    for name, mutate, expected in (
+        ("securityContext", lambda o: container(o).update(securityContext=None), "allowPrivilegeEscalation"),
+        ("resources", lambda o: container(o).update(resources=None), "must set requests"),
+        ("requests", lambda o: container(o)["resources"].update(requests=None), "must set requests"),
+        ("requests-limits", lambda o: container(o).update(resources={"requests": None, "limits": None}), "must set limits"),
+    ):
+        add(f"null-{name}", mutate, expected)
+        nullable_cases.append(cases[-1])
+    for value in ("invalid", [], 1, True):
+        add(f"malformed-security-{value}", lambda o, v=value: container(o).update(securityContext=v), "must be maps")
+        add(f"malformed-resources-{value}", lambda o, v=value: container(o).update(resources=v), "must be maps")
+    for value in ("invalid", {}, 1, True):
+        add(f"malformed-init-{value}", lambda o, v=value: spec(o).update(initContainers=v), "must be an array")
+    add("null-main", lambda o: spec(o).update(containers=None), "nonempty array")
+    add("nameless-container", lambda o: container(o).pop("name"), "nonempty name")
+    add("null-container", lambda o: spec(o).update(containers=[None]), "nonempty name")
+    add("null-workload-metadata", lambda o: o.update(metadata=None), "metadata must be a map")
+    add("null-capabilities", lambda o: container(o)["securityContext"].update(capabilities=None), "drop ALL")
+    add("malformed-capabilities", lambda o: container(o)["securityContext"].update(capabilities={"drop": ["ALL"], "add": "NET_ADMIN"}), "capability lists")
+    add("null-seccomp", lambda o: container(o)["securityContext"].update(seccompProfile=None), "seccompProfile")
+
+    for section in ("requests", "limits"):
+        for resource in ("cpu", "memory", "ephemeral-storage"):
+            marker = "ephemeral storage" if resource == "ephemeral-storage" else f"must set {section}"
+            for value in (None, 0, "0", "0m", "0Mi", "0e6", "0.000", "-1", "garbage"):
+                def change(obj, s=section, r=resource, v=value):
+                    values = container(obj)["resources"][s]
+                    if v is None:
+                        values.pop(r)
+                    else:
+                        values[r] = v
+                add(f"{section}-{resource}-{value}", change, marker)
+    for value in ("1m", "1e-3", ".001", "+0.1", 1):
+        add(f"positive-quantity-{value}", lambda o, v=value: container(o)["resources"]["requests"].update({"cpu": v}))
+
+    for kind in ("Pod", "PodTemplate", "ReplicaSet", "ReplicationController", "StatefulSet", "DaemonSet", "Job", "CronJob"):
+        obj = copy.deepcopy(base)
+        pod = spec(obj)
+        obj["kind"] = kind
+        if kind == "Pod":
+            obj["spec"] = pod
+        elif kind == "PodTemplate":
+            obj.pop("spec")
+            obj["template"] = {"spec": pod}
+        elif kind == "CronJob":
+            obj["spec"] = {"jobTemplate": {"spec": {"template": {"spec": pod}}}}
+        add(f"{kind}-baseline", original=obj)
+        pod["hostNetwork"] = True
+        add(f"{kind}-hostNetwork", expected="hostNetwork", original=obj)
+    add("unsupported-controller", lambda o: o.update({"kind": "UnknownController"}), "unsupported pod-template")
+
+    flux = json.loads(subprocess.check_output([
+        "conftest", "parse", "cluster/flux-system/gotk-components.yaml",
+    ], text=True))
+    for obj in flux:
+        if obj.get("kind") != "Deployment":
+            continue
+        name = obj["metadata"]["name"]
+        add(f"vendor-{name}", original=obj)
+        add(f"vendor-{name}-changed-image", lambda o: container(o).update({"image": "nginx:1.27"}), "pinned by digest", obj)
+        add(f"vendor-{name}-sidecar", lambda o: spec(o)["containers"].append({
+            **copy.deepcopy(container(o)), "name": "extra",
+        }), "ephemeral storage", obj)
+    add("namespace-exemption", lambda o: (
+        o["metadata"].update({"namespace": "flux-system"}),
+        container(o).update({"image": "nginx:1.27"}),
+    ), "pinned by digest")
+
+    secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "test"}}
+    add("empty-secret", original=secret)
+    for section, value in (("stringData", "hunter2"), ("data", "aHVudGVyMg==")):
+        add(f"plaintext-{section}", lambda o, s=section, v=value: o.update({s: {"password": v}}), "must be SOPS encrypted", secret)
+    ciphertext = "ENC[AES256_GCM,data:YQ==,iv:YQ==,tag:YQ==,type:str]"
+    encrypted = {
+        **secret, "stringData": {"password": ciphertext},
+        "sops": {
+            "mac": ciphertext, "encrypted_regex": "^(data|stringData)$",
+            "age": [{"recipient": "age1example", "enc": "-----BEGIN AGE ENCRYPTED FILE-----\nfixture\n-----END AGE ENCRYPTED FILE-----"}],
+        },
+    }
+    add("structural-sops", original=encrypted)
+    add("missing-sops", lambda o: o.pop("sops"), "requires SOPS age metadata", encrypted)
+    add("partial-encryption", lambda o: o["stringData"].update({"other": "plaintext"}), "must be SOPS encrypted", encrypted)
+    add("invalid-mac", lambda o: o["sops"].update({"mac": "plaintext"}), "requires SOPS age metadata", encrypted)
+    add("invalid-payload-map", lambda o: o.update({"data": "invalid"}), "must be a map", encrypted)
+    add("secretGenerator", expected="secretGenerator is forbidden", original={
+        "kind": "Kustomization", "secretGenerator": [{"name": "test", "literals": ["password=test"]}],
+    })
+    add("builtin-SecretGenerator", expected="SecretGenerator is forbidden", original={"kind": "SecretGenerator"})
+    plaintext = {**secret, "stringData": {"password": "fixture-only"}}
+    add("missing-secret-metadata", lambda o: o.pop("metadata"), "must be SOPS encrypted", plaintext)
+    for value in (None, [], "invalid", 1):
+        add(f"secret-metadata-{value}", lambda o, v=value: o.update(metadata=v), "must be SOPS encrypted", plaintext)
+    for kind in ("List", "SecretList", "ConfigMapList"):
+        add(f"forbidden-{kind}", expected="resource list wrappers are forbidden", original={
+            "apiVersion": "v1", "kind": kind, "items": [plaintext],
+        })
+    add("typeless-SecretList-items", expected="resource list wrappers are forbidden", original={
+        "apiVersion": "v1", "kind": "SecretList", "items": [{"metadata": {"name": "fixture"}, "data": {"password": "aHVudGVyMg=="}}],
+    })
+    add("nested-list-wrappers", expected="resource list wrappers are forbidden", original={
+        "apiVersion": "v1", "kind": "List", "items": [{"apiVersion": "v1", "kind": "SecretList", "items": [plaintext]}],
+    })
+    add("array-plaintext-secret", expected="must be SOPS encrypted", original=[plaintext])
+
+    with tempfile.TemporaryDirectory(prefix="cvp-cluster-policy-") as directory:
+        paths = []
+        for index, (_, obj, _) in enumerate(cases):
+            path = Path(directory) / f"{index}.json"
+            path.write_text(json.dumps(obj))
+            paths.append(str(path))
+        result = subprocess.run([
+            "conftest", "test", *paths, "--policy", "tests/policy", "--output", "json",
+        ], capture_output=True, text=True)
+        if result.returncode not in (0, 1):
+            raise AssertionError(result.stderr)
+        results = {Path(row["filename"]).stem: row for row in json.loads(result.stdout)}
+        for index, (name, _, expected) in enumerate(cases):
+            messages = [item["msg"] for item in results[str(index)].get("failures", [])]
+            if expected is None:
+                assert not messages, (name, messages)
+            else:
+                assert any(expected in message for message in messages), (name, expected, messages)
+    print(f"cluster policy: {len(cases)} independent cases passed")
+    test_nullable_renders(nullable_cases, base, args.schema)
+
+
+def test_nullable_renders(cases, base, schema):
+    inputs = runpy.run_path("scripts/cluster-manifest-inputs")
+    with tempfile.TemporaryDirectory(prefix="cvp-nullable-policy-") as directory:
+        directory = Path(directory)
+        for name, obj, expected in [("baseline", base, None), *cases]:
+            (directory / "resource.json").write_text(json.dumps(obj))
+            (directory / "kustomization.yaml").write_text("resources:\n- resource.json\n")
+            rendered = subprocess.check_output(["kustomize", "build", str(directory)], text=True)
+            render_path = directory / "render.yaml"
+            render_path.write_text(rendered)
+            policy = subprocess.run(["conftest", "test", str(render_path), "--policy", "tests/policy"], text=True, capture_output=True)
+            if expected:
+                assert policy.returncode == 1 and expected in policy.stdout, (name, policy.stdout, policy.stderr)
+                assert "null" in rendered, name
+                if "insecure-main" in name:
+                    assert all(marker in policy.stdout for marker in ("privileged", ":latest", "must set requests", "must set limits")), policy.stdout
+            else:
+                assert policy.returncode == 0, policy.stdout + policy.stderr
+            if schema:
+                checked = subprocess.run(inputs["SCHEMA_COMMAND"], input="\n---\n".join(inputs["schema_input"](rendered)), text=True, capture_output=True)
+                assert checked.returncode == 0 and "Valid: 1" in checked.stdout and "Skipped: 0" in checked.stdout, (name, checked.stdout, checked.stderr)
+    print(f"nullable regressions: {len(cases)} rendered policy rejections; strict schema {'verified valid (not skipped)' if schema else 'not requested'}")
+
+
+if __name__ == "__main__":
+    main()
