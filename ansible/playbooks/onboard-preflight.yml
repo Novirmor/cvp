@@ -1,0 +1,13 @@
+---
+- name: Load persistent operator configuration
+  ansible.builtin.import_playbook: load-operator-config.yml
+
+- name: Verify onboarding against the initialized control plane
+  hosts: wireguard
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Check topology and live cluster membership
+      ansible.builtin.include_tasks: tasks/onboard-preflight.yml
+      run_once: true

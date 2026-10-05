@@ -1,4 +1,7 @@
 ---
+- name: Load persistent operator configuration
+  ansible.builtin.import_playbook: load-operator-config.yml
+
 - name: Probe the converged WireGuard underlay and peer MTU
   hosts: wireguard
   become: true
@@ -7,10 +10,12 @@
     - name: Read WireGuard state
       ansible.builtin.command: wg show {{ wireguard_interface }}
       changed_when: false
+      check_mode: false
 
     - name: Read WireGuard interface MTU
       ansible.builtin.command: ip link show dev {{ wireguard_interface }}
       changed_when: false
+      check_mode: false
 
     - name: Probe every peer with a no-fragment packet
       ansible.builtin.command:
@@ -28,6 +33,7 @@
           - "{{ wireguard_interface }}"
           - "{{ hostvars[item].wireguard_address }}"
       changed_when: false
+      check_mode: false
       loop: "{{ groups[wireguard_peers_group] | difference([inventory_hostname]) }}"
       loop_control:
         label: "{{ item }}"

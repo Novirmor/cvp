@@ -1,21 +1,59 @@
 ---
+- name: Load persistent operator configuration
+  ansible.builtin.import_playbook: load-operator-config.yml
+
 - name: Validate node tags before configuring hosts
   hosts: wireguard
   connection: local
   become: false
   gather_facts: false
   run_once: true
+  any_errors_fatal: true
   tasks:
+    - name: Validate the entire cluster topology before host access
+      ansible.builtin.include_tasks: tasks/validate-topology.yml
+
+    - name: Require the shared control-plane dependency in a mutating selection
+      ansible.builtin.assert:
+        that: >-
+          ansible_check_mode or
+          ([k3s_cluster_init_host, k3s_server_host] | unique | difference(ansible_play_hosts_all) | length == 0)
+        fail_msg: >-
+          Include both {{ k3s_cluster_init_host }} and {{ k3s_server_host }} in --limit so convergence
+          holds lifecycle ownership for every shared control-plane and credential dependency.
+          Read-only probes may target one agent.
+
     - name: Validate selected inventory nodes
       ansible.builtin.include_tasks: tasks/validate-node-tags.yml
       vars:
         node_tag_validation_hosts: "{{ ansible_play_hosts_all }}"
+
+- name: Hold exclusive lifecycle ownership before any host changes
+  hosts: wireguard
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Acquire this invocation's host lifecycle lock
+      ansible.builtin.include_role:
+        name: k3s_server
+        tasks_from: lifecycle/acquire
+
+    - name: Revalidate the initialized cluster under the lifecycle locks
+      ansible.builtin.include_tasks: tasks/onboard-preflight.yml
+      when: cvp_onboard_node is defined
 
 - name: Configure K3s hosts
   hosts: wireguard
   serial: 1
   become: true
   gather_facts: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Verify lifecycle ownership before host convergence
+      ansible.builtin.include_role:
+        name: k3s_server
+        tasks_from: lifecycle/assert
   roles:
     - role: base
     - role: tailscale
@@ -27,6 +65,12 @@
   hosts: ingress
   become: true
   gather_facts: false
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Verify lifecycle ownership before ingress convergence
+      ansible.builtin.include_role:
+        name: k3s_server
+        tasks_from: lifecycle/assert
   roles:
     - role: ingress_v6
       when: ingress_v6_enabled | bool
@@ -35,6 +79,7 @@
   hosts: k3s_servers
   become: true
   gather_facts: true
+  any_errors_fatal: true
   roles:
     - role: k3s_server
       when: k3s_server_init | bool
@@ -47,6 +92,7 @@
   serial: 1
   become: true
   gather_facts: true
+  any_errors_fatal: true
   roles:
     - role: k3s_server
       when: not k3s_server_init | bool
@@ -56,6 +102,7 @@
   serial: 1
   become: true
   gather_facts: true
+  any_errors_fatal: true
   roles:
     - role: k3s_agent
 
@@ -64,6 +111,7 @@
   become: true
   gather_facts: false
   run_once: true
+  any_errors_fatal: true
   vars:
     managed_label_prefixes: "{{ k3s_managed_label_domains | join('|') }}"
     tag_target_nodes: "{{ ansible_play_hosts_all }}"
@@ -83,6 +131,7 @@
       retries: 12
       delay: 5
       loop: "{{ tag_target_nodes }}"
+      when: not ansible_check_mode
 
     - name: Read the selected cluster nodes
       kubernetes.core.k8s_info:
@@ -93,6 +142,7 @@
       delegate_to: "{{ k3s_server_host }}"
       register: selected_nodes
       loop: "{{ tag_target_nodes }}"
+      when: not ansible_check_mode
 
     # The annotation is the ownership ledger: only a key/effect recorded by
     # a previous successful run may be removed. A matching unowned taint is
@@ -110,6 +160,7 @@
           {{ item.item }} has an unowned inventory taint or a stale taint
           ownership ledger; resolve it before reconciling.
       loop: "{{ selected_nodes.results }}"
+      when: not ansible_check_mode
       vars:
         existing_identities: >-
           {{ item.resources[0].spec.taints | default([])
@@ -134,12 +185,30 @@
           {%- endfor -%}
           {{ ns.keys }}
 
+    - name: Require ownership of the bootstrap scheduling quarantine
+      ansible.builtin.assert:
+        that:
+          - bootstrap_taints | length <= 1
+          - >-
+            bootstrap_taints | length == 0 or
+            ((item.resources[0].metadata.labels | default({})).get('cvp.io/bootstrap-quarantine') == 'true'
+             and bootstrap_taints[0].get('value') == 'true'
+             and bootstrap_taints[0].get('effect') == 'NoSchedule')
+        fail_msg: The bootstrap quarantine does not match the owned registration state; refusing to remove it.
+      loop: "{{ selected_nodes.results }}"
+      vars:
+        bootstrap_taints: >-
+          {{ item.resources[0].spec.taints | default([])
+             | selectattr('key', 'equalto', 'cvp.io/bootstrap') | list }}
+      when: not ansible_check_mode
+
     # Construct Python/Jinja dictionaries, never JSON text interpolated from
     # inventory. A test on the taint array makes concurrent edits fail cleanly.
     - name: Compute patches for selected inventory nodes
       ansible.builtin.set_fact:
         k8s_node_patches: "{{ k8s_node_patches | default({}) | combine({item.item: node_patch}) }}"
       loop: "{{ selected_nodes.results }}"
+      when: not ansible_check_mode
       vars:
         node_res: "{{ item.resources[0] }}"
         current_labels: "{{ node_res.metadata.labels | default({}) }}"
@@ -177,8 +246,9 @@
             {%- set ns.desired = ns.desired + [dict(key=key, value=value, effect=effect)] -%}
           {%- endfor -%}
           {%- for taint in old_taints -%}
-            {%- if not (ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list) or
-                   (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list) -%}
+            {%- if taint.key != 'cvp.io/bootstrap' and
+                   (not (ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list) or
+                   (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list)) -%}
               {%- set ns.retained = ns.retained + [taint] -%}
             {%- endif -%}
           {%- endfor -%}
@@ -196,8 +266,9 @@
               {%- endif -%}
               {%- for taint in old_taints | reverse | list -%}
                 {%- set index = (old_taints | length - 1) - loop.index0 -%}
-                {%- if ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list and
-                       not (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list) -%}
+                {%- if taint.key == 'cvp.io/bootstrap' or
+                       (ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list and
+                       not (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list)) -%}
                   {%- set ns.ops = ns.ops + [dict(op='remove', path='/spec/taints/' ~ index)] -%}
                 {%- endif -%}
               {%- endfor -%}
@@ -234,4 +305,16 @@
       delegate_to: "{{ k3s_server_host }}"
       loop: "{{ tag_target_nodes }}"
       when:
+        - not ansible_check_mode
         - k8s_node_patches[item] | length > 0
+
+- name: Release lifecycle ownership after successful reconciliation
+  hosts: wireguard
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Release this invocation's verified lifecycle lock
+      ansible.builtin.include_role:
+        name: k3s_server
+        tasks_from: lifecycle/release

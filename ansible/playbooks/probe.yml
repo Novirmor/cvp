@@ -1,4 +1,7 @@
 ---
+- name: Load persistent operator configuration
+  ansible.builtin.import_playbook: load-operator-config.yml
+
 - name: Probe the host and network prerequisites without changing state
   hosts: wireguard
   become: true
@@ -9,6 +12,7 @@
       ansible.builtin.command: systemd-detect-virt
       register: probe_virt
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Require a conclusive virtualization detection
@@ -72,6 +76,7 @@
         argv: [grep, -qw, overlay, /proc/filesystems]
       register: probe_overlay_fs
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Check host-provided modules including built-ins
@@ -84,6 +89,7 @@
       ansible.builtin.command:
         argv: [modprobe, -n, "{{ item }}"]
       changed_when: false
+      check_mode: false
       loop: "{{ base_kernel_modules }}"
       loop_control:
         index_var: module_index
@@ -132,6 +138,7 @@
         - /dev/net/tun
       register: probe_lxc_access
       changed_when: false
+      check_mode: false
       failed_when: false
       when: probe_env == 'lxc'
 
@@ -139,6 +146,7 @@
       ansible.builtin.command: swapon --show --noheadings
       register: probe_swap
       changed_when: false
+      check_mode: false
       when: base_disable_swap | bool
 
     - name: Check LXC network sysctl availability
@@ -147,6 +155,7 @@
       loop: "{{ base_sysctls | dict2items }}"
       register: probe_lxc_sysctls
       changed_when: false
+      check_mode: false
       failed_when: false
       when: probe_env == 'lxc'
 
@@ -156,6 +165,7 @@
       loop: "{{ base_sysctls | dict2items }}"
       register: probe_lxc_writable
       changed_when: false
+      check_mode: false
       failed_when: false
       when:
         - probe_env == 'lxc'
@@ -199,6 +209,7 @@
       loop: "{{ base_ra_interfaces }}"
       register: probe_ra_writable
       changed_when: false
+      check_mode: false
       failed_when: false
       when: probe_env == 'lxc'
 

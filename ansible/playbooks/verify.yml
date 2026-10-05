@@ -1,4 +1,7 @@
 ---
+- name: Load persistent operator configuration
+  ansible.builtin.import_playbook: load-operator-config.yml
+
 - name: Verify host and K3s state without changing it
   hosts: wireguard
   become: true
@@ -8,30 +11,52 @@
       ansible.builtin.command: wg show {{ wireguard_interface }}
       register: verify_wireguard
       changed_when: false
+      check_mode: false
 
     - name: Read WireGuard address
-      ansible.builtin.command: ip -o address show dev {{ wireguard_interface }}
+      ansible.builtin.command: ip -j address show dev {{ wireguard_interface }}
       register: verify_wireguard_address
       changed_when: false
+      check_mode: false
 
     - name: Verify the expected WireGuard address is configured
       ansible.builtin.assert:
         that:
-          - wireguard_address in verify_wireguard_address.stdout
+          - >-
+            verify_wireguard_address.stdout | from_json
+            | selectattr('ifname', 'equalto', wireguard_interface)
+            | map(attribute='addr_info') | flatten
+            | selectattr('family', 'equalto', 'inet')
+            | selectattr('local', 'equalto', wireguard_address)
+            | selectattr('prefixlen', 'equalto', 24) | list | length == 1
         fail_msg: >-
-          {{ wireguard_interface }} is up but does not have {{ wireguard_address }}.
+          {{ wireguard_interface }} is up but does not have exactly {{ wireguard_address }}/24.
+
+    - name: Verify the applied WireGuard configuration
+      ansible.builtin.include_role:
+        name: wireguard
+        tasks_from: verify
 
     - name: Check Tailscale without changing enrollment
       ansible.builtin.command: tailscale status --json
       register: verify_tailscale
       changed_when: false
+      check_mode: false
       failed_when: false
+
+    - name: Require Tailscale to be running
+      ansible.builtin.assert:
+        that:
+          - verify_tailscale.rc == 0
+          - (verify_tailscale.stdout | from_json).BackendState == 'Running'
+        fail_msg: Tailscale must report BackendState Running in valid JSON.
 
     # Evidence for gate records: which environment each node actually runs on.
     - name: Detect the virtualization environment
       ansible.builtin.command: systemd-detect-virt
       register: verify_virt
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Require a conclusive virtualization detection
@@ -79,6 +104,7 @@
       loop: "{{ base_sysctls | dict2items }}"
       register: verify_sysctls
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Require live network sysctls to match inventory
@@ -99,6 +125,7 @@
       loop: "{{ base_ra_interfaces }}"
       register: verify_ra
       changed_when: false
+      check_mode: false
       failed_when: false
       when: base_sysctls['net.ipv6.conf.all.forwarding'] | string == '1'
 
@@ -121,16 +148,10 @@
       register: verify_wireguard_service
       changed_when: false
 
-    - name: Check firewall syntax
-      ansible.builtin.command: nft -c -f /etc/nftables.conf
-      register: verify_firewall
-      changed_when: false
-
-    - name: Check firewall service
-      ansible.builtin.systemd_service:
-        name: nftables.service
-      register: verify_firewall_service
-      changed_when: false
+    - name: Verify the applied firewall policy
+      ansible.builtin.include_role:
+        name: firewall
+        tasks_from: verify
 
     - name: Check K3s service
       ansible.builtin.systemd_service:
@@ -138,22 +159,16 @@
       register: verify_k3s_service
       changed_when: false
 
-    - name: Check the exact local-path mountpoint
-      ansible.builtin.command: findmnt --noheadings --output UUID --mountpoint {{ storage_mountpoint }}
-      register: verify_storage_mount
-      changed_when: false
-      failed_when: false
+    - name: Verify storage mount identity and filesystem
+      ansible.builtin.include_role:
+        name: storage
+        tasks_from: verify
 
     - name: Verify required host services
       ansible.builtin.assert:
         that:
           - verify_wireguard_service.status.ActiveState == 'active'
           - verify_k3s_service.status.ActiveState == 'active'
-          - verify_tailscale.rc == 0
-          - "'Running' in verify_tailscale.stdout"
-          - verify_firewall.rc == 0
-          - verify_firewall_service.status.ActiveState == 'active'
-          - verify_storage_mount.rc == 0 or storage_device | length == 0
         fail_msg: >-
           One or more host checks failed. Inspect the registered command output
           and systemd journal before changing the host.
@@ -163,6 +178,7 @@
         path: /run/flannel/subnet.env
         state: present
         timeout: 300
+      check_mode: false
       when: k3s_role is defined
 
     - name: Read the Flannel MTU
@@ -174,6 +190,7 @@
           - /run/flannel/subnet.env
       register: verify_flannel_mtu
       changed_when: false
+      check_mode: false
       when: k3s_role is defined
 
     - name: Require the measured pod MTU to match the design
@@ -186,60 +203,64 @@
           A missing or different MTU is a verification failure, not a skip.
       when: k3s_role is defined
 
-- name: Verify the control plane from a server
-  hosts: k3s_servers
-  become: true
-  gather_facts: false
-  run_once: true
-  tasks:
-    - name: Read the cluster nodes
-      kubernetes.core.k8s_info:
-        kubeconfig: /etc/rancher/k3s/k3s.yaml
-        api_version: v1
-        kind: Node
-      register: verify_k8s_nodes
+    - name: Verify selected nodes through the control plane
+      run_once: true
+      tags: [verify_api]
+      block:
+        - name: Require an inventory control-plane delegate
+          ansible.builtin.assert:
+            that:
+              - k3s_server_host | default('') in groups['k3s_servers']
 
-    - name: Show cluster node readiness
-      ansible.builtin.debug:
-        msg: >-
-          {{ verify_k8s_nodes.resources
-             | map(attribute='metadata.name')
-             | list }} with Ready conditions
-          {{ verify_k8s_nodes.resources
-             | map(attribute='status.conditions')
-             | select('defined')
-             | map('selectattr', 'type', 'equalto', 'Ready')
-             | map('first')
-             | map(attribute='status')
-             | list }}
+        - name: Read API readiness from the server
+          ansible.builtin.command:
+            argv:
+              - "{{ k3s_bin_path }}"
+              - kubectl
+              - --kubeconfig=/etc/rancher/k3s/k3s.yaml
+              - get
+              - --raw=/readyz
+          delegate_to: "{{ k3s_server_host }}"
+          register: verify_api_readiness
+          changed_when: false
+          check_mode: false
 
-    - name: Require every inventory node to be present and Ready
-      ansible.builtin.assert:
-        that:
-          - verify_k8s_nodes.resources | length == groups['wireguard'] | length
-          - >-
-            groups['wireguard']
-            | difference(verify_k8s_nodes.resources | map(attribute='metadata.name') | list)
-            | length == 0
-          - >-
-            verify_k8s_nodes.resources
-            | selectattr('metadata.name', 'in', groups['wireguard'])
-            | map(attribute='status.conditions')
-            | select('defined')
-            | map('selectattr', 'type', 'equalto', 'Ready')
-            | map('first')
-            | list | length == groups['wireguard'] | length
-          - >-
-            verify_k8s_nodes.resources
-            | selectattr('metadata.name', 'in', groups['wireguard'])
-            | map(attribute='status.conditions')
-            | select('defined')
-            | map('selectattr', 'type', 'equalto', 'Ready')
-            | map('first')
-            | map(attribute='status')
-            | select('ne', 'True')
-            | list | length == 0
-        fail_msg: >-
-          Expected every inventory node ({{ groups['wireguard'] | join(', ') }})
-          to be present and Ready; observed:
-          {{ verify_k8s_nodes.resources | map(attribute='metadata.name') | list }}.
+        - name: Require a ready API
+          ansible.builtin.assert:
+            that:
+              - verify_api_readiness.stdout | trim == 'ok'
+
+        - name: Read the cluster nodes
+          kubernetes.core.k8s_info:
+            kubeconfig: /etc/rancher/k3s/k3s.yaml
+            api_version: v1
+            kind: Node
+          delegate_to: "{{ k3s_server_host }}"
+          register: verify_k8s_nodes
+          check_mode: false
+
+        - name: Require every selected node to be present and Ready with its expected address
+          ansible.builtin.assert:
+            that:
+              - selected_nodes | length == 1
+              - >-
+                selected_nodes[0].status.conditions
+                | selectattr('type', 'equalto', 'Ready')
+                | selectattr('status', 'equalto', 'True') | list | length == 1
+              - >-
+                selected_nodes[0].status.addresses
+                | selectattr('type', 'equalto', 'InternalIP')
+                | map(attribute='address') | list == [hostvars[item].wireguard_address]
+            fail_msg: >-
+              Selected node {{ item }} must be present, Ready, and have exactly
+              InternalIP {{ hostvars[item].wireguard_address }}; observed {{ selected_nodes }}.
+          vars:
+            selected_nodes: >-
+              {{ verify_k8s_nodes.resources | selectattr('metadata.name', 'equalto', item) | list }}
+          loop: "{{ ansible_play_hosts_all }}"
+
+        - name: Report the verification scope
+          ansible.builtin.debug:
+            msg: >-
+              API ready via {{ k3s_server_host }}. Verified selected nodes only:
+              {{ ansible_play_hosts_all | join(', ') }} (Ready and exact WireGuard InternalIP).

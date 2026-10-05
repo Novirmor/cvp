@@ -2,9 +2,10 @@
 set -Eeuo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-unset CVP_ONBOARD_SERVER_CONFIRM CVP_ONBOARD_SITE_VARS_FILE
+unset CVP_ONBOARD_SERVER_CONFIRM CVP_ONBOARD_SITE_VARS_FILE CVP_OPERATOR_CONFIG_FILE
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
+export XDG_CONFIG_HOME="$work_dir/config"
 mkdir "$work_dir/bin"
 
 tee "$work_dir/bin/mise" > /dev/null <<'STUB'
@@ -34,16 +35,18 @@ fi
 export CVP_ONBOARD_CONFIRM=worker1
 bash "$root_dir/scripts/onboard-node" > /dev/null
 mapfile -t calls < "$CVP_ONBOARD_TEST_CALLS"
-[[ "${#calls[@]}" -eq 6 ]] || {
-  printf 'expected six ordered calls, got %s\n' "${#calls[@]}" >&2
+[[ "${#calls[@]}" -eq 7 ]] || {
+  printf 'expected seven ordered calls, got %s\n' "${#calls[@]}" >&2
   exit 1
 }
 [[ "${calls[0]}" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]
 [[ "${calls[1]}" == 'exec -- task test' ]]
-[[ "${calls[2]}" == 'exec -- ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/probe.yml --limit worker1' ]]
-[[ "${calls[3]}" == 'exec -- ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/site.yml' ]]
-[[ "${calls[4]}" == 'exec -- ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/probe-wireguard.yml --limit worker1' ]]
-[[ "${calls[5]}" == 'exec -- ansible-playbook -i ansible/inventory/hosts.yml ansible/playbooks/verify.yml' ]]
+[[ "${calls[2]}" == *'ansible/playbooks/onboard-preflight.yml '* && "${calls[2]}" != *'--limit'* ]]
+[[ "${calls[3]}" == *'ansible/playbooks/probe.yml --limit worker1 '* ]]
+[[ "${calls[4]}" == *'ansible/playbooks/site.yml '* && "${calls[4]}" != *'--limit'* ]]
+[[ "${calls[4]}" == *'"cvp_onboard_node": "worker1"'* ]]
+[[ "${calls[5]}" == *'ansible/playbooks/probe-wireguard.yml --limit worker1 '* ]]
+[[ "${calls[6]}" == *'ansible/playbooks/verify.yml '* ]]
 
 : > "$CVP_ONBOARD_TEST_CALLS"
 export CVP_ONBOARD_TEST_INVENTORY='{"_meta":{"hostvars":{},"profile":"inventory_legacy"},"all":{"children":["ungrouped","wireguard","k3s_servers","k3s_agents","storage_stateful","ingress"]}}'
@@ -87,7 +90,7 @@ mapfile -t calls < "$CVP_ONBOARD_TEST_CALLS"
 export CVP_ONBOARD_SERVER_CONFIRM=worker1
 bash "$root_dir/scripts/onboard-node" > /dev/null
 mapfile -t calls < "$CVP_ONBOARD_TEST_CALLS"
-[[ "${#calls[@]}" -eq 6 ]] || {
+[[ "${#calls[@]}" -eq 7 ]] || {
   printf '%s\n' 'confirmed server onboarding did not run its checks' >&2
   exit 1
 }

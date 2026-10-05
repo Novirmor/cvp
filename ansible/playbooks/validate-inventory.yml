@@ -1,0 +1,36 @@
+---
+- name: Load persistent operator configuration for inventory validation
+  ansible.builtin.import_playbook: load-operator-config.yml
+
+- name: Require a configured fleet even when the inventory has no hosts
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    ansible_become: false
+    ansible_connection: local
+  tasks:
+    - name: Require at least one configured WireGuard inventory host
+      ansible.builtin.assert:
+        that: groups.get('wireguard', []) | length > 0
+        fail_msg: Inventory is unconfigured; add hosts to wireguard and their K3s role groups before validation.
+
+- name: Validate topology and node tags entirely on the controller
+  hosts: wireguard
+  connection: local
+  gather_facts: false
+  become: false
+  run_once: true
+  any_errors_fatal: true
+  vars:
+    ansible_become: false
+    ansible_connection: local
+  tasks:
+    - name: Validate the complete inventory topology
+      ansible.builtin.include_tasks: tasks/validate-topology.yml
+
+    - name: Validate every inventory node tag declaration
+      ansible.builtin.include_tasks: tasks/validate-node-tags.yml
+      vars:
+        node_tag_validation_hosts: "{{ groups['wireguard'] }}"

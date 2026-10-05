@@ -1,0 +1,57 @@
+---
+- name: Validate the complete inventory topology on the controller
+  run_once: true
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  block:
+    - name: Select only public topology fields from global host data
+      ansible.builtin.set_fact:
+        cvp_topology_data: >-
+          {%- set ns = namespace(hosts={}, groups={}) -%}
+          {%- set operator = (cvp_operator_configuration.stdout | default('{}')) | from_json -%}
+          {%- for group in ['wireguard', 'k3s_servers', 'k3s_agents', 'ingress'] -%}
+            {%- set ns.groups = ns.groups | combine({group: groups[group] | default([])}) -%}
+          {%- endfor -%}
+          {%- for host in groups['wireguard'] | default([]) -%}
+            {%- set row = namespace(values={}) -%}
+            {%- for key in ['node_name', 'k3s_role', 'k3s_server_init', 'k3s_cluster_init_host',
+                            'k3s_server_host', 'k3s_datastore', 'wireguard_address', 'wireguard_public_key',
+                            'wireguard_peers_group', 'k3s_node_labels', 'k3s_node_taints', 'storage_enabled',
+                            'storage_mountpoint', 'k3s_default_local_storage_path'] -%}
+              {%- set row.values = row.values | combine({key: hostvars[host][key] | default(none)}) -%}
+              {%- if key in ['storage_enabled', 'storage_mountpoint'] and
+                      not (hostvars[host]['cvp_operator_config_loaded'] | default(false)) -%}
+                {%- set overrides = operator.get('cvp_operator_defaults', {})
+                    | combine(operator.get('cvp_operator_hosts', {}).get(host, {})) -%}
+                {%- if key in overrides -%}
+                  {%- set row.values = row.values | combine({key: overrides[key]}) -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set ns.hosts = ns.hosts | combine({host: row.values}) -%}
+          {%- endfor -%}
+          {{ {'groups': ns.groups, 'hosts': ns.hosts} }}
+      no_log: true
+
+    - name: Check global topology even when the play is limited
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -B
+          - "{{ playbook_dir }}/../../scripts/cvp-topology.py"
+          - topology
+        stdin: >-
+          {{ {'topology': cvp_topology_data,
+              'allow_empty': cvp_topology_allow_empty | default(false)} | to_json }}
+      register: cvp_topology_result
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Require a valid global topology
+      ansible.builtin.assert:
+        that: cvp_topology_result.rc == 0
+        fail_msg: "{{ cvp_topology_result.stderr }}"

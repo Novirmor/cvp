@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$root_dir"
 export ANSIBLE_HOST_KEY_CHECKING=True
+export ANSIBLE_SSH_HOST_KEY_CHECKING=True ANSIBLE_TRANSPORT=ssh
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -20,21 +21,18 @@ public_key_file="${CVP_ACCESS_PUBLIC_KEY_FILE:-}"
 [[ "$public_key_file" == /* && -f "$public_key_file" && -r "$public_key_file" ]] ||
   fail 'CVP_ACCESS_PUBLIC_KEY_FILE must be a readable absolute path to one approved public key'
 
-root_ssh_args=()
-operator_ssh_args=()
+root_ssh_args=(-e "$(python3 -B scripts/cvp_wrapper_common.py ssh-options root)")
+operator_ssh_args=(-e "$(python3 -B scripts/cvp_wrapper_common.py ssh-options ops)")
 for identity in ROOT OPERATOR; do
   variable="CVP_ACCESS_${identity}_IDENTITY_FILE"
   path="${!variable:-}"
   [[ -n "$path" ]] || continue
-  [[ "$path" == /* && -f "$path" && -r "$path" ]] ||
-    fail "$variable must be a readable absolute path"
-  case "$path" in
-    "$root_dir"/*) fail "$variable must be stored outside the repository" ;;
-  esac
+  path="$(python3 -B scripts/cvp_wrapper_common.py external-file "$path")" ||
+    fail "$variable must be a readable absolute path outside the repository"
   if [[ "$identity" == ROOT ]]; then
-    root_ssh_args=(--private-key "$path")
+    root_ssh_args=(-e "$(python3 -B scripts/cvp_wrapper_common.py ssh-options root "$path")")
   else
-    operator_ssh_args=(--private-key "$path")
+    operator_ssh_args=(-e "$(python3 -B scripts/cvp_wrapper_common.py ssh-options ops "$path")")
   fi
 done
 
@@ -52,6 +50,7 @@ ssh-keygen -lf "$public_key_file" > /dev/null || fail 'ssh-keygen rejected the p
 
 inventory="$(ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-inventory \
   -i ansible/inventory/hosts.yml --list)" || fail 'could not read the Ansible inventory'
+printf '%s\n' "$inventory" | python3 -B scripts/cvp_wrapper_common.py ssh-inventory
 printf '%s\n' "$inventory" | python3 -c '
 import json
 import sys
@@ -60,6 +59,8 @@ data = json.load(sys.stdin)
 node = sys.argv[1]
 if node not in data.get("wireguard", {}).get("hosts", []):
     sys.exit(f"{node} must be in the wireguard inventory group")
+if node in data:
+    sys.exit(f"{node}: a node name must not collide with an inventory group")
 host = data.get("_meta", {}).get("hostvars", {}).get(node, {})
 if host.get("node_name") != node or not host.get("ansible_host"):
     sys.exit(f"{node} needs a matching node_name and an SSH endpoint")

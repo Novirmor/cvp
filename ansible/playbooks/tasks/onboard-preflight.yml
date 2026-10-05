@@ -1,0 +1,111 @@
+---
+- name: Revalidate the complete inventory before onboarding
+  ansible.builtin.include_tasks: validate-topology.yml
+  run_once: true
+
+- name: Validate the requested onboarding operation on the controller
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -B
+      - "{{ playbook_dir }}/../../scripts/cvp-topology.py"
+      - onboard-intent
+    stdin: >-
+      {{ {'topology': cvp_topology_data, 'target': cvp_onboard_node | default(none),
+          'server_confirmation': cvp_onboard_server_confirm | default('')} | to_json }}
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  register: cvp_onboard_intent
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  run_once: true
+  no_log: true
+
+- name: Require a confirmed joining node
+  ansible.builtin.assert:
+    that: cvp_onboard_intent.rc == 0
+    fail_msg: "{{ cvp_onboard_intent.stderr }}"
+  run_once: true
+
+- name: Read control plane readiness through the designated server
+  ansible.builtin.command:
+    argv:
+      - "{{ hostvars[cvp_api_server]['k3s_bin_path'] }}"
+      - kubectl
+      - --kubeconfig=/etc/rancher/k3s/k3s.yaml
+      - --request-timeout=30s
+      - get
+      - --raw=/readyz
+  delegate_to: "{{ cvp_api_server }}"
+  become: true
+  vars:
+    cvp_api_server: "{{ cvp_topology_data.hosts[cvp_onboard_node].k3s_server_host }}"
+  register: cvp_onboard_readyz
+  changed_when: false
+  failed_when: cvp_onboard_readyz.rc != 0 or cvp_onboard_readyz.stdout | trim != 'ok'
+  check_mode: false
+  run_once: true
+
+- name: Read every cluster node through the designated server
+  kubernetes.core.k8s_info:
+    kubeconfig: /etc/rancher/k3s/k3s.yaml
+    api_version: v1
+    kind: Node
+  delegate_to: "{{ cvp_api_server }}"
+  become: true
+  vars:
+    cvp_api_server: "{{ cvp_topology_data.hosts[cvp_onboard_node].k3s_server_host }}"
+  register: cvp_onboard_nodes
+  check_mode: false
+  run_once: true
+  no_log: true
+
+- name: Validate actual cluster membership on the controller
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -B
+      - "{{ playbook_dir }}/../../scripts/cvp-topology.py"
+      - onboard
+    stdin: >-
+      {%- set ns = namespace(nodes=[]) -%}
+      {%- for node in cvp_onboard_nodes.resources -%}
+        {%- set selected = namespace(labels={}, addresses=[], conditions=[]) -%}
+        {%- for key in ['node-role.kubernetes.io/control-plane', 'node-role.kubernetes.io/master',
+                        'node-role.kubernetes.io/etcd', 'cvp.io/role'] -%}
+          {%- if key in node.metadata.labels | default({}) -%}
+            {%- set selected.labels = selected.labels | combine({key: node.metadata.labels[key]}) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- for address in node.status.addresses | default([]) if address.type == 'InternalIP' -%}
+          {%- set selected.addresses = selected.addresses + [{'type': address.type, 'address': address.address}] -%}
+        {%- endfor -%}
+        {%- for condition in node.status.conditions | default([]) if condition.type == 'Ready' -%}
+          {%- set selected.conditions = selected.conditions + [{'type': condition.type, 'status': condition.status}] -%}
+        {%- endfor -%}
+        {%- set ns.nodes = ns.nodes + [{'metadata': {'name': node.metadata.name, 'labels': selected.labels,
+            'deletionTimestamp': node.metadata.deletionTimestamp | default(none)},
+            'status': {'addresses': selected.addresses, 'conditions': selected.conditions}}] -%}
+      {%- endfor -%}
+      {{ {'topology': cvp_topology_data, 'target': cvp_onboard_node,
+          'server_confirmation': cvp_onboard_server_confirm | default(''),
+          'nodes': ns.nodes} | to_json }}
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_become: false
+  register: cvp_onboard_membership
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  run_once: true
+  no_log: true
+
+- name: Require initialized healthy inventory membership
+  ansible.builtin.assert:
+    that: cvp_onboard_membership.rc == 0
+    fail_msg: "{{ cvp_onboard_membership.stderr }}"
+  run_once: true

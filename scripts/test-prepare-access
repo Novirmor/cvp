@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+unset CVP_ACCESS_ROOT_IDENTITY_FILE CVP_ACCESS_OPERATOR_IDENTITY_FILE
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 mkdir "$work_dir/bin"

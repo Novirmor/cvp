@@ -45,6 +45,7 @@
         test -x /usr/bin/apt-get &&
         grep -Eq '(^ID=(debian|ubuntu)$|^ID_LIKE=.*debian)' /etc/os-release
       changed_when: false
+      check_mode: false
 
     - name: Check minimal Ansible prerequisites
       ansible.builtin.raw: >-
@@ -54,6 +55,7 @@
         grep -qx 'install ok installed'
       register: bootstrap_prerequisites
       changed_when: false
+      check_mode: false
       failed_when: false
 
     - name: Install Python, sudo, and host-probe tools if absent
@@ -61,7 +63,26 @@
         DEBIAN_FRONTEND=noninteractive apt-get update &&
         DEBIAN_FRONTEND=noninteractive apt-get install -y
         python3 python3-apt sudo kmod procps
-      when: bootstrap_prerequisites.rc != 0
+      when:
+        - bootstrap_prerequisites.rc != 0
+        - not ansible_check_mode
+      changed_when: true
+
+    - name: Report deferred bootstrap when prerequisites are missing
+      ansible.builtin.debug:
+        msg: >-
+          Deferred in check mode: install Python, sudo, and host-probe prerequisites,
+          then create ops, install its approved keys, and grant sudo access.
+          Account and directory state cannot be verified until prerequisites exist.
+      when:
+        - ansible_check_mode
+        - bootstrap_prerequisites.rc != 0
+
+    - name: Defer Python-dependent bootstrap until prerequisites exist
+      ansible.builtin.meta: end_host
+      when:
+        - ansible_check_mode
+        - bootstrap_prerequisites.rc != 0
 
     - name: Create the operator account
       ansible.builtin.user:
@@ -72,6 +93,30 @@
         append: true
         state: present
 
+    - name: Discover the existing operator account in check mode
+      ansible.builtin.getent:
+        database: passwd
+        key: ops
+        fail_key: false
+      when: ansible_check_mode
+
+    - name: Inspect the existing operator home in check mode
+      ansible.builtin.stat:
+        path: "{{ ansible_facts.getent_passwd.ops[4] }}"
+      register: bootstrap_operator_home
+      when:
+        - ansible_check_mode
+        - ansible_facts.getent_passwd.ops is not none
+
+    - name: Report deferred keys when the operator home is unknown
+      ansible.builtin.debug:
+        msg: >-
+          Deferred in check mode: approved SSH keys require an existing ops account
+          and home directory. Re-run bootstrap after creating them to verify key changes.
+      when:
+        - ansible_check_mode
+        - not (bootstrap_operator_home.stat.isdir | default(false))
+
     - name: Install approved SSH public keys for the operator
       ansible.posix.authorized_key:
         user: ops
@@ -80,6 +125,7 @@
         manage_dir: true
       loop: "{{ bootstrap_admin_keys }}"
       no_log: true
+      when: not ansible_check_mode or (bootstrap_operator_home.stat.isdir | default(false))
 
     - name: Grant the operator passwordless sudo
       ansible.builtin.copy:

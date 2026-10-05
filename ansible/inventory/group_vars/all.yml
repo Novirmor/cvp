@@ -6,6 +6,8 @@ base_packages:
   - ca-certificates
   - conntrack
   - curl
+  - diffutils
+  - e2fsprogs
   - age
   - findutils
   - iproute2
@@ -102,12 +104,19 @@ firewall_manage: true
 # declare the interface explicitly; never guess an interface for a firewall.
 firewall_external_interface: >-
   {{ ansible_default_ipv4.interface
-     | default(ansible_default_ipv6.interface | default(''), true) }}
+      | default(ansible_default_ipv6.interface | default(''), true) }}
+firewall_external_ipv4_interface: >-
+  {{ firewall_external_interface | default(ansible_default_ipv4.interface | default(''), true) }}
+firewall_external_ipv6_interface: >-
+  {{ ansible_default_ipv6.interface | default(firewall_external_interface, true) }}
+firewall_external_interfaces: >-
+  {{ [firewall_external_ipv4_interface, firewall_external_ipv6_interface]
+     | reject('equalto', '') | unique | list }}
 # IPv6 router advertisements must still be accepted when forwarding is on.
 # Include the IPv6 default-route uplink when it differs from the IPv4 one.
 base_ra_interfaces: >-
-  {{ ([firewall_external_interface, ansible_default_ipv6.interface | default('')]
-      | reject('equalto', '') | unique) | list }}
+  {{ ((firewall_external_interfaces + [ansible_default_ipv6.interface | default('')])
+       | reject('equalto', '') | unique) | list }}
 firewall_public_ingress_ports:
   - 80
   - 443
@@ -127,18 +136,18 @@ storage_mountpoint: /var/lib/rancher/k3s/storage
 storage_mount_options: defaults,noatime
 storage_manage_device: false
 storage_allow_format: false
+storage_format_confirmation: ""
 storage_directory_mode: "0750"
 
 k3s_version: v1.35.4+k3s1
 k3s_arch: amd64
-k3s_binary_name: k3s
+k3s_binary_name: "{{ 'k3s' if k3s_arch == 'amd64' else 'k3s-' ~ k3s_arch }}"
 k3s_bin_path: /usr/local/bin/k3s
 k3s_binary_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/{{ k3s_binary_name }}"
 k3s_checksum_url: "https://github.com/k3s-io/k3s/releases/download/{{ k3s_version }}/sha256sum-{{ k3s_arch }}.txt"
 k3s_data_dir: /var/lib/rancher/k3s
 k3s_config_path: /etc/rancher/k3s/config.yaml
 k3s_datastore: etcd
-k3s_cluster_init_host: ""
 k3s_node_taints: []
 k3s_cluster_cidr: 10.42.0.0/16
 k3s_service_cidr: 10.43.0.0/16
@@ -159,6 +168,7 @@ k3s_agent_token_path: /etc/rancher/k3s/agent-token
 # Backup is opt-in until the operator supplies an age recipient and an upload
 # command for the selected off-host store. The recipient is public key material.
 k3s_backup_enabled: false
+k3s_backup_disable_confirm: ""
 k3s_backup_dir: /var/backups/k3s
 k3s_backup_script_path: /usr/local/sbin/k3s-backup
 k3s_backup_service_name: cvp-k3s-backup.service

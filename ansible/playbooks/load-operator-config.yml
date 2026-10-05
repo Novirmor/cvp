@@ -1,0 +1,35 @@
+---
+- name: Load validated host-scoped operator settings before host access
+  hosts: wireguard
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Validate the persistent operator configuration on the controller
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -B
+          - "{{ playbook_dir }}/../../scripts/cvp_wrapper_common.py"
+          - operator-load
+        stdin: "{{ groups['all'] | to_json }}"
+      delegate_to: localhost
+      vars:
+        ansible_become: false
+      run_once: true
+      check_mode: false
+      changed_when: false
+      register: cvp_operator_configuration
+      no_log: true
+
+    - name: Apply defaults and only this host's validated operator settings
+      ansible.builtin.set_fact:
+        "{{ item.key }}": "{{ item.value }}"
+      loop: "{{ operator_values | dict2items }}"
+      vars:
+        operator_config: "{{ cvp_operator_configuration.stdout | from_json }}"
+        operator_values: >-
+          {{ {'cvp_operator_config_loaded': true}
+             | combine(operator_config.get('cvp_operator_defaults', {}))
+             | combine(operator_config.get('cvp_operator_hosts', {}).get(inventory_hostname, {})) }}
+      no_log: true

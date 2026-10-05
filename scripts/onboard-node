@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$root_dir"
+export ANSIBLE_HOST_KEY_CHECKING=True
+export ANSIBLE_SSH_HOST_KEY_CHECKING=True ANSIBLE_TRANSPORT=ssh
+ssh_options="$(python3 -B scripts/cvp_wrapper_common.py ssh-options)"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -15,19 +18,47 @@ node="${CVP_ONBOARD_NODE:-}"
 [[ "${CVP_ONBOARD_CONFIRM:-}" == "$node" ]] ||
   fail 'set CVP_ONBOARD_CONFIRM to the same node name after reviewing the host and deployment gates'
 
-site_args=()
-if [[ -n "${CVP_ONBOARD_SITE_VARS_FILE:-}" ]]; then
-  vars_file="$CVP_ONBOARD_SITE_VARS_FILE"
-  [[ "$vars_file" == /* && -f "$vars_file" && -r "$vars_file" ]] ||
-    fail 'CVP_ONBOARD_SITE_VARS_FILE must be a readable absolute path outside this repository'
-  case "$vars_file" in
-    "$root_dir"/*) fail 'site vars must not be stored inside the repository' ;;
-  esac
-  site_args=(-e "@$vars_file")
+if [[ -n "${CVP_ONBOARD_SITE_VARS_FILE:-}" && -n "${CVP_OPERATOR_CONFIG_FILE:-}" ]]; then
+  fail 'set only CVP_OPERATOR_CONFIG_FILE; CVP_ONBOARD_SITE_VARS_FILE is a deprecated alias'
 fi
+config_file="${CVP_OPERATOR_CONFIG_FILE:-${CVP_ONBOARD_SITE_VARS_FILE:-}}"
+unset CVP_OPERATOR_CONFIG_SHA256 CVP_OPERATOR_CONFIG_ABSENT
+if [[ -z "$config_file" ]]; then
+  config_file="$(python3 -B scripts/cvp_wrapper_common.py operator-path)" ||
+    fail 'invalid default operator configuration'
+fi
+if [[ -n "$config_file" ]]; then
+  config_file="$(python3 -B scripts/cvp_wrapper_common.py operator-config "$config_file")" ||
+    fail 'invalid operator configuration'
+  export CVP_OPERATOR_CONFIG_FILE="$config_file"
+  CVP_OPERATOR_CONFIG_SHA256="$(python3 -B scripts/cvp_wrapper_common.py operator-digest "$config_file")"
+  export CVP_OPERATOR_CONFIG_SHA256
+else
+  export CVP_OPERATOR_CONFIG_ABSENT=1
+fi
+unset CVP_ONBOARD_SITE_VARS_FILE
+
+check_config() {
+  if [[ -z "$config_file" ]]; then
+    python3 -B scripts/cvp_wrapper_common.py operator-path > /dev/null ||
+      fail 'operator configuration appeared during onboarding; review it and start a new run'
+    return
+  fi
+  local digest
+  digest="$(python3 -B scripts/cvp_wrapper_common.py operator-digest "$config_file")" ||
+    fail 'operator configuration became invalid during onboarding'
+  [[ "$digest" == "$CVP_OPERATOR_CONFIG_SHA256" ]] ||
+    fail 'operator configuration changed during onboarding; review it and start a new run'
+}
 
 inventory="$(ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-inventory \
   -i ansible/inventory/hosts.yml --list)" || fail 'could not read the Ansible inventory'
+printf '%s\n' "$inventory" | python3 -B scripts/cvp_wrapper_common.py ssh-inventory
+
+if [[ -n "$config_file" ]]; then
+  printf '%s\n' "$inventory" | python3 -B scripts/cvp_wrapper_common.py operator-inventory "$config_file" ||
+    fail 'operator configuration does not match inventory'
+fi
 
 role="$(printf '%s\n' "$inventory" | python3 -c '
 import json
@@ -44,6 +75,8 @@ def reject(message):
 
 if not registered("wireguard"):
     reject(f"{node} must be in the wireguard group")
+if node in data:
+    reject(f"{node}: a node name must not collide with an inventory group")
 server = registered("k3s_servers")
 agent = registered("k3s_agents")
 if server == agent:
@@ -68,20 +101,32 @@ print("server" if server else "agent")
 printf 'Checking repository and inventory for %s...\n' "$node"
 mise exec -- task test
 
-printf 'Probing host capabilities on %s (read-only)...\n' "$node"
+onboard_vars="$(python3 -c 'import json,sys; print(json.dumps({"cvp_onboard_node":sys.argv[1], "cvp_onboard_server_confirm":sys.argv[2]}))' \
+  "$node" "${CVP_ONBOARD_SERVER_CONFIRM:-}")"
+printf 'Checking the initialized control plane and fleet membership...\n'
+check_config
 ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/probe.yml --limit "$node"
+  -i ansible/inventory/hosts.yml ansible/playbooks/onboard-preflight.yml \
+  -e "$ssh_options" -e "$onboard_vars"
+
+printf 'Probing host capabilities on %s (read-only)...\n' "$node"
+check_config
+ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
+  -i ansible/inventory/hosts.yml ansible/playbooks/probe.yml --limit "$node" -e "$ssh_options"
 
 printf 'Converging the full fleet to distribute the new WireGuard peer...\n'
+check_config
 ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/site.yml "${site_args[@]}"
+  -i ansible/inventory/hosts.yml ansible/playbooks/site.yml -e "$ssh_options" -e "$onboard_vars"
 
 printf 'Checking %s WireGuard peers and path MTU...\n' "$node"
+check_config
 ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/probe-wireguard.yml --limit "$node"
+  -i ansible/inventory/hosts.yml ansible/playbooks/probe-wireguard.yml --limit "$node" -e "$ssh_options"
 
 printf 'Verifying all hosts and cluster nodes...\n'
+check_config
 ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook \
-  -i ansible/inventory/hosts.yml ansible/playbooks/verify.yml
+  -i ansible/inventory/hosts.yml ansible/playbooks/verify.yml -e "$ssh_options"
 
 printf 'Onboarding verified for %s.\n' "$node"
