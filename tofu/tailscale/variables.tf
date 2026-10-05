@@ -4,8 +4,8 @@ variable "tailnet" {
   nullable    = false
 
   validation {
-    condition     = var.tailnet != "" && var.tailnet == trimspace(var.tailnet)
-    error_message = "tailnet must be a non-empty tailnet ID or domain."
+    condition     = var.tailnet != "" && var.tailnet != "-" && var.tailnet == trimspace(var.tailnet)
+    error_message = "tailnet must be an explicit tailnet ID or domain; the credential-relative '-' alias is forbidden."
   }
 }
 

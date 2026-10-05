@@ -76,6 +76,7 @@ locals {
 # resources below. triggers_replace (not input, which only stores state) makes
 # a tailnet change force replacement of this resource, and prevent_destroy
 # blocks it, forcing an explicit, reviewed migration instead.
+# The guarded establish-identity operation creates this in empty state before imports.
 resource "terraform_data" "tailnet_identity" {
   input            = var.tailnet
   triggers_replace = [var.tailnet]
@@ -86,6 +87,8 @@ resource "terraform_data" "tailnet_identity" {
 }
 
 resource "tailscale_acl" "policy" {
+  depends_on = [terraform_data.tailnet_identity]
+
   acl = jsonencode(local.policy)
 
   # Import the existing policy before managing it; a first apply must not
@@ -103,6 +106,8 @@ resource "tailscale_acl" "policy" {
 }
 
 resource "tailscale_dns_configuration" "tailnet" {
+  depends_on = [terraform_data.tailnet_identity]
+
   magic_dns          = var.magic_dns
   override_local_dns = var.override_local_dns
   search_paths       = var.search_paths

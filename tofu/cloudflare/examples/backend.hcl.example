@@ -12,4 +12,4 @@ use_lockfile  = true
 # Note: use_lockfile locking requires S3 conditional writes (If-None-Match);
 # if the store does not implement them, set use_lockfile = false and use a
 # lock-table-capable endpoint instead.
-# endpoint = "https://replace-with-s3-compatible-endpoint"
+# endpoints = { s3 = "https://replace-with-s3-compatible-endpoint" }
