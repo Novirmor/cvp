@@ -14,18 +14,23 @@ loss.
 Each milestone finishes with executable evidence. A file existing in Git is not
 deployment evidence.
 
+A ticked item is implemented in this repository and covered by the
+credential-free checks (`task lint`, `task test`, `task security`, and the
+isolated dataplane tasks). No item that requires a live host, cluster, provider
+account, or restore drill is ticked, and no exit gate has been passed yet.
+
 ## M0: Repository foundation
 
 ### Deliverables
 
-- [ ] Pin the complete local toolchain in `mise.toml`: Ansible, OpenTofu,
+- [x] Pin the complete local toolchain in `mise.toml`: Ansible, OpenTofu,
   kubectl, Helm, Flux, Kustomize, SOPS, age, Task, and security linters.
-- [ ] Add one local CI workflow that runs `task lint`, `task test`, and
+- [x] Add one local CI workflow that runs `task lint`, `task test`, and
   `task security`; do not create another reusable-workflow repository.
-- [ ] Add YAML, Ansible, Kubernetes, shell, OpenTofu, action, and secret linting.
-- [ ] Define naming and labels once for nodes, namespaces, applications, and
+- [x] Add YAML, Ansible, Kubernetes, shell, OpenTofu, action, and secret linting.
+- [x] Define naming and labels once for nodes, namespaces, applications, and
   backup objects.
-- [ ] Add Renovate or Dependabot for container, Helm, action, and tool pins.
+- [x] Add Renovate or Dependabot for container, Helm, action, and tool pins.
 
 ### Exit gate G0
 
@@ -60,18 +65,18 @@ deployment evidence.
 
 ### Deliverables
 
-- [ ] Keep default inventory empty; document operator-supplied K3s roles,
+- [x] Keep default inventory empty; document operator-supplied K3s roles,
   WireGuard addresses, public endpoints, Tailscale addresses, and storage intent.
-- [ ] Implement local roles: `base`, `firewall`, `tailscale`, `wireguard`,
+- [x] Implement local roles: `base`, `firewall`, `tailscale`, `wireguard`,
   `storage`, `k3s_server`, and `k3s_agent`.
-- [ ] Use local roles and pinned public Ansible collections.
+- [x] Use local roles and pinned public Ansible collections.
 - [ ] Pin package sources and K3s artifacts; verify checksums or signatures.
-- [ ] Make WireGuard converge before K3s.
-- [ ] Bind K3s node traffic to `wg0` and prevent cluster ports on public
+- [x] Make WireGuard converge before K3s.
+- [x] Bind K3s node traffic to `wg0` and prevent cluster ports on public
   interfaces.
-- [ ] Add a read-only host verification playbook.
+- [x] Add a read-only host verification playbook.
 - [ ] Add an idempotence check and reboot-persistence test.
-- [ ] Implement a host-level encrypted backup for the K3s datastore (embedded
+- [x] Implement a host-level encrypted backup for the K3s datastore (embedded
   etcd snapshot, or SQLite in single-server mode) and the matching server and
   agent tokens.
 
@@ -90,7 +95,7 @@ deployment evidence.
   `k3s_cluster_init_host` and `k3s_server_host`, and set its
   `k3s_server_init: true` before initial host bootstrap.
 - [ ] Initialize the selected K3s server with embedded etcd (`cluster-init`).
-- [ ] Add subsequent servers or agents through the onboarding helper over the
+- [ ] Add subsequent servers or agents with `task node-join` over the
   selected server's mesh address (example `192.0.2.1:6443`), reviewing quorum
   impact for each server addition.
 - [ ] Label nodes with the boolean `cvp.io/*` allocation tags (`compute`,
@@ -120,16 +125,16 @@ deployment evidence.
   `cluster/flux-system/source.yaml` with the reviewed repository URL and branch.
 - [ ] Bootstrap Flux with a read-only deploy key, explicitly supplying
   `FLUX_GITHUB_OWNER` and `FLUX_GITHUB_REPOSITORY`.
-- [ ] Define ordered Flux Kustomizations for policy, infrastructure, data, apps,
+- [x] Define ordered Flux Kustomizations for policy, infrastructure, data, apps,
   and operations.
-- [ ] Enable pruning and drift correction.
+- [x] Enable pruning and drift correction.
 - [ ] Recover or generate one age key for the cluster, store its private half in
   an operator-chosen external secrets store, and seed it into `flux-system` through
   `scripts/bootstrap-flux`; Ansible never owns this key.
 - [ ] Add `.sops.yaml` rules that encrypt only Secret payloads.
 - [ ] Prove that Git contains no plaintext secret and Flux can restore an
   encrypted test Secret after deletion.
-- [ ] Document a break-glass Flux suspend, reconcile, and recovery procedure.
+- [x] Document a break-glass Flux suspend, reconcile, and recovery procedure.
 
 ### Exit gate G4
 
@@ -152,7 +157,7 @@ deployment evidence.
   read-only root filesystems where possible, and bounded temporary storage.
 - [ ] Define minimal service accounts and RBAC.
 - [ ] Validate manifests against the exact cluster Kubernetes version.
-- [ ] Add policy tests for prohibited host networking, host paths, privileged
+- [x] Add policy tests for prohibited host networking, host paths, privileged
   containers, mutable production tags, and unbounded resources.
 
 ### Exit gate G5
@@ -165,18 +170,18 @@ deployment evidence.
 
 ### Deliverables
 
-- [ ] Maintain separate Cloudflare and Tailscale OpenTofu roots in `tofu/` without
+- [x] Maintain separate Cloudflare and Tailscale OpenTofu roots in `tofu/` without
   combining their state with Kubernetes or application state.
 - [ ] Review external resource ownership before applying; import resources when
   adopting objects already managed outside these roots.
 - [ ] Point a disposable hostname at the selected ingress node.
-- [ ] Configure Traefik through a Git-managed K3s `HelmChartConfig`.
+- [x] Configure Traefik through a Git-managed K3s `HelmChartConfig`.
 - [ ] Deploy cert-manager only if Traefik's maintained K3s configuration cannot
   satisfy the required certificate lifecycle cleanly.
 - [ ] Use a scoped Cloudflare token for DNS-01 when DNS-01 is required.
 - [ ] Verify HTTP-to-HTTPS redirect, certificate renewal, client IP handling,
   request limits, and ingress resource isolation.
-- [ ] Write the ingress relocation procedure for moving traffic to another node.
+- [x] Write the ingress relocation procedure for moving traffic to another node.
 
 ### Exit gate G6
 
