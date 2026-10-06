@@ -1,5 +1,14 @@
 # Contributing
 
+## Platform, not instance
+
+This repository is the shared platform. Hosts, applications, secrets, and
+operator-specific settings never belong here; they live in instance
+repositories (`task new-instance`). Platform changes must keep working for
+every instance: change defaults in `ansible/defaults/`, keep `tasks/ops.yml`
+task names stable, and note anything an instance must do on upgrade in
+`CHANGELOG.md`.
+
 ## Rules
 
 - Keep host configuration in Ansible and in-cluster resources under Flux.

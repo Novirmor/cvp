@@ -1,17 +1,50 @@
 # CVP
 
-Infrastructure and GitOps repository for an operator-configured K3s platform
-using standard Kubernetes resources.
+A reusable platform for running a small K3s cluster on ordinary hosts: Debian
+nodes joined by a WireGuard mesh, administered over SSH, reached by people
+through Tailscale, serving the public through Cloudflare, and reconciled from
+Git by Flux. Standard Kubernetes resources only; recovery over high
+availability.
+
+## Platform and instances
+
+This repository is the **platform**: Ansible roles, guarded operator scripts,
+cluster policy/ingress/operations layers, OpenTofu roots, tests, and runbooks.
+It contains no hosts and no secrets. Each operator runs their own **instance
+repository**, which pins a platform commit as a `platform/` submodule and holds
+only what is theirs:
+
+| Instance path | Contents |
+| --- | --- |
+| `platform/` | This repository, pinned to one commit |
+| `inventory/` | Hosts, host vars, overrides of platform defaults |
+| `cluster/flux-system/` | Flux entry point: the instance's own source, the pinned `cvp-platform` source, the reconciliation graph |
+| `cluster/apps/` | The instance's applications |
+| `Taskfile.yml` | Includes every platform task; adds `validate` and `platform-upgrade` |
+
+Flux pulls the platform layers (policy, ingress, operations, data) from the
+pinned platform commit and the applications from the instance, and every layer
+is rendered and policy-checked before bootstrap. Upgrading is one command in the
+instance (`task platform-upgrade -- v0.2.0`) followed by review and a push.
 
 ## Quickstart
 
 You need a controller (your machine) and one host with a public IP.
 
-1. **Controller, once:** install [mise](https://mise.jdx.dev/getting-started.html),
-   then in this checkout run `mise install`. Make sure the controller is joined
-   to your tailnet.
+1. **Create your instance** from a platform checkout. Use the public URL of the
+   platform repository you will track; nothing is pushed for you:
+
+   ```sh
+   git clone https://github.com/OWNER/cvp.git && cd cvp
+   mise install
+   task new-instance -- ../my-platform --platform-url https://github.com/OWNER/cvp.git
+   cd ../my-platform && mise install && task validate
+   ```
+
+   Push `my-platform` to a **private** repository of your own.
 2. **Host:** in your provider's panel, install **Debian 13 (trixie), amd64**
-   with an SSH server and a root password (or your root SSH key).
+   with an SSH server and a root password (or your root SSH key). Make sure the
+   controller is joined to your tailnet.
 3. **Provider console:** read the host's SSH fingerprint there (not over SSH):
 
    ```sh
@@ -20,7 +53,7 @@ You need a controller (your machine) and one host with a public IP.
 
 4. **Tailscale admin console:** create an auth key tagged `tag:k3s` (and
    `tag:k3s-ingress` for the first host).
-5. **Controller:** run the guided setup and answer its questions:
+5. **In your instance**, run the guided setup and answer its questions:
 
    ```sh
    task init
@@ -45,7 +78,7 @@ Then: point your public names at the first host through Cloudflare (proxied),
 ## I want to run the steps myself
 
 **Use [the node runbook](docs/runbooks/nodes.md).** `task init` only chains
-these commands, which you can run one at a time:
+these commands, which you can run one at a time in your instance:
 
 ```sh
 task node-new -- server1 --ssh 203.0.113.20 --virt vm --mesh-address 10.77.0.1 \
@@ -79,11 +112,12 @@ matches repository dependencies; it is not a claim of live deployment testing.
 | Public DNS or tailnet policy adoption | [External providers](docs/runbooks/tofu.md) |
 | Production data or recovery | [Backup enablement](ansible/README.md#backup-enablement) and [disposable restore drill](ansible/README.md#datastore-restore) |
 
-The default inventory contains **no hosts** and provisions none. Both
+A new instance's inventory contains **no hosts** and provisions none. Both
 `k3s_cluster_init_host` and `k3s_server_host` default to empty; `task node-new`
-selects the first node for both in `ansible/inventory/hosts.yml`'s `all.vars` so
-later nodes inherit the same selections. Examples use a replaceable RFC1918 mesh `/24`; choose an
-unused subnet, not a documentation-only address range. Public example IPs and
+selects the first node for both in the instance's `inventory/hosts.yml`
+`all.vars` so later nodes inherit the same selections. Examples use a
+replaceable RFC1918 mesh `/24`; choose an unused subnet, not a
+documentation-only address range. Public example IPs and
 all credential/identity placeholders must be replaced.
 
 ## Operating model
@@ -104,10 +138,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) and [PLAN.md](PLAN.md).
 
 ```text
 ansible/                 Host and K3s bootstrap
+  defaults/              Platform defaults, loaded before every instance inventory
 cluster/                 Flux-managed Kubernetes desired state
-  flux-system/           Flux bootstrap and reconciliation graph
-  infrastructure/        Cluster-wide controllers and policy
-  apps/                  Application workloads
+  flux-system/           Flux components and the single-repository graph
+  infrastructure/        Cluster-wide policy and ingress (pulled by instances)
+  operations/, data/     Operations and data layers (pulled by instances)
+  apps/                  Example applications (copied into new instances)
+tasks/ops.yml            Operational tasks, included by every instance Taskfile
+templates/instance/      Files a new instance starts from (task new-instance)
+examples/instance/       The empty example instance the platform tests run against
 tofu/                    External Cloudflare and Tailscale resources
 tests/                   Policy tests for rendered cluster manifests
 docs/                    Runbooks and durable decisions
@@ -137,8 +176,7 @@ to pick up the added Python dependencies. Controller prerequisites include Git,
 Python/PyYAML, `sqlite3`, and OpenSSH client/server tools. Local tests need
 `ssh-keygen` and a real OpenSSH `sshd` parser on `PATH` or selected through
 `CVP_TEST_SSHD` (for example `/usr/sbin/sshd`); the parser test does not start a
-daemon. Install `wireguard-tools` for onboarding key generation. The first-host
-runbook includes a Debian controller package command.
+daemon. The node runbook includes a Debian controller package command.
 
 Linux kernel integration checks run separately, without sudo/root, in disposable
 unprivileged user/network namespaces:
@@ -189,8 +227,9 @@ to lock shared dependencies. Failed site operations can retain
 explicit cleanup. Locks are never stolen automatically.
 
 Keep persistent operator settings outside Git in
-`$XDG_CONFIG_HOME/cvp/operator.yml` (default `~/.config/cvp/operator.yml`), or
-select an absolute external path with `CVP_OPERATOR_CONFIG_FILE`. Credentials
+`$XDG_CONFIG_HOME/cvp/<instance>/operator.yml` (default
+`~/.config/cvp/<instance>/operator.yml`; generated keys and the kubeconfig live
+beside it), or select an absolute external path with `CVP_OPERATOR_CONFIG_FILE`. Credentials
 and destructive approvals are host-scoped. Supported credential fields accept
 literal strings, `{file: PATH}` (a private `0600` file outside the checkout), or
 `{env: NAME}`; **every configured reference must resolve on
@@ -205,6 +244,19 @@ matches one of them, and rejects sources overlapping Tailscale or the mesh. See
 [changing your SSH address](docs/runbooks/nodes.md#your-public-ssh-address-changed).
 
 Ansible convergence does not bootstrap Flux. Before the separate cluster step,
-replace `example.invalid/repository.git` in `cluster/flux-system/source.yaml`
-and supply the reviewed repository, deploy key, SOPS identity, and explicit
-context as described in [the cluster runbook](docs/runbooks/cluster.md).
+replace `example.invalid/repository.git` in the instance's
+`cluster/flux-system/source.yaml` and supply the reviewed repository, deploy
+key, SOPS identity, and explicit context as described in
+[the cluster runbook](docs/runbooks/cluster.md).
+
+## Using this platform without an instance repository
+
+The platform still works as a single repository: run the operational tasks here
+with `CVP_INSTANCE_DIR` pointing at a directory that holds `inventory/`, and
+bootstrap Flux from this repository's own `cluster/`. Instance repositories are
+recommended because they keep your hosts, applications, and history separate
+from platform upgrades.
+
+## License
+
+[MIT](LICENSE).

@@ -11,7 +11,7 @@ action: the procedure must complete without changing any application manifest
 Four declarations must move together, and only the first three live in this
 repository's Ansible inventory:
 
-1. Membership in the `ingress` group in `ansible/inventory/hosts.yml`; the
+1. Membership in the `ingress` group in the instance's `inventory/hosts.yml`; the
    `ingress_v6` role installs the systemd socat forwarders that bridge public
    IPv6 `:80`/`:443` to the local IPv4 ServiceLB listeners.
 2. The node labels in the host's `inventory/host_vars/<node>.yml`:

@@ -13,6 +13,23 @@ deployment; see the open items and exit gates in `PLAN.md`.
 
 ### Added
 
+- **Platform and instance repositories.** This repository is now a reusable
+  platform; each operator runs an instance repository created with
+  `task new-instance -- ../my-platform --platform-url https://...`:
+  - the instance pins the platform as a `platform/` submodule and includes its
+    tasks (`tasks/ops.yml`), so `task init`, `node-*`, `site`, `verify`, and the
+    provider tasks run against the instance's inventory and cluster;
+  - Flux reconciles policy, ingress, operations, and data from a `cvp-platform`
+    GitRepository pinned to the submodule commit, and apps from the instance;
+    the validator and bootstrap preflight render those layers from that exact
+    commit and reject any mismatch;
+  - `task validate` and `task platform-upgrade -- <ref>` keep the submodule,
+    Flux pin, copied Flux components, and toolchain in step;
+  - platform defaults moved to `ansible/defaults/` and load before the instance
+    inventory, whose `group_vars/all.yml` overrides them; operator files, keys,
+    state, and kubeconfigs are scoped per instance under
+    `~/.config/cvp/<instance>/`.
+- Licensed under MIT.
 - **Guided setup.** `task init` takes a fresh Debian host to a joined node:
   it creates the operator SSH key if needed, verifies the host key against the
   console fingerprint, detects your SSH source from the host's view of the

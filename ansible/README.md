@@ -23,7 +23,8 @@ their unprivileged namespace/tool requirements.
 
 ## Inventory inputs
 
-The default `inventory/hosts.yml` contains no hosts and provisions none.
+An instance's `inventory/hosts.yml` starts with no hosts and provisions none
+(the platform tests use the empty `examples/instance`).
 `k3s_cluster_init_host` and `k3s_server_host` are empty by default; the operator
 must select the initial server explicitly before convergence.
 
@@ -43,7 +44,7 @@ Site validates the **whole** topology before host access, including under
   heterogeneous per-node paths are unsupported.
 
 Persistent operator settings live outside Git in
-`$XDG_CONFIG_HOME/cvp/operator.yml`, or `~/.config/cvp/operator.yml` when
+`$XDG_CONFIG_HOME/cvp/<instance>/operator.yml`, or `~/.config/cvp/<instance>/operator.yml` when
 `XDG_CONFIG_HOME` is unset. Set `CVP_OPERATOR_CONFIG_FILE` to select another
 absolute external path. An absent default file means no overrides; an explicit
 missing file fails. Keep files containing credentials private.
@@ -71,14 +72,14 @@ confirmations belong in the appropriate `cvp_operator_hosts` entry.
 
 Values are literal data, not Jinja expressions. Only `wireguard_private_key`
 and `tailscale_auth_key` accept references: a private file such as
-`wireguard_private_key: {file: /home/operator/.config/cvp/keys/server1.wg-private}`
+`wireguard_private_key: {file: /home/operator/.config/cvp/example/keys/server1.wg-private}`
 (absolute, outside the checkout, a regular file owned by you with mode `0600`,
 one line), or an environment variable such as
 `wireguard_private_key: {env: SERVER1_WG_PRIVATE_KEY}`. Referenced values must
 be present, nonempty, and free of control characters; literal credential
 strings are also supported. Other fields cannot use references.
 
-Create operator-supplied files under `inventory/host_vars/` with node names,
+Create operator-supplied files under the instance's `inventory/host_vars/` with node names,
 WireGuard addresses and public keys, stable public endpoints, SSH endpoints,
 K3s roles, and placement labels. Documentation examples use `server1` and the
 synthetic mesh `192.0.2.0/24`; replace these before use. Leave
@@ -95,7 +96,7 @@ host probe, the OS must have `kmod` and `procps` available; `task probe` is
 read-only and does not install packages or require an active WireGuard mesh.
 Every node, including the initial server, starts as a fresh Debian install and
 is scaffolded, bootstrapped, and joined through `docs/runbooks/nodes.md`
-(`task node-new`, `task node-bootstrap`, `task node-join`). `inventory/host_vars/example-newnode.yml.example`
+(`task node-new`, `task node-bootstrap`, `task node-join`). `examples/instance/inventory/host_vars/example-newnode.yml.example`
 documents each host variable for hand edits.
 
 Node labels are declared per host in `k3s_node_labels`; `cvp.io/role` is
@@ -110,7 +111,7 @@ the tag catalog is in `ARCHITECTURE.md`.
 Each host's public WireGuard key is persisted in its inventory file and is the
 authentication source for every peer. Prepare keys out of band before the
 first convergence: `task node-new` generates one key pair per host into
-`~/.config/cvp/keys/` and references it from the operator file (or generate one
+`~/.config/cvp/<instance>/keys/` and references it from the operator file (or generate one
 in the secret store), distribute each private key to its host
 through the secret store or `wireguard_private_key`, and record each public
 key in the matching `inventory/host_vars/` file. The role fails when a host's
@@ -295,7 +296,7 @@ CVP_BOOTSTRAP_ADMIN_KEYS='["ssh-ed25519 AAAA..."]' \
 task bootstrap-access -- --limit server1 -e ansible_user=root -e ansible_become=false
 ```
 
-The K3s release is pinned in `group_vars/all.yml`. Downloads are verified using
+The K3s release is pinned in `ansible/defaults/group_vars/all.yml`. Downloads are verified using
 the matching release `sha256sum-*.txt` asset. Review and update that version as
 part of the K3s acceptance gate rather than switching to a channel or install
 script.
