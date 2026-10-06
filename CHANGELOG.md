@@ -13,6 +13,13 @@ deployment; see the open items and exit gates in `PLAN.md`.
 
 ### Added
 
+- **Guided setup.** `task init` takes a fresh Debian host to a joined node:
+  it creates the operator SSH key if needed, verifies the host key against the
+  console fingerprint, detects your SSH source from the host's view of the
+  connection, bootstraps the host, scaffolds and validates the inventory, joins
+  the node, and exports a Tailscale kubeconfig for the first host. It asks only
+  for what it cannot detect, shows plans before writing, and is safe to rerun
+  to resume or to add the next host.
 - **Node workflow.** `task node-new`, `task node-bootstrap`, and
   `task node-join` take every host from a fresh Debian install to a joined
   node, replacing the manual first-host and onboarding procedures:

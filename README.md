@@ -3,11 +3,49 @@
 Infrastructure and GitOps repository for an operator-configured K3s platform
 using standard Kubernetes resources.
 
-## I have a host; what next?
+## Quickstart
 
-**Start with [the node runbook](docs/runbooks/nodes.md).** Every host, the
-first and each later one, starts as a freshly installed Debian system and goes
-through the same three commands:
+You need a controller (your machine) and one host with a public IP.
+
+1. **Controller, once:** install [mise](https://mise.jdx.dev/getting-started.html),
+   then in this checkout run `mise install`. Make sure the controller is joined
+   to your tailnet.
+2. **Host:** in your provider's panel, install **Debian 13 (trixie), amd64**
+   with an SSH server and a root password (or your root SSH key).
+3. **Provider console:** read the host's SSH fingerprint there (not over SSH):
+
+   ```sh
+   ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+   ```
+
+4. **Tailscale admin console:** create an auth key tagged `tag:k3s` (and
+   `tag:k3s-ingress` for the first host).
+5. **Controller:** run the guided setup and answer its questions:
+
+   ```sh
+   task init
+   ```
+
+It creates your operator SSH key if needed, verifies the host key against the
+fingerprint, detects the address you SSH from (the only address that may SSH
+to the node afterwards), bootstraps the host, writes and validates the
+inventory, joins the node, and exports a kubeconfig that reaches the API over
+Tailscale. It shows every plan before writing and is safe to rerun; after a
+failure, fix the reported problem and run `task init` again.
+
+**To add a host**, install Debian on it and run `task init` again. Every answer
+can also be given as a flag, for example
+`task init -- --address 203.0.113.21 --host-key-fingerprint SHA256:...`;
+see `task init -- --help`.
+
+Then: point your public names at the first host through Cloudflare (proxied),
+[bootstrap Flux](docs/runbooks/cluster.md#bootstrap), and
+[enable backups](ansible/README.md#backup-enablement) before production data.
+
+## I want to run the steps myself
+
+**Use [the node runbook](docs/runbooks/nodes.md).** `task init` only chains
+these commands, which you can run one at a time:
 
 ```sh
 task node-new -- server1 --ssh 203.0.113.20 --virt vm --mesh-address 10.77.0.1 \

@@ -57,6 +57,7 @@ tasks:
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
         -i ansible/inventory/hosts.yml ansible/playbooks/test-labels.yml
       - mise exec -- python3 -B scripts/test-node-lifecycle.py
+      - mise exec -- python3 -B scripts/test-init.py
       - mise exec -- ./scripts/test-prepare-access
       - mise exec -- python3 -B scripts/test-wrapper-safety.py
       - mise exec -- python3 -B scripts/test-tofu-identity.py
@@ -140,6 +141,14 @@ tasks:
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
         ansible/playbooks/probe-wireguard.yml {{.CLI_ARGS}}
 
+  init:
+    desc: >-
+      Guided setup: take a fresh Debian host to a joined node (first run creates
+      the cluster; rerun to add hosts or resume). See README Quickstart.
+    interactive: true
+    cmds:
+      - mise exec -- python3 -B scripts/cvp_init.py {{.CLI_ARGS}}
+
   node-new:
     desc: >-
       Scaffold one node's inventory, host vars, WireGuard key, and operator entry
@@ -160,6 +169,7 @@ tasks:
       Copy scripts/node-bootstrap.sh to a fresh Debian host over SSH and run it
       as root to create the ops operator
       (e.g. task node-bootstrap -- worker1 --confirm worker1 --host-key-fingerprint SHA256:...)
+    interactive: true
     cmds:
       - mise exec -- python3 -B scripts/cvp_node.py bootstrap {{.CLI_ARGS}}
 

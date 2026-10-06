@@ -15,6 +15,19 @@ Debian system with nothing else on it.
 The host firewall, the tailnet policy, and the commands below enforce these
 rules; there is no "move SSH to Tailscale" step.
 
+## Quick path: `task init`
+
+`task init` runs everything in sections 2–4 for one host, asking only for what
+it cannot detect: the host's public IP, the console fingerprint (section 3.1),
+and the Tailscale auth key (stored as a `0600` file). It reads the address you
+SSH from out of the host's own view of the connection (`$SSH_CONNECTION`) and
+asks you to confirm it as the node's permanent SSH source. It then runs
+`node-new` (showing the plan first), `node-bootstrap`, `node-join`, and, for the
+first host, the kubeconfig export. Rerun it to resume after a failure (add
+`--retry-reviewed` once you have inspected an interrupted `site`, section 6) or
+to add the next host. The rest of this runbook explains each step and is the
+manual path.
+
 ## Commands
 
 | Command | What it does | Touches |

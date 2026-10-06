@@ -403,6 +403,8 @@ def cmd_new(args):
         for path in created:
             path.unlink(missing_ok=True)
         raise
+    if args.no_next_steps:
+        return 0
     say(f"\n{node} is in the inventory. Store {key_path} in your external secret store, then run:")
     say(f"  task node-bootstrap -- {node} --confirm {node} --host-key-fingerprint SHA256:<provider console>")
     say(f"  task node-join -- {node} --confirm {node}"
@@ -658,6 +660,57 @@ def operator_public_key(args, host):
     return public_key, lines[0].strip()
 
 
+class LoginSession:
+    """One SSH control connection to a fresh host's provider login.
+
+    The password (if any) is typed once; detection, copy, and run reuse it.
+    Host keys must already be trusted (see trust_bootstrap_key).
+    """
+
+    def __init__(self, address, port, user="root", key_file=None):
+        require(NAME.fullmatch(user) is not None, "--login-user must be a plain account name")
+        self.address, self.port, self.user = str(address), int(port), user
+        self.control = Path(tempfile.mkdtemp(prefix="cvp-"))
+        self.options = ["-F", "/dev/null", "-o", "StrictHostKeyChecking=yes",
+                        "-o", f"UserKnownHostsFile={known_hosts_file()}", "-o", "ForwardAgent=no",
+                        "-o", "ControlMaster=auto", "-o", f"ControlPath={self.control}/login",
+                        "-o", "ControlPersist=900"]
+        if key_file:
+            self.options += ["-o", "IdentitiesOnly=yes", "-i", str(common.external_path(key_file))]
+        self.target = f"{user}@{self.address}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        subprocess.run(["ssh", *self.options, "-p", str(self.port), "-O", "exit", self.target],
+                       capture_output=True)
+        shutil.rmtree(self.control, ignore_errors=True)
+
+    def output(self, command):
+        result = subprocess.run(["ssh", *self.options, "-p", str(self.port), self.target, command],
+                                stdout=subprocess.PIPE, text=True)
+        require(result.returncode == 0, f"SSH to {self.target} failed ({result.returncode})")
+        return result.stdout
+
+    def client_source(self):
+        """The controller address as this host sees it: the SSH source to allow."""
+        fields = self.output('printf "%s\\n" "$SSH_CONNECTION"').split()
+        require(fields, "the host did not report the SSH client address")
+        return ipaddress.ip_address(fields[0])
+
+    def bootstrap(self, key):
+        copy_target = f"{self.user}@[{self.address}]" if ":" in self.address else self.target
+        say(f"==> copying the bootstrap script to {self.address}")
+        run(["scp", *self.options, "-P", str(self.port), str(BOOTSTRAP_SCRIPT),
+             f"{copy_target}:{BOOTSTRAP_REMOTE}"])
+        say(f"==> running the bootstrap script on {self.address} as root")
+        sudo = "" if self.user == "root" else "sudo "
+        remote = (f"{sudo}sh {BOOTSTRAP_REMOTE} {shlex.quote(key)}; status=$?; "
+                  f"rm -f {BOOTSTRAP_REMOTE}; exit $status")
+        run(["ssh", *self.options, "-t", "-p", str(self.port), self.target, remote])
+
+
 def cmd_bootstrap(args):
     node = args.node
     require(NAME.fullmatch(node) is not None, "node names are lowercase letters, digits, and hyphens")
@@ -670,29 +723,9 @@ def cmd_bootstrap(args):
     address, port = host["ansible_host"], host.get("ansible_port", 22)
     _, key = operator_public_key(args, host)
     trust_bootstrap_key(address, port, args.host_key_fingerprint)
-
-    control = Path(tempfile.mkdtemp(prefix="cvp-"))
-    options = ["-F", "/dev/null", "-o", "StrictHostKeyChecking=yes",
-               "-o", f"UserKnownHostsFile={known_hosts_file()}", "-o", "ForwardAgent=no",
-               "-o", "ControlMaster=auto", "-o", f"ControlPath={control}/root", "-o", "ControlPersist=120"]
-    if args.root_key:
-        options += ["-o", "IdentitiesOnly=yes", "-i", str(common.external_path(args.root_key))]
-    user = args.login_user
-    require(NAME.fullmatch(user) is not None, "--login-user must be a plain account name")
-    sudo = "" if user == "root" else "sudo "
-    target = f"{user}@{address}"
-    copy_target = f"{user}@[{address}]" if ":" in str(address) else target
-    try:
-        say(f"==> copying the bootstrap script to {address} ({user} may be asked for a password)")
-        run(["scp", *options, "-P", str(port), str(BOOTSTRAP_SCRIPT), f"{copy_target}:{BOOTSTRAP_REMOTE}"])
-        say(f"==> running the bootstrap script on {address} as root")
-        remote = (f"{sudo}sh {BOOTSTRAP_REMOTE} {shlex.quote(key)}; status=$?; "
-                  f"rm -f {BOOTSTRAP_REMOTE}; exit $status")
-        run(["ssh", *options, "-t", "-p", str(port), target, remote])
-    finally:
-        subprocess.run(["ssh", *options, "-p", str(port), "-O", "exit", target], capture_output=True)
-        shutil.rmtree(control, ignore_errors=True)
-
+    say(f"==> connecting to {address} as {args.login_user} (you may be asked for its password once)")
+    with LoginSession(address, port, args.login_user, args.root_key) as session:
+        session.bootstrap(key)
     say("==> verifying ops login and passwordless sudo with the operator key")
     require(operator_ssh_check(inventory, node, common.ssh_options()),
             "ops could not log in and escalate with the operator key; inspect the bootstrap output above")
@@ -727,6 +760,7 @@ def parser():
     auth.add_argument("--tailscale-auth-key-env", help="environment variable holding the Tailscale auth key")
     new.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
     new.add_argument("--write", action="store_true", help="apply the plan (default: dry run)")
+    new.add_argument("--no-next-steps", action="store_true", help=argparse.SUPPRESS)
     new.set_defaults(func=cmd_new)
 
     join = commands.add_parser("join", help="join one node (resumable)")
