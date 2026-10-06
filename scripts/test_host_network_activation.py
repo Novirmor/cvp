@@ -107,11 +107,11 @@ else:
             "Read Tailscale backend state", "Enroll Tailscale when an external auth key is supplied",
             "Refresh the Tailscale backend state", "Select the refreshed Tailscale state",
             "Reconcile mutable Tailscale settings on an enrolled host")]
-        tasks.extend(task_named("firewall", name) for name in (
-            "Read Tailscale state before firewall activation",
-            "Require a verified private or temporary bootstrap administration path"))
+        tasks.append(task_named("firewall", "Require a verified public SSH administration path"))
         self.play(tasks, values, check=True, success=False)
-        self.play(tasks, values | {"firewall_admin_access": {"stdout": '{"path":"tailscale"}'}}, check=True)
+        # SSH is public-only: a Tailscale administration path never authorizes activation.
+        self.play(tasks, values | {"firewall_admin_access": {"stdout": '{"path":"tailscale"}'}},
+                  check=True, success=False)
         self.assertFalse(Path(self.environment["MOCK_CALLS"]).exists())
         Path(self.environment["MOCK_STATE"]).write_text(json.dumps({"backend": "NeedsLogin"}))
         self.play(tasks, values, check=True, success=False)

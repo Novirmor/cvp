@@ -170,6 +170,27 @@
   no_log: true
   when: not k3s_server_init | bool and not ansible_check_mode
 
+# People reach the API over Tailscale, so the certificate must cover this
+# server's tailnet addresses. Tailscale enrolls earlier in the same site run.
+- name: Read this server's Tailscale addresses for the API certificate
+  ansible.builtin.command: tailscale ip
+  register: k3s_tailscale_ips
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Cover the Tailscale addresses in the API certificate
+  ansible.builtin.set_fact:
+    k3s_effective_tls_sans: >-
+      {{ (k3s_tls_sans
+          + ((k3s_tailscale_ips.stdout_lines | default([])) if k3s_tailscale_ips.rc | default(1) == 0 else [])
+            | map('trim') | select('match', k3s_tailnet_address_pattern) | list)
+         | unique }}
+  vars:
+    # Tailscale's CGNAT 100.64.0.0/10 IPv4 range and its fd7a:115c:a1e0::/48 IPv6 range.
+    k3s_tailnet_address_pattern: >-
+      ^(100[.](6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])[.][0-9]{1,3}[.][0-9]{1,3}|fd7a:115c:a1e0:[0-9a-f:]+)$
+
 - name: Render the K3s server configuration
   ansible.builtin.template:
     src: config.yaml.j2

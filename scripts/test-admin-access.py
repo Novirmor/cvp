@@ -31,15 +31,12 @@ class AdminAccessTests(unittest.TestCase):
             "CVP_TEST_CALLS": str(self.calls),
             "CVP_TEST_SSHD": "port 22\npasswordauthentication no\n",
             "CVP_TEST_SS": SOCKETS,
-            "CVP_TEST_TAILSCALE": '{"BackendState":"Stopped"}',
             "ANSIBLE_CONFIG": str(ROOT / "ansible/ansible.cfg"),
             "ANSIBLE_LOCAL_TEMP": str(self.directory / "controller"),
             "ANSIBLE_REMOTE_TEMP": str(self.directory / "modules"),
             "ANSIBLE_NOCOLOR": "1",
         }
-        for name, args, variable in (
-                ("sshd", ["-T"], "SSHD"),
-                ("tailscale", ["status", "--json"], "TAILSCALE")):
+        for name, args, variable in (("sshd", ["-T"], "SSHD"),):
             path = self.bin / name
             path.write_text(f"#!{sys.executable}\n" +
                             "import json, os, sys\n" +
@@ -59,17 +56,7 @@ with open(os.environ['CVP_TEST_CALLS'], 'a') as stream:
 if sys.argv[1:] == ['-H', '-ltn']:
     print(os.environ['CVP_TEST_SS'], end='')
     sys.exit(int(os.environ.get('CVP_TEST_SS_RC', '0')))
-assert sys.argv[1:] == ['-H', '-tn', 'state', 'established']
-if 'CVP_TEST_ESTABLISHED' in os.environ:
-    print(os.environ['CVP_TEST_ESTABLISHED'], end='')
-else:
-    client, client_port, server, server_port = os.environ['CVP_TEST_CONNECTION'].split()
-    interface = os.environ.get('CVP_TEST_BOUND', 'tailscale0' if server.startswith(('100.', 'fd7a:')) else 'wg0')
-    local = server + ('%' + interface if interface else '')
-    local = '[' + local + ']' if ':' in server else local
-    peer = '[' + client + ']' if ':' in client else client
-    print('0 0 ' + local + ':' + server_port + ' ' + peer + ':' + client_port)
-sys.exit(int(os.environ.get('CVP_TEST_ESTABLISHED_RC', '0')))
+raise AssertionError(f'unexpected ss call: {sys.argv}')
 ''',
             "ip": '''import json, os, sys
 from pathlib import Path
@@ -77,15 +64,7 @@ with open(os.environ['CVP_TEST_CALLS'], 'a') as stream:
     stream.write(json.dumps(sys.argv) + '\\n')
 if sys.argv[1:] == ['link']:
     sys.exit(0)
-if 'CVP_TEST_TOOLS_READY' in os.environ:
-    assert Path(os.environ['CVP_TEST_TOOLS_READY']).is_file(), 'ip invoked before prerequisite installation'
-client, client_port, server, server_port = os.environ['CVP_TEST_CONNECTION'].split()
-family = '-6' if ':' in client else '-4'
-assert sys.argv[1:] == [family, '-j', 'route', 'get', client, 'from', server,
-                       'ipproto', 'tcp', 'sport', server_port, 'dport', client_port]
-interface = 'tailscale0' if client.startswith(('100.', 'fd7a:')) else 'wg0'
-print(os.environ.get('CVP_TEST_ROUTE', json.dumps([{'dst': client, 'dev': interface, 'flags': []}])))
-sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
+raise AssertionError(f'unexpected ip call: {sys.argv}')
 ''',
         }.items():
             path = self.bin / name
@@ -94,9 +73,7 @@ sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
         self.policy = {
             "firewall_ssh_port": 22, "base_ssh_port": 22,
             "ipv4_source_cidrs": ["198.51.100.20/32"], "ipv6_source_cidrs": [],
-            "ssh_connection": CONNECTION, "tailscale_rc": 0,
-            "tailscale_status": '{"BackendState":"Stopped"}',
-            "wireguard_address": "10.20.0.10", "wireguard_peer_addresses": ["10.20.0.20"],
+            "ssh_connection": CONNECTION, "wireguard_address": "10.20.0.10",
         }
 
     def helper(self, overrides=None, success=True, raw=None) -> Any:
@@ -145,7 +122,7 @@ sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
         ] + [
             {"ssh_connection": value} for value in ("garbage", "host 10 192.0.2.10 22",
                                                      "198.51.100.20 0 192.0.2.10 22", 22)
-        ] + [{"tailscale_status": value} for value in ("garbage", "[]", "{}", '{"BackendState":"Running","Self":null}')]
+        ]
         for overrides in invalid:
             with self.subTest(overrides=overrides):
                 self.helper(overrides, success=False)
@@ -164,98 +141,33 @@ sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
             self.helper(success=False)
             del self.environment[f"CVP_TEST_{variable}_RC"]
 
-    def test_running_tailscale_does_not_protect_public_session(self):
-        private = {"ipv4_source_cidrs": [], "tailscale_status": json.dumps({
-            "BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::10"]},
-            "Peer": {"other": {"TailscaleIPs": ["100.64.0.11"]}},
-        })}
-        self.helper(private, success=False)
-        self.helper({"ipv4_source_cidrs": ["198.51.100.21/32"]}, success=False)
-        for destination, success in (("100.64.0.10", True), ("100.64.0.11", False)):
-            result = self.helper(private | {"ssh_connection": f"100.64.0.20 40000 {destination} 22"}, success=success)
-            if success:
-                self.assertEqual(result["path"], "tailscale")
-        self.assertEqual(self.helper(private | {
-            "ssh_connection": "fd7a:115c:a1e0::20 40000 fd7a:115c:a1e0::10 22",
-        })["path"], "tailscale")
-        self.helper(private | {"tailscale_status": '{"BackendState":"Stopped","Self":{"TailscaleIPs":["100.64.0.10"]}}',
-                               "ssh_connection": "100.64.0.20 40000 100.64.0.10 22"}, success=False)
+    def test_tailscale_and_wireguard_sessions_never_authorize_ssh(self):
+        for connection in ("100.64.0.20 40000 100.64.0.10 22",
+                           "fd7a:115c:a1e0::20 40000 fd7a:115c:a1e0::10 22",
+                           "10.20.0.20 40000 10.20.0.10 22",
+                           "198.51.100.20 40000 100.64.0.10 22",
+                           "198.51.100.20 40000 10.20.0.10 22"):
+            with self.subTest(connection=connection):
+                error = self.helper({"ssh_connection": connection}, success=False)
+                self.assertTrue("Tailscale or WireGuard" in error or "not permitted" in error, error)
 
-    def test_wireguard_requires_exact_destination_and_authenticated_peer_address(self):
-        private = {"ipv4_source_cidrs": [], "ssh_connection": "10.20.0.20 40000 10.20.0.10 22"}
-        self.assertEqual(self.helper(private)["path"], "wireguard")
-        for connection in ("10.20.0.21 40000 10.20.0.10 22", "10.20.0.20 40000 192.0.2.10 22"):
-            self.helper(private | {"ssh_connection": connection}, success=False)
-
-    def test_private_addresses_require_exact_bound_socket_and_matching_route(self):
-        for client, server, interface, status in (
-            ("100.64.0.20", "100.64.0.10", "tailscale0", {"BackendState": "Running", "Self": {"TailscaleIPs": ["100.64.0.10"]}}),
-            ("fd7a:115c:a1e0::20", "fd7a:115c:a1e0::10", "tailscale0", {"BackendState": "Running", "Self": {"TailscaleIPs": ["fd7a:115c:a1e0::10"]}}),
-            ("10.20.0.20", "10.20.0.10", "wg0", {"BackendState": "Stopped"}),
-        ):
-            policy = {"ipv4_source_cidrs": [], "ssh_connection": f"{client} 40000 {server} 22",
-                      "tailscale_status": json.dumps(status)}
-            with self.subTest(interface=interface, client=client):
-                self.helper(policy)
-                for bound in ("", "eth0", "lo"):
-                    self.environment["CVP_TEST_BOUND"] = bound
-                    self.assertIn("ingress is unproven", self.helper(policy, success=False))
-                self.environment.pop("CVP_TEST_BOUND")
-                local = f"[{server}%{interface}]:22" if ":" in server else f"{server}%{interface}:22"
-                peer = f"[{client}]:40001" if ":" in client else f"{client}:40001"
-                correct_peer = f"[{client}]:40000" if ":" in client else f"{client}:40000"
-                correct = f"0 0 {local} {correct_peer}\n"
-                for evidence in ("", "garbage", f"0 0 {local} {peer}\n", "0 0 invalid:22 invalid:40000", correct * 2):
-                    self.environment["CVP_TEST_ESTABLISHED"] = evidence
-                    self.helper(policy, success=False)
-                self.environment.pop("CVP_TEST_ESTABLISHED")
-                for route in ([], {}, [None], [{"dev": "eth0"}], [{"dev": interface, "gateway": "192.0.2.1"}],
-                              [{"dev": interface, "type": "local"}], [{"dev": interface, "flags": ["linkdown"]}],
-                              [{"dev": interface}, {"dev": interface}]):
-                    self.environment["CVP_TEST_ROUTE"] = json.dumps(route)
-                    self.helper(policy, success=False)
-                self.environment["CVP_TEST_ROUTE"] = "not-json"
-                self.helper(policy, success=False)
-                self.environment.pop("CVP_TEST_ROUTE")
-                for variable in ("CVP_TEST_ESTABLISHED_RC", "CVP_TEST_ROUTE_RC"):
-                    self.environment[variable] = "1"
-                    self.helper(policy, success=False)
-                    self.environment.pop(variable)
-                self.environment["CVP_TEST_ESTABLISHED"] = correct
-                self.helper(policy)
-                if ":" in server:
-                    self.environment["CVP_TEST_ESTABLISHED"] = f"0 0 [{server}]%{interface}:22 {correct_peer}\n"
-                    self.helper(policy)
-                self.environment.pop("CVP_TEST_ESTABLISHED")
-
-    def test_public_session_to_tailscale_address_is_not_private_ingress(self):
-        self.environment["CVP_TEST_BOUND"] = ""
-        self.helper({"ipv4_source_cidrs": [], "ssh_connection": "198.51.100.20 40000 100.64.0.10 22",
-                     "tailscale_status": '{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.10"]}}'},
-                    success=False)
+    def test_private_or_unbounded_ssh_sources_are_rejected(self):
+        for overrides in ({"ipv4_source_cidrs": ["100.64.0.20/32"]},
+                          {"ipv4_source_cidrs": ["0.0.0.0/0"]},
+                          {"ipv4_source_cidrs": ["10.20.0.0/24"]},
+                          {"ipv6_source_cidrs": ["fd7a:115c:a1e0::20/128"]},
+                          {"ipv6_source_cidrs": ["::/0"]}):
+            with self.subTest(overrides=overrides):
+                self.assertIn("overlaps Tailscale or the WireGuard mesh", self.helper(overrides, success=False))
 
     def test_missing_connection_reports_limited_proof_and_keeps_bootstrap_gate(self):
         self.assertEqual(self.helper({"ssh_connection": ""})["path"], "connection-proof-unavailable")
-        for status in ('{"BackendState":"Stopped"}', '{"BackendState":"Running"}'):
-            error = self.helper({"ssh_connection": "", "ipv4_source_cidrs": [],
-                                 "tailscale_status": status}, success=False)
-            for marker in ("SSH_CONNECTION is unavailable", "firewall_ssh_ipv4_source_cidrs",
-                           "firewall_ssh_ipv6_source_cidrs", "independently verified source", "Tailscale Running"):
-                self.assertIn(marker, error)
+        error = self.helper({"ssh_connection": "", "ipv4_source_cidrs": []}, success=False)
+        for marker in ("SSH_CONNECTION is unavailable", "firewall_ssh_ipv4_source_cidrs",
+                       "firewall_ssh_ipv6_source_cidrs", "independently verified public source"):
+            self.assertIn(marker, error)
         self.environment["SSH_CONNECTION"] = CONNECTION
         self.assertEqual(self.helper({"ssh_connection": ""})["path"], "source-cidr")
-
-    def test_unbound_private_session_error_names_the_matching_source_cidr(self):
-        self.environment["CVP_TEST_BOUND"] = ""
-        for client, server, version, suffix in (("100.64.0.20", "100.64.0.10", 4, 32),
-                                               ("fd7a:115c:a1e0::20", "fd7a:115c:a1e0::10", 6, 128)):
-            policy = {"ipv4_source_cidrs": [], "ssh_connection": f"{client} 40000 {server} 22",
-                      "tailscale_status": json.dumps({"BackendState": "Running", "Self": {"TailscaleIPs": [server]}})}
-            error = self.helper(policy, success=False)
-            for marker in ("stock unbound sshd", f"firewall_ssh_ipv{version}_source_cidrs",
-                           f"{client}/{suffix}", "not its public egress IP"):
-                self.assertIn(marker, error)
-            self.assertEqual(self.helper(policy | {f"ipv{version}_source_cidrs": [f"{client}/{suffix}"]})["path"], "source-cidr")
 
     def play(self, overrides=None, success=True, check=False):
         source = (ROLE / "tasks/main.yml").read_text()
@@ -323,13 +235,8 @@ sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
         self.assertEqual(marker.exists(), success and not check, output)
         self.assertTrue(tools_ready.is_file(), output)
         calls = [json.loads(line)[1:] for line in self.calls.read_text().splitlines()]
-        self.assertEqual(calls.count(["status", "--json"]), 1)
-        connection = self.environment["CVP_TEST_CONNECTION"].split()
-        allowed = [["link"], ["status", "--json"], ["-T"], ["-H", "-ltn"], ["-H", "-tn", "state", "established"]]
-        if connection:
-            client, client_port, server, server_port = connection
-            allowed.append(["-6" if ":" in client else "-4", "-j", "route", "get", client, "from", server,
-                            "ipproto", "tcp", "sport", server_port, "dport", client_port])
+        self.assertNotIn(["status", "--json"], calls)
+        allowed = [["link"], ["-T"], ["-H", "-ltn"]]
         self.assertTrue(all(call in allowed for call in calls), calls)
         return output, calls
 
@@ -344,11 +251,9 @@ sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
         self.environment["CVP_TEST_SS"] = SOCKETS
         self.play()
 
-    def test_ansible_include_checks_current_source_and_tailscale_self_destination(self):
-        self.environment["CVP_TEST_TAILSCALE"] = '{"BackendState":"Running","Self":{"TailscaleIPs":["100.64.0.10"]}}'
-        self.play({"firewall_ssh_ipv4_source_cidrs": []}, success=False)
+    def test_ansible_include_rejects_a_tailscale_session_before_mutation(self):
         self.play({"firewall_ssh_ipv4_source_cidrs": [],
-                   "ansible_env": {"SSH_CONNECTION": "100.64.0.20 40000 100.64.0.10 22"}})
+                   "ansible_env": {"SSH_CONNECTION": "100.64.0.20 40000 100.64.0.10 22"}}, success=False)
         self.play({"firewall_ssh_ipv4_source_cidrs": ["garbage"]}, success=False)
 
     def test_ansible_check_executes_readonly_guards_and_recovers_unprivileged_session(self):
@@ -362,23 +267,6 @@ sys.exit(int(os.environ.get('CVP_TEST_ROUTE_RC', '0')))
         self.play({"ansible_env": {}}, check=True, success=False)
         self.environment["SSH_CONNECTION"] = ""
         self.play({"ansible_env": {}}, check=True)
-
-    def test_ansible_include_allows_verified_wireguard_session_without_tailscale(self):
-        self.play({"firewall_ssh_ipv4_source_cidrs": [],
-                   "ansible_env": {"SSH_CONNECTION": "10.20.0.20 40000 10.20.0.10 22"}})
-        self.environment["CVP_TEST_BOUND"] = ""
-        self.play({"firewall_ssh_ipv4_source_cidrs": [],
-                   "ansible_env": {"SSH_CONNECTION": "10.20.0.20 40000 10.20.0.10 22"}}, success=False)
-
-    def test_ansible_caller_forwards_nondefault_wireguard_interface(self):
-        self.environment["CVP_TEST_BOUND"] = "wgmesh"
-        self.environment["CVP_TEST_ROUTE"] = '[{"dev":"wgmesh","flags":[]}]'
-        for check in (False, True):
-            self.play({"wireguard_interface": "wgmesh", "firewall_ssh_ipv4_source_cidrs": [],
-                       "ansible_env": {"SSH_CONNECTION": "10.20.0.20 40000 10.20.0.10 22"}}, check=check)
-        self.environment["CVP_TEST_BOUND"] = "wg0"
-        self.play({"wireguard_interface": "wgmesh", "firewall_ssh_ipv4_source_cidrs": [],
-                   "ansible_env": {"SSH_CONNECTION": "10.20.0.20 40000 10.20.0.10 22"}}, success=False)
 
 
 if __name__ == "__main__":

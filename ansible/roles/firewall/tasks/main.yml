@@ -8,14 +8,6 @@
     policy_rc_d: 101
   when: firewall_manage | bool
 
-- name: Read Tailscale state before firewall activation
-  ansible.builtin.command: tailscale status --json
-  register: firewall_tailscale_status
-  changed_when: false
-  failed_when: false
-  check_mode: false
-  when: firewall_manage | bool
-
 - name: Read the remote SSH session before privilege escalation
   ansible.builtin.command:
     argv:
@@ -45,32 +37,26 @@
           'ipv6_source_cidrs': firewall_ssh_ipv6_source_cidrs,
           'ssh_connection': ansible_env.SSH_CONNECTION
                             | default(firewall_remote_ssh_connection.stdout | default(''), true),
-          'tailscale_rc': firewall_tailscale_status.rc,
-           'tailscale_status': firewall_tailscale_status.stdout,
-           'wireguard_interface': wireguard_interface,
-           'wireguard_address': wireguard_address | default(''),
-          'wireguard_peer_addresses': groups.get(wireguard_peers_group | default('wireguard'), [])
-                                     | map('extract', hostvars, 'wireguard_address') | list} | to_json }}
+          'wireguard_address': wireguard_address | default('')} | to_json }}
   register: firewall_admin_access
   changed_when: false
   check_mode: false
   when: firewall_manage | bool
 
-- name: Require a verified private or temporary bootstrap administration path
+- name: Require a verified public SSH administration path
   ansible.builtin.assert:
     that:
       - >-
         (((firewall_admin_access | default({})).get('stdout', '{}') | from_json).path
-         | default('')) in ['source-cidr', 'tailscale', 'wireguard']
+         | default('')) == 'source-cidr'
         or ((((firewall_admin_access | default({})).get('stdout', '{}') | from_json).path
              | default('')) == 'connection-proof-unavailable'
             and (firewall_ssh_ipv4_source_cidrs | length > 0 or firewall_ssh_ipv6_source_cidrs | length > 0))
     fail_msg: >-
       Refusing to activate a default-deny firewall without successful administration-path
-      preflight evidence. Tailscale Running and a private destination IP do not prove
-      ingress through a private interface. Stock unbound sshd sockets require an explicit
+      preflight evidence. SSH is accepted only on the public uplinks from an explicit
       firewall_ssh_ipv4_source_cidrs or firewall_ssh_ipv6_source_cidrs entry matching
-      the actual client source. Check mode does not enroll Tailscale.
+      the actual public client source; Tailscale and WireGuard do not carry SSH.
   when: firewall_manage | bool
 
 - name: Require CIDR allowlists to be lists

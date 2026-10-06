@@ -63,6 +63,10 @@ def render(role, template, values):
     return str(ENV.from_string((ROLES / role / "templates" / template).read_text()).render(values))
 
 
+CLOUDFLARE_V4 = "173.245.48.10"
+CLOUDFLARE_V6 = "2606:4700::10"
+
+
 class Ruleset:
     def __init__(self, text):
         self.chains = {}
@@ -190,7 +194,7 @@ class FirewallTests(unittest.TestCase):
 
     def test_public_forwarding_original_destination_and_port(self):
         rules = self.rules()
-        packet = {"iif": "eth0", "dnat": True, "dport": 8000,
+        packet = {"iif": "eth0", "dnat": True, "dport": 8000, "saddr": CLOUDFLARE_V4,
                   "original_address": "192.0.2.10", "original_port": 80}
         self.assertEqual(rules.verdict("forward", packet), "accept")
         cases = [
@@ -199,16 +203,17 @@ class FirewallTests(unittest.TestCase):
             {"original_address": "192.0.2.11"},
             {"dnat": False, "daddr": "10.42.0.20", "dport": 80},
             {"proto": "udp"},
+            {"saddr": "198.51.100.9"},
         ]
         for change in cases:
             with self.subTest(change=change):
                 self.assertEqual(rules.verdict("forward", packet | change), "drop")
         self.assertEqual(self.rules(ingress=False).verdict("forward", packet), "drop")
         self.assertEqual(self.rules(firewall_public_ingress_ports=[]).verdict("forward", packet), "drop")
-        self.assertEqual(rules.verdict("forward", packet | {
-            "iif": "eth1", "family": "ip6", "original_address": "2001:db8::10",
-            "original_port": 443, "dport": 8443,
-        }), "accept")
+        ipv6 = packet | {"iif": "eth1", "family": "ip6", "saddr": CLOUDFLARE_V6,
+                         "original_address": "2001:db8::10", "original_port": 443, "dport": 8443}
+        self.assertEqual(rules.verdict("forward", ipv6), "accept")
+        self.assertEqual(rules.verdict("forward", ipv6 | {"saddr": "2001:db8::20"}), "drop")
 
     def test_cluster_and_return_paths_survive(self):
         rules = self.rules(ingress=False)
@@ -226,16 +231,38 @@ class FirewallTests(unittest.TestCase):
         self.assertEqual(values["firewall_external_ipv6_interface"], "eth1")
         self.assertEqual(values["firewall_external_interfaces"], ["eth0", "eth1"])
         rules = self.rules()
-        for interface in ("eth1", "tailscale0"):
+        for interface, source in (("eth1", CLOUDFLARE_V6), ("tailscale0", "fd7a:115c:a1e0::20")):
             for port in (80, 443):
-                packet = {"iif": interface, "family": "ip6", "saddr": "2001:db8::20", "dport": port}
+                packet = {"iif": interface, "family": "ip6", "saddr": source, "dport": port}
                 self.assertEqual(rules.verdict("input", packet), "accept")
                 self.assertEqual(self.rules(ingress=False).verdict("input", packet), "drop")
+        # Public HTTP(S) is the Cloudflare origin only.
+        for packet in ({"iif": "eth1", "family": "ip6", "saddr": "2001:db8::20", "dport": 443},
+                       {"iif": "eth0", "saddr": "198.51.100.9", "dport": 80}):
+            self.assertEqual(rules.verdict("input", packet), "drop")
+        self.assertEqual(rules.verdict("input", {"iif": "eth0", "saddr": CLOUDFLARE_V4, "dport": 443}), "accept")
+        self.assertEqual(self.rules(firewall_public_ingress_ipv4_source_cidrs=[]).verdict(
+            "input", {"iif": "eth0", "saddr": CLOUDFLARE_V4, "dport": 443}), "drop")
         self.assertEqual(rules.verdict("input", {
             "iif": "eth1", "family": "ip6", "saddr": "2001:db8::20", "proto": "udp", "dport": 51820,
         }), "accept")
         self.assertEqual(rules.verdict("input", {"iif": "eth0", "dport": 6443}), "drop")
         self.assertEqual(rules.verdict("input", {"iif": "wg0", "dport": 6443}), "accept")
+        self.assertEqual(rules.verdict("input", {"iif": "tailscale0", "saddr": "100.64.0.20", "dport": 6443}), "accept")
+
+    def test_ssh_is_public_only(self):
+        rules = self.rules(firewall_ssh_ipv4_source_cidrs=["203.0.113.10/32"],
+                           firewall_ssh_ipv6_source_cidrs=["2001:db8:5::10/128"])
+        self.assertEqual(rules.verdict("input", {"iif": "eth0", "saddr": "203.0.113.10", "dport": 22}), "accept")
+        self.assertEqual(rules.verdict("input", {"iif": "eth1", "family": "ip6", "saddr": "2001:db8:5::10",
+                                                 "dport": 22}), "accept")
+        for packet in ({"iif": "eth0", "saddr": "198.51.100.9", "dport": 22},
+                       {"iif": "tailscale0", "saddr": "100.64.0.20", "dport": 22},
+                       {"iif": "tailscale0", "saddr": "203.0.113.10", "dport": 22},
+                       {"iif": "wg0", "saddr": "10.77.0.2", "dport": 22},
+                       {"iif": "wg0", "saddr": "203.0.113.10", "dport": 22}):
+            with self.subTest(packet=packet):
+                self.assertEqual(rules.verdict("input", packet), "drop")
 
     def test_ipv6_control_traffic(self):
         rules = self.rules()
@@ -253,7 +280,8 @@ class FirewallTests(unittest.TestCase):
         self.assertEqual(values["firewall_external_interfaces"], ["ens3", "ens4"])
         rules = Ruleset(render("firewall", "nftables.conf.j2", values))
         self.assertEqual(rules.verdict("forward", {
-            "iif": "ens3", "dnat": True, "original_address": "192.0.2.2", "original_port": 443, "dport": 8443,
+            "iif": "ens3", "dnat": True, "saddr": CLOUDFLARE_V4, "original_address": "192.0.2.2",
+            "original_port": 443, "dport": 8443,
         }), "accept")
 
     def test_packaged_stop_override_preserves_other_owners(self):
@@ -305,6 +333,24 @@ class LocalAnsibleTests(unittest.TestCase):
         path.chmod(0o700)
         return path
 
+    def test_api_certificate_covers_only_live_tailscale_addresses(self):
+        self.executable("tailscale", "import os, sys\n"
+                        "assert sys.argv[1:] == ['ip'], sys.argv\n"
+                        "print(os.environ['MOCK_TAILSCALE_IPS'], end='')\n"
+                        "sys.exit(int(os.environ.get('MOCK_TAILSCALE_RC', '0')))\n")
+        tasks = [task_named("k3s_server", name) for name in (
+            "Read this server's Tailscale addresses for the API certificate",
+            "Cover the Tailscale addresses in the API certificate")]
+        tasks.append({"ansible.builtin.copy": {"content": "{{ k3s_effective_tls_sans | to_json }}",
+                                               "dest": str(self.directory / "sans.json")}})
+        self.environment["MOCK_TAILSCALE_IPS"] = "100.100.100.20\nfd7a:115c:a1e0::5\n100.128.0.1\n10.0.0.1\nbad;x\n"
+        for rc, expected in (("0", ["api.internal", "100.100.100.20", "fd7a:115c:a1e0::5"]), ("1", ["api.internal"])):
+            with self.subTest(rc=rc):
+                self.environment["MOCK_TAILSCALE_RC"] = rc
+                self.play(tasks, {"k3s_tls_sans": ["api.internal"]})
+                self.assertEqual(json.loads((self.directory / "sans.json").read_text()), expected)
+        self.assertIn("k3s_effective_tls_sans", (ROLES / "k3s_server/templates/config.yaml.j2").read_text())
+
     def play(self, tasks, variables, success=True, module_defaults=None, check=False):
         play = [{"name": "Isolated host security regression", "hosts": "localhost", "connection": "local",
                  "become": False, "gather_facts": False, "vars": variables, "tasks": tasks,
@@ -354,6 +400,25 @@ Path(os.environ["MOCK_CALLS"]).write_text(json.dumps(args))
 state_path.write_text(json.dumps(state))
 sys.exit(int(os.environ.get("MOCK_EXIT", "0")))
 ''')
+
+    def test_tailscale_ssh_is_always_disabled(self):
+        self.mock_tailscale()
+        values = defaults("tailscale") | {"node_name": "test-node", "tailscale_auth_key": "synthetic-auth-secret",
+                                        "tailscale_auth_key_temp_dir": str(self.directory)}
+        self.play(load_tasks("tailscale", "enroll.yml"), values)
+        self.assertEqual(json.loads(Path(self.environment["MOCK_CALLS"]).read_text())[-1], "--ssh=false")
+        reconcile = [task_named("tailscale", "Keep Tailscale SSH disabled on enrolled hosts"),
+                     task_named("tailscale", "Reconcile mutable Tailscale settings on an enrolled host")]
+        status = {"rc": 0, "stdout": json.dumps({"BackendState": "Running"})}
+        self.play(reconcile, values | {"tailscale_status": status})
+        self.assertEqual(json.loads(Path(self.environment["MOCK_CALLS"]).read_text())[-1], "--ssh=false")
+        Path(self.environment["MOCK_CALLS"]).unlink()
+        for key, tasks in (("tailscale_extra_up_args", load_tasks("tailscale", "enroll.yml")),
+                           ("tailscale_extra_set_args", reconcile)):
+            for flag in ("--ssh", "--ssh=true", "-ssh"):
+                with self.subTest(key=key, flag=flag):
+                    self.play(tasks, values | {key: [flag], "tailscale_status": status}, success=False)
+                    self.assertFalse(Path(self.environment["MOCK_CALLS"]).exists())
 
     def test_enrollment_secret_cleanup_success_and_failure(self):
         self.mock_tailscale()

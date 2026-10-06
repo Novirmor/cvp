@@ -1,6 +1,8 @@
 locals {
-  # The policy deliberately contains only the ports used by the new K3s
-  # architecture. WireGuard-only cluster ports are not Tailscale permissions.
+  # Tailscale carries people (and CI) to internal services only: the
+  # Kubernetes API and internal applications behind the ingress node's
+  # Traefik. SSH uses the nodes' public addresses, and WireGuard-only cluster
+  # ports are not Tailscale permissions.
   policy = {
     groups = {
       "group:admin" = var.admin_users
@@ -19,7 +21,6 @@ locals {
         proto  = "tcp"
         src    = ["group:admin"]
         dst = [
-          "tag:k3s:22",
           "tag:k3s:6443",
           "tag:k3s-ingress:80",
           "tag:k3s-ingress:443",
@@ -40,11 +41,11 @@ locals {
         src   = "group:admin"
         proto = "tcp"
         accept = [
-          "tag:k3s:22",
           "tag:k3s:6443",
           "tag:k3s-ingress:80",
           "tag:k3s-ingress:443",
         ]
+        deny = ["tag:k3s:22"]
       },
       {
         src    = "group:ci"

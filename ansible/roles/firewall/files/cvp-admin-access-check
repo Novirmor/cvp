@@ -84,51 +84,31 @@ def listeners(output):
     return result
 
 
-def socket_endpoint(value):
-    address, number = endpoint(value)
-    if address is None:
-        raise ValueError("Wildcard established socket address")
-    interface = value.rpartition(":")[0].strip("[]").partition("%")[2]
-    return address, number, interface
+# SSH is public-only: Tailscale carries people to internal services and
+# WireGuard carries node-to-node cluster traffic; neither carries SSH.
+TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+
+
+def private_networks(policy):
+    result = list(TAILNET)
+    wg_address = policy.get("wireguard_address", "")
+    if not isinstance(wg_address, str):
+        raise ValueError("WireGuard address must be a string")
+    if wg_address:
+        result.append(ipaddress.ip_network(f"{wg_address}/24", strict=False))
+    return result
 
 
 def bootstrap_cidr_guidance(client=None):
     if client is None:
         return ("SSH_CONNECTION is unavailable, so the actual client source cannot be checked. "
                 "Set firewall_ssh_ipv4_source_cidrs or firewall_ssh_ipv6_source_cidrs in this host's "
-                "external operator settings to the independently verified source address the host sees "
-                "(/32 for IPv4 or /128 for IPv6). Tailscale Running does not replace this requirement.")
+                "external operator settings to the independently verified public source address the host "
+                "sees (/32 for IPv4 or /128 for IPv6).")
     variable = f"firewall_ssh_ipv{client.version}_source_cidrs"
     cidr = f"{client}/{client.max_prefixlen}"
     return (f"Set {variable} to {json.dumps([cidr])} in this host's external operator settings, "
-            "explicitly matching the current SSH client source observed by the host. "
-            "For a Tailscale session use that client's Tailscale source IP, not its public egress IP.")
-
-
-def private_interface(client, destination, client_port, server_port, interface):
-    found = []
-    for line in read_command(["ss", "-H", "-tn", "state", "established"]).splitlines():
-        fields = line.split()
-        if len(fields) != 4 or not all(value.isdigit() for value in fields[:2]):
-            raise ValueError("Malformed established socket evidence")
-        local, local_port, bound = socket_endpoint(fields[2])
-        peer, peer_port, _ = socket_endpoint(fields[3])
-        if (local, local_port, peer, peer_port) == (destination, server_port, client, client_port):
-            found.append(bound)
-    if found != [interface]:
-        raise ValueError("Private SSH ingress is unproven: stock unbound sshd sockets cannot supply "
-                         "kernel interface-binding evidence, even when SSH to a private IP succeeds. "
-                         + bootstrap_cidr_guidance(client))
-    routes = json.loads(read_command([
-        "ip", f"-{client.version}", "-j", "route", "get", str(client), "from", str(destination),
-        "ipproto", "tcp", "sport", str(server_port), "dport", str(client_port),
-    ]))
-    if (not isinstance(routes, list) or len(routes) != 1 or not isinstance(routes[0], dict)
-            or routes[0].get("dev") != interface or routes[0].get("type", "unicast") != "unicast"
-            or any(routes[0].get(key) for key in ("gateway", "via", "multipath", "nhid"))
-            or routes[0].get("flags", [])):
-        raise ValueError("Private SSH return route does not match its bound ingress interface. "
-                         + bootstrap_cidr_guidance(client))
+            "explicitly matching the current public SSH client source observed by the host.")
 
 
 def check(policy):
@@ -138,6 +118,11 @@ def check(policy):
     if port(policy["base_ssh_port"]) != managed_port:
         raise ValueError("firewall_ssh_port must equal base_ssh_port")
     cidrs = networks(policy["ipv4_source_cidrs"], 4) + networks(policy["ipv6_source_cidrs"], 6)
+    private = private_networks(policy)
+    for network in cidrs:
+        if any(network.version == other.version and network.overlaps(other) for other in private):
+            raise ValueError(f"SSH source {network} overlaps Tailscale or the WireGuard mesh; "
+                             "SSH is accepted only from public sources on the public uplinks")
     connection = policy.get("ssh_connection", "")
     if not isinstance(connection, str):
         raise ValueError("SSH_CONNECTION must be a string")
@@ -148,30 +133,12 @@ def check(policy):
         if len(fields) != 4:
             raise ValueError("Malformed SSH_CONNECTION: expected client IP/port and server IP/port")
         client, destination = addresses([fields[0], fields[2]])
-        client_port = port(fields[1])
+        port(fields[1])
         if port(fields[3]) != managed_port:
             raise ValueError("Current SSH server local port differs from firewall_ssh_port/base_ssh_port")
         if client.version != destination.version:
             raise ValueError("SSH_CONNECTION IP address families differ")
         session = client, destination
-    tailscale = {}
-    tailscale_rc = policy.get("tailscale_rc", 1)
-    if not isinstance(tailscale_rc, int) or isinstance(tailscale_rc, bool):
-        raise ValueError("Tailscale command status must be an integer")
-    if tailscale_rc == 0:
-        tailscale = json.loads(policy["tailscale_status"])
-        if not isinstance(tailscale, dict) or not isinstance(tailscale.get("BackendState"), str):
-            raise ValueError("Malformed Tailscale status")
-    running = tailscale.get("BackendState") == "Running"
-    self_status = tailscale.get("Self", {})
-    if not isinstance(self_status, dict):
-        raise ValueError("Malformed Tailscale Self status")
-    self_ips = addresses(self_status.get("TailscaleIPs", []))
-    wg_address = policy.get("wireguard_address", "")
-    if not isinstance(wg_address, str):
-        raise ValueError("WireGuard address must be a string")
-    wg_ip = ipaddress.ip_address(wg_address) if wg_address else None
-    wg_peers = addresses(policy.get("wireguard_peer_addresses", []))
     effective_ports = configured_ports(read_command(["sshd", "-T"]))
     if effective_ports != [managed_port]:
         raise ValueError(f"sshd effective ports {effective_ports} must be exactly [{managed_port}]; extra ports are unmodeled")
@@ -188,21 +155,13 @@ def check(policy):
                or (address.version == destination.version and address.is_unspecified)
                for address in managed_sockets):
         raise ValueError("No managed SSH listener covers the current server destination IP")
-    if any(client in network for network in cidrs):
-        path = "source-cidr"
-    elif running and destination in self_ips:
-        private_interface(client, destination, client_port, managed_port, "tailscale0")
-        path = "tailscale"
-    elif destination == wg_ip and client in wg_peers:
-        interface = policy.get("wireguard_interface", "wg0")
-        if not isinstance(interface, str) or not re.fullmatch(r"[A-Za-z0-9_=+.-]{1,15}", interface):
-            raise ValueError("Invalid WireGuard interface")
-        private_interface(client, destination, client_port, managed_port, interface)
-        path = "wireguard"
-    else:
+    if any(destination in network for network in private):
+        raise ValueError("The current SSH session uses a Tailscale or WireGuard address, which the firewall "
+                         "does not accept for SSH. Connect Ansible to the node's public address.")
+    if not any(client in network for network in cidrs):
         raise ValueError("Current SSH connection is not permitted by the candidate firewall policy. "
                          + bootstrap_cidr_guidance(client))
-    return {"path": path, "port": managed_port}
+    return {"path": "source-cidr", "port": managed_port}
 
 
 def main():

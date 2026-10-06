@@ -74,13 +74,23 @@
     tailscale_status: "{{ tailscale_refreshed_status }}"
   when: not ansible_check_mode
 
+- name: Keep Tailscale SSH disabled on enrolled hosts
+  ansible.builtin.assert:
+    that:
+      - tailscale_extra_set_args is sequence
+      - tailscale_extra_set_args is not string
+      - tailscale_extra_set_args | select('match', '^-{1,2}ssh(?:=|$)') | list | length == 0
+    fail_msg: SSH uses the node's public address; Tailscale SSH cannot be enabled.
+
+# Tailscale carries people to internal services only; its SSH server stays off
+# even if it was enabled out of band.
 - name: Reconcile mutable Tailscale settings on an enrolled host
   ansible.builtin.command:
     argv: "{{ ['tailscale', 'set',
                '--hostname=' ~ node_name,
                '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false'),
                '--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
-             + tailscale_extra_set_args }}"
+             + tailscale_extra_set_args + ['--ssh=false'] }}"
   register: tailscale_reconcile
   changed_when: false
   when:

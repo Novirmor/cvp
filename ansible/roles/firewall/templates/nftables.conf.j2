@@ -16,22 +16,26 @@ table inet cvp_filter {
     ip protocol icmp accept
     meta l4proto ipv6-icmp accept
 
-    # Administration is private by default: Tailscale, WireGuard, or an
-    # explicitly supplied bootstrap CIDR can reach SSH and the API.
-    iifname "tailscale0" tcp dport { {{ firewall_ssh_port }}, 6443 } accept
+    # Tailscale carries people to internal services: the Kubernetes API and,
+    # on the ingress node, internal applications behind Traefik. No SSH.
+    iifname "tailscale0" tcp dport 6443 accept
 {% if inventory_hostname in groups.get('ingress', []) and firewall_public_ingress_ports | length > 0 %}
     iifname "tailscale0" tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
 {% endif %}
-    iifname "{{ wireguard_interface }}" tcp dport { {{ firewall_ssh_port }}, 6443, 10250 } accept
+    # WireGuard carries node-to-node cluster traffic only. No SSH.
+    iifname "{{ wireguard_interface }}" tcp dport { 6443, 10250 } accept
 {% if inventory_hostname in groups.get('k3s_servers', []) %}
     ip saddr {{ k3s_cluster_cidr }} tcp dport 6443 accept
 {% endif %}
+    # SSH is public-only: the public uplinks, from explicit operator sources.
+{% for interface in firewall_external_interfaces %}
 {% if firewall_ssh_ipv4_source_cidrs | length > 0 %}
-    ip saddr { {{ firewall_ssh_ipv4_source_cidrs | join(', ') }} } tcp dport {{ firewall_ssh_port }} accept
+    iifname "{{ interface }}" ip saddr { {{ firewall_ssh_ipv4_source_cidrs | join(', ') }} } tcp dport {{ firewall_ssh_port }} accept
 {% endif %}
 {% if firewall_ssh_ipv6_source_cidrs | length > 0 %}
-    ip6 saddr { {{ firewall_ssh_ipv6_source_cidrs | join(', ') }} } tcp dport {{ firewall_ssh_port }} accept
+    iifname "{{ interface }}" ip6 saddr { {{ firewall_ssh_ipv6_source_cidrs | join(', ') }} } tcp dport {{ firewall_ssh_port }} accept
 {% endif %}
+{% endfor %}
 
     # WireGuard is authenticated by its peer keys. Restrict these sets to
     # stable provider endpoint CIDRs when those are available.
@@ -57,8 +61,14 @@ table inet cvp_filter {
     ip saddr {{ k3s_cluster_cidr }} tcp dport 10250 accept
 {% endif %}
 {% if inventory_hostname in groups.get('ingress', []) and firewall_public_ingress_ports | length > 0 %}
+    # Public HTTP(S) is the Cloudflare origin only.
 {% for interface in firewall_external_interfaces %}
-    iifname "{{ interface }}" tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% if firewall_public_ingress_ipv4_source_cidrs | length > 0 %}
+    iifname "{{ interface }}" ip saddr { {{ firewall_public_ingress_ipv4_source_cidrs | join(', ') }} } tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endif %}
+{% if firewall_public_ingress_ipv6_source_cidrs | length > 0 %}
+    iifname "{{ interface }}" ip6 saddr { {{ firewall_public_ingress_ipv6_source_cidrs | join(', ') }} } tcp dport { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% endif %}
 {% endfor %}
 {% endif %}
   }
@@ -74,11 +84,12 @@ table inet cvp_filter {
 
   chain public_forward {
 {% if inventory_hostname in groups.get('ingress', []) and firewall_public_ingress_ports | length > 0 %}
-{% if firewall_public_ipv4_addresses | length > 0 %}
-    meta l4proto tcp ct status dnat ct original ip daddr { {{ firewall_public_ipv4_addresses | join(', ') }} } ct original proto-dst { {{ firewall_public_ingress_ports | join(', ') }} } accept
+    # DNAT rewrites only the destination: the source is still the Cloudflare edge.
+{% if firewall_public_ipv4_addresses | length > 0 and firewall_public_ingress_ipv4_source_cidrs | length > 0 %}
+    ip saddr { {{ firewall_public_ingress_ipv4_source_cidrs | join(', ') }} } meta l4proto tcp ct status dnat ct original ip daddr { {{ firewall_public_ipv4_addresses | join(', ') }} } ct original proto-dst { {{ firewall_public_ingress_ports | join(', ') }} } accept
 {% endif %}
-{% if firewall_public_ipv6_addresses | length > 0 %}
-    meta l4proto tcp ct status dnat ct original ip6 daddr { {{ firewall_public_ipv6_addresses | join(', ') }} } ct original proto-dst { {{ firewall_public_ingress_ports | join(', ') }} } accept
+{% if firewall_public_ipv6_addresses | length > 0 and firewall_public_ingress_ipv6_source_cidrs | length > 0 %}
+    ip6 saddr { {{ firewall_public_ingress_ipv6_source_cidrs | join(', ') }} } meta l4proto tcp ct status dnat ct original ip6 daddr { {{ firewall_public_ipv6_addresses | join(', ') }} } ct original proto-dst { {{ firewall_public_ingress_ports | join(', ') }} } accept
 {% endif %}
 {% endif %}
     drop

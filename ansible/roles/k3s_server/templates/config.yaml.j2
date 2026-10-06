@@ -29,7 +29,7 @@ secrets-encryption: true
 agent-token-file: "{{ k3s_agent_token_server_path }}"
 tls-san-security: true
 tls-san:
-{% for san in k3s_tls_sans %}
+{% for san in k3s_effective_tls_sans | default(k3s_tls_sans) %}
   - "{{ san }}"
 {% endfor %}
 node-label:

@@ -105,6 +105,11 @@ def render():
         },
         "wireguard_interface": "wg0", "wireguard_port": 51820,
         "k3s_cluster_cidr": "10.42.0.0/16",
+        # The public peer stands in for both the Cloudflare edge and the operator's SSH source.
+        "firewall_public_ingress_ipv4_source_cidrs": [f"{REMOTE[4]}/32"],
+        "firewall_public_ingress_ipv6_source_cidrs": [f"{REMOTE[6]}/128"],
+        "firewall_ssh_ipv4_source_cidrs": [f"{REMOTE[4]}/32"],
+        "firewall_ssh_ipv6_source_cidrs": [f"{REMOTE[6]}/128"],
     }
     for _ in range(30):
         pending = [key for key, value in values.items() if isinstance(value, str) and "{{" in value]
@@ -124,6 +129,12 @@ def render():
         "ingress": str(template.render(values)),
         "non-ingress": str(template.render(values | {"groups": {"k3s_servers": ["dataplane"]}})),
         "empty-ports": str(template.render(values | {"firewall_public_ingress_ports": []})),
+        "foreign-source": str(template.render(values | {
+            "firewall_public_ingress_ipv4_source_cidrs": ["203.0.113.0/24"],
+            "firewall_public_ingress_ipv6_source_cidrs": ["2001:db8:ff::/48"],
+            "firewall_ssh_ipv4_source_cidrs": ["203.0.113.10/32"],
+            "firewall_ssh_ipv6_source_cidrs": ["2001:db8:ff::10/128"],
+        })),
     }
 
 
@@ -358,8 +369,9 @@ class Sandbox:
         for version in (4, 6):
             source = f"public{version}"
             for port in (22, 6443, 10250, 2379, 2380):
+                # WireGuard carries cluster traffic only; SSH is public-only.
                 self.probe(f"{label} IPv{version} wg0 INPUT {port}", "internal", INTERNAL[version],
-                           port, True, "input")
+                           port, port != 22, "input")
             self.probe(f"{label} IPv{version} wg0 forwarding", "internal", BACKEND[version],
                        8080, True, "forward")
             self.probe(f"{label} IPv{version} public direct pod route blocked", source,
@@ -407,19 +419,18 @@ class Sandbox:
                 require(peer_port is not None, "Cannot find the isolated established TCP tuple")
                 policy = {"firewall_ssh_port": port, "base_ssh_port": port,
                           "ipv4_source_cidrs": [], "ipv6_source_cidrs": [],
-                          "ssh_connection": f"{client} {peer_port} {host} {port}", "tailscale_rc": 0,
-                          "tailscale_status": json.dumps({"BackendState": "Running", "Self": {
-                              "TailscaleIPs": ["100.64.0.10", "fd7a:115c:a1e0::10"]}}),
-                          "wireguard_address": INTERNAL[4], "wireguard_peer_addresses": ["10.44.0.2"]}
+                          "ssh_connection": f"{client} {peer_port} {host} {port}",
+                          "wireguard_address": INTERNAL[4]}
                 try:
                     self.command(sys.executable, "-B", "-c", script,
                                  str(ROOT / "ansible/roles/firewall/files/cvp-admin-access-check"), str(port),
                                  text=json.dumps(policy))
-                except RuntimeError as error:
-                    require(not bound, "Kernel-bound private SSH socket was rejected: " + str(error))
+                except RuntimeError:
+                    pass
                 else:
-                    require(bound, "Unbound SSH socket was accepted as proven private ingress")
-                self.check(f"{interface} {'IPv6' if family == socket.AF_INET6 else 'IPv4'} {'bound accepted' if bound else 'unbound rejected'}", True)
+                    raise RuntimeError("An SSH session over Tailscale or WireGuard authorized activation")
+                self.check(f"{interface} {'IPv6' if family == socket.AF_INET6 else 'IPv4'} "
+                           f"{'bound' if bound else 'unbound'} private SSH rejected", True)
                 if source == "tailscale" and family == socket.AF_INET and not bound:
                     result = self.request("public4", action="open", address=host, port=port, id="public-to-tailscale")
                     require(result["result"] == "accepted", "Public-to-private-address TCP control connection failed")
@@ -488,13 +499,16 @@ class Sandbox:
                            PUBLIC[version], port, True, "input")
             self.probe(f"control IPv{version} public routed backend listener", f"public{version}",
                        BACKEND[version], 80, True, "forward")
-        for variant in ("ingress", "non-ingress", "empty-ports"):
+        for variant in ("ingress", "non-ingress", "empty-ports", "foreign-source"):
             self.apply(rendered, variant)
             for version in (4, 6):
-                for port in PORTS if variant == "ingress" else (80, 443):
+                for port in PORTS if variant in ("ingress", "foreign-source") else (22, 80, 443):
+                    # The listed public source reaches SSH everywhere and HTTP(S) on the ingress node only.
+                    accepted = variant != "foreign-source" and (
+                        port == 22 or (variant == "ingress" and port in (80, 443)))
                     self.probe(f"{variant} IPv{version} public INPUT {port}", f"public{version}",
-                               PUBLIC[version], port, variant == "ingress" and port in (80, 443), "input")
-            if variant != "empty-ports":
+                               PUBLIC[version], port, accepted, "input")
+            if variant not in ("empty-ports", "foreign-source"):
                 self.internal_paths(variant)
         self.nft("delete table inet cvp_filter")
         rules = []
@@ -511,7 +525,7 @@ class Sandbox:
                                   (PUBLIC[version], 30080), (ALTERNATE[version], 80)):
                 self.probe(f"control IPv{version} DNAT {address}:{port}", f"public{version}",
                            address, port, True, "forward")
-        for variant in ("ingress", "non-ingress", "empty-ports"):
+        for variant in ("ingress", "non-ingress", "empty-ports", "foreign-source"):
             self.apply(rendered, variant, nat=True)
             if variant == "non-ingress":
                 for version in (4, 6):

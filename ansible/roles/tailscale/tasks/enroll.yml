@@ -9,6 +9,12 @@
     fail_msg: Supply credentials only through tailscale_auth_key.
   no_log: true
 
+- name: Keep Tailscale SSH disabled during enrollment
+  ansible.builtin.assert:
+    that:
+      - tailscale_extra_up_args | select('match', '^-{1,2}ssh(?:=|$)') | list | length == 0
+    fail_msg: SSH uses the node's public address; Tailscale SSH cannot be enabled.
+
 - name: Enroll using a private ephemeral credential file
   block:
     - name: Allocate the enrollment credential file
@@ -33,7 +39,7 @@
                    '--accept-dns=' ~ ('true' if tailscale_accept_dns | bool else 'false'),
                    '--advertise-tags=' ~ (tailscale_advertise_tags | join(','))]
                  + (['--login-server=' ~ tailscale_login_server] if tailscale_login_server | length > 0 else [])
-                 + tailscale_extra_up_args }}"
+                 + tailscale_extra_up_args + ['--ssh=false'] }}"
       no_log: true
       changed_when: true
   always:
