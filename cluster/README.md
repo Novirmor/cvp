@@ -29,7 +29,7 @@ No live cluster changes are performed by repository validation. Use a real
 context only after reviewing the rendered output.
 
 1. Bootstrap the first host and any later nodes with `task node-new`,
-   `task node-join`, and `task node-private` (`docs/runbooks/nodes.md`); the
+   `task node-bootstrap`, and `task node-join` (`docs/runbooks/nodes.md`); the
    first node is selected in `k3s_cluster_init_host` and `k3s_server_host`. Confirm API access, CoreDNS, packaged Traefik, ServiceLB, and the
    configured WireGuard addresses are healthy.
 2. Restrict K3s ServiceLB to the ingress pool. Label only the ingress node with

@@ -155,12 +155,13 @@ tasks:
     cmds:
       - mise exec -- python3 -B scripts/cvp_node.py join {{.CLI_ARGS}}
 
-  node-private:
+  node-bootstrap:
     desc: >-
-      Move one joined node's SSH to its Tailscale address and reconverge
-      (e.g. task node-private -- worker1 --confirm worker1)
+      Copy scripts/node-bootstrap.sh to a fresh Debian host over SSH and run it
+      as root to create the ops operator
+      (e.g. task node-bootstrap -- worker1 --confirm worker1 --host-key-fingerprint SHA256:...)
     cmds:
-      - mise exec -- python3 -B scripts/cvp_node.py private {{.CLI_ARGS}}
+      - mise exec -- python3 -B scripts/cvp_node.py bootstrap {{.CLI_ARGS}}
 
   onboard:
     desc: >-

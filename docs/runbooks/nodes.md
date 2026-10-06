@@ -1,13 +1,27 @@
 # Nodes: Bootstrap and Grow the Cluster
 
 This is the one procedure for every host: the first one that initializes the
-cluster and each one you add later. Three commands drive it:
+cluster and each one you add later. Every host starts as a freshly installed
+Debian system with nothing else on it.
+
+## Network rules
+
+| Path | Carries | Never carries |
+| --- | --- | --- |
+| Public IP | SSH (TCP `22`) from your listed operator addresses; HTTP(S) `80`/`443` on the ingress node from Cloudflare's published ranges only; the encrypted WireGuard transport (UDP `51820`) between nodes | Kubernetes API, etcd, kubelet, VXLAN |
+| WireGuard (`wg0`) | Node-to-node cluster traffic: API `6443`, etcd `2379`/`2380`, kubelet `10250`, Flannel VXLAN `8472` | SSH |
+| Tailscale | People (and CI) reaching internal services: Kubernetes API `6443`, internal applications through the ingress node's Traefik | SSH, cluster-internal ports |
+
+The host firewall, the tailnet policy, and the commands below enforce these
+rules; there is no "move SSH to Tailscale" step.
+
+## Commands
 
 | Command | What it does | Touches |
 | --- | --- | --- |
 | `task node-new` | Allocates the mesh address, generates the WireGuard key, writes host vars, inventory groups, and the operator entry, then validates the result. Dry run unless `--write`; rolls back if validation fails. | Controller files only |
-| `task node-join` | Trusts the host key, grants `ops` access, probes, checks fleet membership, converges, probes the mesh, verifies. Records progress and resumes. | The new host and, during `site`, the whole fleet |
-| `task node-private` | Proves private SSH over Tailscale with the already-trusted host key, switches inventory and the SSH source allowance to it, reconverges. Rolls back if Ansible cannot use the new path. | The fleet |
+| `task node-bootstrap` | Trusts the fresh host's SSH key only if it matches the provider-console fingerprint, copies `scripts/node-bootstrap.sh` to it over SSH, and runs it as root: installs Python, sudo, and SSH, and creates the `ops` operator with your key and passwordless sudo. Then proves `ops` login and sudo. | The new host (accounts and packages only) |
+| `task node-join` | Validates, probes, checks fleet membership, converges, probes the mesh, verifies. Records progress and resumes. | The new host and, during `site`, the whole fleet |
 
 Run controller commands from the repository root. The default inventory is
 empty and creates no machines. Add **one node at a time**.
@@ -18,14 +32,6 @@ fingerprints below are **illustrative; replace them**. The mesh example
 never deploy a documentation-only range such as `192.0.2.0/24` as the mesh.
 
 ## 1. Prerequisites
-
-**Recommended host:** a fresh Debian 13 (trixie) amd64 VM with systemd,
-working package repositories, and provider-console access. This is a
-dependency-compatible baseline, not a claim of a completed live deployment
-test. Review the pinned K3s version in `ansible/inventory/group_vars/all.yml`.
-LXC needs provider-supplied overlay/VXLAN/bridge-netfilter support, delegated
-cgroups, TUN access, and bridge sysctls; the guest cannot load kernel modules,
-and a failing compatibility probe calls for provider changes or a VM.
 
 On a Debian controller, install the system prerequisites and
 [mise](https://mise.jdx.dev/getting-started.html), then run the local checks:
@@ -50,25 +56,20 @@ Gather these inputs before the first host:
 
 | Input | What to check |
 | --- | --- |
-| SSH address and host fingerprint | Fingerprint from the provider console or another trusted provider channel; key-authenticated root SSH already works |
+| A host with a public IP | Provider console access; you will install Debian on it (section 3.1) |
+| Your public SSH source | The controller's actual public IPv4 `/32` or IPv6 `/128`. It is the **permanent** SSH allowance, so prefer a stable address (office, VPN egress, or bastion) |
 | Operator SSH key | Dedicated, passphrase-less automation key outside Git (section 2) |
-| Public WireGuard endpoint | Stable address with UDP `51820` reachable from every peer; defaults to the SSH address |
 | Mesh subnet | One unused RFC1918 `/24`; no overlap with your LAN, routes, or K3s pod/service CIDRs |
-| Tailscale | Controller enrolled; ACL lets it reach `tag:k3s` on TCP `22` and `6443`; `tagOwners` for `tag:k3s` and `tag:k3s-ingress`; a **node enrollment auth key** for those tags (not a provider API credential) |
-| Controller egress | The controller's actual public IPv4 `/32` or IPv6 `/128` for temporary SSH |
+| Tailscale | Controller enrolled; ACL lets admins reach `tag:k3s` on TCP `6443` and `tag:k3s-ingress` on `80`/`443`; `tagOwners` for `tag:k3s` and `tag:k3s-ingress`; a **node enrollment auth key** for those tags (not a provider API credential) |
+| Cloudflare | The public names you will proxy to the ingress node (orange-cloud). Direct, non-Cloudflare requests to the origin are dropped |
 
 If adopting the repository's tailnet policy, follow the
 [Tailscale adoption procedure](tofu.md#adopting-external-resources) first: that
 root owns the complete ACL and DNS configuration.
 
-Provider firewalls must allow bootstrap SSH from that controller source only,
-UDP `51820` to each WireGuard endpoint, and public TCP `80`/`443` only to the
-ingress node. Public `6443`, etcd, and VXLAN ports are not needed: cluster
-traffic uses WireGuard and administration uses Tailscale.
-
-If the provider supplies only a non-root account, **stop** and use its console
-or recovery procedure to install your root public key. `node-join` cannot create
-the first connection. Never disable host-key checking or enable password login.
+In the provider firewall (if any), allow TCP `22` from your SSH source only, UDP
+`51820` to every node, and TCP `80`/`443` to the ingress node. Public `6443`,
+etcd, kubelet, and VXLAN ports are never needed.
 
 ## 2. Create the operator SSH key (once)
 
@@ -79,12 +80,35 @@ chmod 0700 "$HOME/.ssh" "$HOME/.config/cvp"
 ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/cvp-ops" -C cvp-ops
 ```
 
-`node-join` installs `cvp-ops.pub` for the `ops` account. Generate keys once,
-not on each retry.
+`node-bootstrap` installs `cvp-ops.pub` for the `ops` account. Generate keys
+once, not on each retry.
 
 ## 3. First host
 
-### 3.1 Scaffold it
+### 3.1 Install Debian from scratch
+
+In the provider panel, install **Debian 13 (trixie), amd64**, minimal, as a VM
+or bare metal. Choose the SSH server option if the installer offers one. Either
+set a root password or give the provider your root SSH key; both work for the
+one-time bootstrap. Note the public IPv4/IPv6 address.
+
+Read the SSH host key fingerprint **through the provider console** (not over
+the network), and keep it for `node-bootstrap`:
+
+```sh
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Example output: `256 SHA256:Xy...Q root@server1 (ED25519)`. If the image has no
+SSH server yet, run `apt-get install -y openssh-server` in the console first.
+Cloud images that allow only a sudo user (such as `admin` or `debian`) are
+supported with `--login-user`.
+
+LXC containers additionally need provider-supplied overlay/VXLAN/bridge-netfilter
+support, delegated cgroups, TUN access, and bridge sysctls; a failing probe
+calls for provider changes or a VM.
+
+### 3.2 Scaffold it
 
 Paste the Tailscale enrollment key from your secret store into a private file
 (it is not echoed or kept in shell history), then preview the node:
@@ -106,7 +130,7 @@ ingress node; it gets directory-backed local storage on the root filesystem
 - `ansible/inventory/hosts.yml`: group membership and both shared server selections;
 - `ansible/inventory/host_vars/server1.yml`: identity, mesh, labels, storage;
 - `~/.config/cvp/keys/server1.wg-private` (mode `0600`): a new WireGuard key;
-- `~/.config/cvp/operator.yml` (mode `0600`): credential references and the SSH source.
+- `~/.config/cvp/operator.yml` (mode `0600`): credential references and your SSH source.
 
 **Store the WireGuard private key in your external secret store now.** The
 generated files are shown in [section 8](#8-reference-generated-files). Pass
@@ -115,52 +139,45 @@ a WireGuard endpoint different from the SSH address, and `--no-storage` to skip
 storage preparation. Edit the generated host vars before joining for anything
 else, such as a custom SSH port.
 
-### 3.2 Join it
-
-Preview first. The fingerprint comes from the provider console; the root key is
-the provider's root login key:
+### 3.3 Bootstrap the fresh host
 
 ```sh
-task node-join -- server1 --confirm server1 --preview \
-  --host-key-fingerprint SHA256:REPLACE_WITH_PROVIDER_FINGERPRINT \
-  --root-key "$HOME/.ssh/provider-root"
+task node-bootstrap -- server1 --confirm server1 \
+  --host-key-fingerprint SHA256:REPLACE_WITH_CONSOLE_FINGERPRINT
+```
+
+It refuses to continue unless the host presents the key you read in the
+console, then asks for the root password once (or uses `--root-key`). It copies
+`scripts/node-bootstrap.sh` to the host, runs it as root, deletes it, and
+proves that `ops` logs in with your operator key and has passwordless sudo. The
+script installs `python3`, `python3-apt`, `sudo`, `kmod`, `procps`, and
+`openssh-server`; it does not touch networking. For a sudo-only cloud image use
+`--login-user admin` (the script then runs with `sudo`).
+
+### 3.4 Join it
+
+Preview first, then join:
+
+```sh
+task node-join -- server1 --confirm server1 --preview
 task node-join -- server1 --confirm server1
 ```
 
-Expected: `Join verified for server1.` The preview trusts the host key only if
-the presented key matches the fingerprint, grants `ops` login and passwordless
-sudo, runs the read-only probe, and shows a check-mode `site` diff. Check mode
-does not exchange tokens or start services. The real run continues with `site`,
-which registers the node quarantined and then applies its labels/taints and
-removes the quarantine in one API patch.
+Expected: `Join verified for server1.` The preview runs inventory validation,
+the read-only probe, and a check-mode `site` diff; check mode does not
+exchange tokens or start services. The real run continues with `site`, which
+enrolls Tailscale, brings up WireGuard and the firewall, and installs K3s. The
+node registers quarantined; its labels/taints are applied and the quarantine
+removed in one API patch. From now on SSH is accepted only from your listed
+public source, and the API certificate covers the server's Tailscale address.
 
-### 3.3 Move SSH to the private address
+### 3.5 Export a kubeconfig over Tailscale
 
-```sh
-task node-private -- server1 --confirm server1
-```
-
-It reads the node's Tailscale IP over the trusted public path, accepts the key
-at the private address only if it equals the trusted key, proves a fresh
-private login and sudo, and reads the client source the host sees. It then sets
-`ansible_host`/`tailscale_address` (and, for servers, `k3s_tls_sans`) to the
-Tailscale IP and replaces the SSH source with that client `/32`. If Ansible
-cannot log in through the new address, it restores both files. Otherwise it
-runs probe, `site`, the mesh probe, and verification.
-
-If the host sees a non-Tailscale client source, the command stops; supply an
-independently verified `--source 100.x.y.z/32`. Then **remove the provider's
-public SSH exception**. Keep UDP `51820` open for the mesh.
-
-Stock sshd sockets are not bound to an interface, so the firewall keeps an
-explicit SSH source allowance even over Tailscale. Never set both source lists
-to `[]` in the operator file to "close" SSH.
-
-### 3.4 Export a private, TLS-verified kubeconfig
-
-`node-private` added the server's Tailscale IP to its API certificate SANs:
+Read the server's Tailscale address and export a TLS-verified kubeconfig that
+reaches the API through the tailnet:
 
 ```sh
+ssh -i "$HOME/.ssh/cvp-ops" ops@203.0.113.20 tailscale ip -4
 CVP_KUBECONFIG_HOST=server1 CVP_KUBECONFIG_CONFIRM=server1 \
 CVP_KUBECONFIG_CONTEXT=cvp \
 CVP_KUBECONFIG_SERVER=https://100.100.100.20:6443 \
@@ -174,14 +191,17 @@ mise exec -- kubectl --context cvp get nodes -o wide
 Choose a **new** output path outside Git. The exported credentials are
 cluster-admin secrets. Never use `insecure-skip-tls-verify` to bypass a SAN,
 CA, routing, or ACL failure. Expected: `/readyz` returns `ok` and `server1` is
-Ready with InternalIP `10.77.0.1`. **Flux is a separate step:** continue with
-[the cluster runbook](cluster.md#bootstrap) and [external providers](tofu.md).
+Ready with InternalIP `10.77.0.1`. Optionally record the address as
+`tailscale_address` in its host vars. **Flux is a separate step:** continue
+with [the cluster runbook](cluster.md#bootstrap) and [external providers](tofu.md).
 
-### 3.5 Accept the host and establish recovery before production
+### 3.6 Accept the host and establish recovery before production
 
-- Record probe/verify results, private SSH/API access, and an intentional
-  reboot check. Local tests do not prove production reboot, network, or
-  recovery behavior.
+- Record probe/verify results, SSH and API access, and an intentional reboot
+  check. Local tests do not prove production reboot, network, or recovery
+  behavior.
+- Point the public names at the ingress node through Cloudflare (proxied).
+  Direct requests to the origin from non-Cloudflare addresses are dropped.
 - Before production data, enable encrypted off-host backups following
   [backup enablement](../../ansible/README.md#backup-enablement), and perform a
   [disposable restore drill](../../ansible/README.md#datastore-restore).
@@ -201,26 +221,28 @@ WireGuard InternalIP. Review placement and recovery impact: adding nodes does
 not make ingress or local data highly available. Keep exactly one ingress node;
 move it only with [ingress relocation](ingress-relocation.md).
 
-### 4.2 Scaffold it
+### 4.2 Install Debian, scaffold, and bootstrap it
+
+Install Debian and read its fingerprint as in [section 3.1](#31-install-debian-from-scratch), then:
 
 ```sh
 task node-new -- worker1 --ssh 203.0.113.21 --virt vm \
   --ssh-source 203.0.113.10/32 \
   --tailscale-auth-key-file "$HOME/.config/cvp/keys/worker1.ts-authkey"
+task node-bootstrap -- worker1 --confirm worker1 \
+  --host-key-fingerprint SHA256:REPLACE_WITH_CONSOLE_FINGERPRINT
 ```
 
-Review, then rerun with `--write`. Later nodes default to compute-only agents
-with the next free mesh address and the operator key shared by the existing
-nodes. Use `--mesh-address`, `--label`, `--storage`, and `--role server` to
-change that. The operator file must still resolve **every** credential
-reference for **every** host on each run (section 8).
+Run `node-new` once without `--write` to review, then with it. Later nodes
+default to compute-only agents with the next free mesh address and the operator
+key shared by the existing nodes. Use `--mesh-address`, `--label`, `--storage`,
+and `--role server` to change that. The operator file must still resolve
+**every** credential reference for **every** host on each run (section 8).
 
 ### 4.3 Join it
 
 ```sh
-task node-join -- worker1 --confirm worker1 \
-  --host-key-fingerprint SHA256:REPLACE_WITH_PROVIDER_FINGERPRINT \
-  --root-key "$HOME/.ssh/provider-root"
+task node-join -- worker1 --confirm worker1
 ```
 
 `site` converges **the entire fleet**, because every existing peer needs the new
@@ -236,17 +258,17 @@ time. SQLite permits only one server. Confirm the quorum review explicitly:
 task node-new -- server2 --ssh 203.0.113.22 --virt vm --role server \
   --ssh-source 203.0.113.10/32 \
   --tailscale-auth-key-file "$HOME/.config/cvp/keys/server2.ts-authkey"
-task node-join -- server2 --confirm server2 --server-confirm server2 \
-  --host-key-fingerprint SHA256:REPLACE_WITH_PROVIDER_FINGERPRINT
+task node-bootstrap -- server2 --confirm server2 \
+  --host-key-fingerprint SHA256:REPLACE_WITH_CONSOLE_FINGERPRINT
+task node-join -- server2 --confirm server2 --server-confirm server2
 ```
 
 Never add a second init server, reset the datastore, or point the shared server
 selections at a node that has not joined.
 
-### 4.4 Make it private and accept it
+### 4.4 Accept it
 
 ```sh
-task node-private -- worker1 --confirm worker1
 task probe-wireguard
 mise exec -- kubectl --context cvp get nodes -o wide
 ```
@@ -262,7 +284,7 @@ it does not evict existing pods.
 | Stage | Kind | Result |
 | --- | --- | --- |
 | `validate` | read-only | Effective inventory, topology, and node tags are valid (controller only) |
-| `access` | mutating | `ops` login and sudo work; if not, `prepare-access` installs prerequisites and the operator key through root |
+| `access` | mutating | `ops` login and sudo work; if not, run `task node-bootstrap` (or pass `--root-key` to use the Ansible `prepare-access` path) |
 | `probe` | read-only | Host compatibility (kernel, cgroups, modules, virtualization) |
 | `preflight` | read-only | Later nodes only: API `/readyz` and full fleet membership |
 | `site` | mutating | Full-fleet convergence under lifecycle locks; the node joins |
@@ -285,17 +307,31 @@ edit, create, or remove them during a run: the next stage stops.
 | Failed stage | What to do before continuing |
 | --- | --- |
 | `node-new` | Nothing was kept. Fix the reported inventory, credential, or address problem |
-| Host key / root login | Stop at the provider console or identity verification. No trust bypass |
-| `access` | Inspect partial package/account/key changes; no locks are taken and networking is unchanged |
+| `node-bootstrap` host key | Stop. Re-read the fingerprint in the provider console; never bypass the check |
+| `node-bootstrap` script | Read its output; it is safe to rerun. It changes only packages, the `ops` account, its key, and `/etc/sudoers.d/ops` |
 | `validate`, `probe`, `preflight` | Fix tools, inventory, secrets, sudo, compatibility, or fleet health. These gates do not mutate hosts or take locks |
 | `site` | Later phases stop and acquired `/var/lib/cvp/lifecycle.lock` directories can remain across the fleet. Inspect every selected host's lock owner, running controller/host processes, and service journals. Resolve the interrupted state before explicit lock cleanup, then rerun with `--retry-reviewed` |
 | `mesh`, `verify` | The join may be complete and locks released. Diagnose live state, then rerun to resume. Do not delete the Node or reset etcd to hide an error |
-| `node-private` | Before the switch, nothing changed; after a failed Ansible check, both files were restored. During reconvergence, keep the public exception and diagnose the tailnet ACL, host key, listener, and firewall |
 
 Locks never expire and are never stolen automatically. If a restore guard or
 staging exists, follow [datastore recovery](../../ansible/README.md#datastore-restore)
 before any cleanup or startup; deleting a guard can authorize startup of an
 unresolved datastore.
+
+### Your public SSH address changed
+
+SSH is accepted only from the sources in each host's operator entry. Before
+your address changes, add the new `/32` or `/128` next to the old one in every
+host's `firewall_ssh_ipv4_source_cidrs` (or `..._ipv6_...`) and run
+`task site`; remove the old one afterwards. If you are already locked out, open
+the provider console on each host and temporarily allow the new source, then
+fix the operator file and converge:
+
+```sh
+nft insert rule inet cvp_filter input ip saddr 198.51.100.7 tcp dport 22 accept
+```
+
+`task site` replaces that temporary console rule with the managed policy.
 
 ## 7. Removing a node
 
@@ -347,7 +383,7 @@ Both server selections stay in `all.vars` so every node inherits them.
 override them. Every mesh host is in exactly one of `k3s_servers` and
 `k3s_agents`, matching its `k3s_role`.
 
-`host_vars/server1.yml` (before `node-private`):
+`host_vars/server1.yml`:
 
 ```yaml
 ---

@@ -181,19 +181,31 @@ SOPS age identity directly into the cluster. Ansible never owns those secrets.
 
 ## Network model
 
+Each path has one purpose:
+
+| Path | Carries |
+| --- | --- |
+| Public IP | SSH from listed operator sources; Cloudflare-proxied HTTP(S) to the ingress node; the encrypted WireGuard transport (UDP `51820`) |
+| WireGuard `wg0` | Node-to-node cluster traffic only (no SSH) |
+| Tailscale | People and CI reaching internal services: the Kubernetes API and internal applications (no SSH) |
+
 ```text
 Internet
   -> Cloudflare DNS/proxy
-  -> selected ingress node public IPv6:80/443
+  -> selected ingress node public IPv6:80/443 (Cloudflare source ranges only)
   -> socat forwarders to 127.0.0.1:80/443
   -> K3s ServiceLB
   -> Traefik
   -> Kubernetes Service
   -> Pod
 
-Operator
+Operator automation
+  -> node public IP:22 (listed operator sources only)
+  -> SSH for Ansible
+
+People and CI
   -> Tailscale
-  -> SSH, Kubernetes API, and temporary port-forward access
+  -> Kubernetes API, internal applications, and temporary port-forward access
 
 Node and pod traffic
   -> wg0 (operator-selected mesh; example 192.0.2.0/24)
@@ -229,19 +241,25 @@ The host firewall permits these node-to-node cluster paths on `wg0`:
 | UDP 8472 | all nodes | Flannel VXLAN |
 | TCP 10250 | all nodes | Kubelet API and metrics |
 
-Tailscale separately permits SSH and API access, plus ingress testing on ingress
-nodes; pods can reach the API and kubelet through their configured pod CIDR.
-WireGuard endpoint source allowlists default to all sources, with peer keys
-providing authentication. Narrow the allowlists to stable peer endpoints when
-available.
+Tailscale permits the Kubernetes API, plus internal applications on the
+ingress node; pods can reach the API and kubelet through their configured pod
+CIDR. Neither Tailscale nor WireGuard accepts SSH. WireGuard endpoint source
+allowlists default to all sources, with peer keys providing authentication.
+Narrow the allowlists to stable peer endpoints when available. K3s servers add
+their live Tailscale addresses to the API certificate, so people reach the API
+over the tailnet with TLS verification.
 
-Firewall administration preflight requires either an explicit source CIDR
-matching the current SSH client or exact established-socket kernel binding to
-the private interface and a direct matching return route. Stock unbound sshd
-therefore needs a host-scoped `/32` or `/128`, including the client's Tailscale
-source address for ordinary private SSH. If session metadata is unavailable,
-an independently verified source CIDR remains mandatory. Backend `Running`
-and private destination addresses alone cannot authorize activation.
+SSH is accepted only on the public uplinks from host-scoped `/32` or `/128`
+operator sources. Firewall administration preflight requires the current SSH
+client to match one of them and rejects sessions to Tailscale or mesh addresses
+and source CIDRs that overlap those ranges. If session metadata is unavailable,
+an explicit source CIDR remains mandatory.
+
+Public HTTP(S) on the ingress node accepts only Cloudflare's published source
+ranges (`firewall_public_ingress_ipv4_source_cidrs` and
+`firewall_public_ingress_ipv6_source_cidrs`), on both the host input path and
+the forwarded ServiceLB DNAT path, so the origin cannot be reached around
+Cloudflare.
 
 The firewall identifies IPv4 and IPv6 public uplinks separately. New external
 forwarding is allowed only for DNAT traffic whose original destination is an
@@ -345,7 +363,8 @@ Cloudflare records point public names at the selected ingress node. This is not
 advertised as highly available. Moving ingress is a documented recovery action
 that updates the node label and DNS.
 
-Private administration uses Tailscale and `kubectl port-forward` by default.
+People reach internal services through Tailscale and `kubectl port-forward` by
+default; host administration (Ansible) uses SSH on the public address.
 An in-cluster SSO and private-dashboard ingress plane is added only when a real
 application requires browser access by more than the owner.
 

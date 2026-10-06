@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Controller-side tests for cvp_node.py (node-new, node-join, node-private).
+"""Controller-side tests for cvp_node.py (node-new, node-bootstrap, node-join).
 
 `new` runs against a temporary inventory with the real validate-inventory
-playbook. `join` and `private` run with stubbed ansible/ssh executables that
+playbook. `bootstrap` and `join` run with stubbed ansible/ssh executables that
 record their argv, so no host is ever contacted.
 """
 import base64
@@ -60,12 +60,8 @@ if name == "ansible":
 elif name == "ssh-keyscan":
     key = os.environ.get("CVP_TEST_SCAN_KEY", "")
     print(args[-1] + " ssh-ed25519 " + key)
-elif name == "ssh":
-    command = args[-1]
-    if "tailscale ip -4" in command:
-        print(os.environ.get("CVP_TEST_TAILSCALE_IP", "100.100.100.21"))
-    elif "SSH_CONNECTION" in command:
-        print(os.environ.get("CVP_TEST_SSH_CONNECTION", "100.100.100.10 50000 100.100.100.21 22"))
+elif name in ("ssh", "scp") and os.environ.get("CVP_TEST_SSH_FAIL"):
+    sys.exit(255)
 """
 
 
@@ -87,8 +83,9 @@ class NodeLifecycleTests(unittest.TestCase):
         self.home = self.directory / "home"
         (self.home / ".ssh").mkdir(parents=True, mode=0o700)
         self.ssh_key = self.home / ".ssh/cvp-ops"
-        self.ssh_key.write_text("synthetic\n")
-        self.ssh_key.with_suffix(".pub").write_text("ssh-ed25519 AAAA synthetic\n")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "cvp-ops", "-f", str(self.ssh_key)],
+                       check=True)
+        self.public_key = self.ssh_key.with_suffix(".pub").read_text().strip()
         self.calls = self.directory / "calls"
         self.stubs = self.directory / "stubs"
         self.stubs.mkdir()
@@ -314,7 +311,7 @@ class NodeLifecycleTests(unittest.TestCase):
         self.trust("203.0.113.20")
         self.ssh_key.with_suffix(".pub").unlink()
         self.install_stubs("ansible-playbook", "ansible")
-        self.join("server1", success=False, env={"CVP_TEST_ANSIBLE_FAIL": "1"}, expected="--public-key")
+        self.join("server1", success=False, env={"CVP_TEST_ANSIBLE_FAIL": "1"}, expected="task node-bootstrap")
         self.assertNotIn("site.yml", self.playbooks())
 
     def test_changed_credential_file_stops_between_stages(self):
@@ -351,56 +348,62 @@ class NodeLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("onboard-preflight.yml", self.playbooks())
 
-    # -- node-private ----------------------------------------------------
+    # -- node-bootstrap --------------------------------------------------
 
-    def joined_server(self):
+    def bootstrap(self, *extra, **kwargs):
+        env = {"SYNTHETIC_TS_KEY": "synthetic-ts-key", "CVP_TEST_SCAN_KEY": HOST_KEY, **kwargs.pop("env", {})}
+        return self.cli("bootstrap", "server1", "--confirm", "server1", "--inventory", str(self.inventory),
+                        *extra, stub=True, env=env, **kwargs)
+
+    def test_bootstrap_copies_and_runs_the_script_after_trusting_the_host_key(self):
+        self.first_host()
+        self.install_stubs("ansible", "ssh", "scp", "ssh-keyscan")
+        self.bootstrap(success=False, expected="--host-key-fingerprint")
+        self.bootstrap("--host-key-fingerprint", fingerprint(OTHER_KEY), success=False,
+                       expected="did not present the expected host key")
+        self.assertFalse(any(call[0] in ("scp", "ssh") for call in self.recorded()))
+        self.bootstrap("--host-key-fingerprint", fingerprint(HOST_KEY), expected="ready for Ansible")
+        self.assertIn(f"203.0.113.20 ssh-ed25519 {HOST_KEY}", (self.home / ".ssh/known_hosts").read_text())
+        calls = self.recorded()
+        scp = next(call for call in calls if call[0] == "scp")
+        self.assertEqual(scp[-2:], [str(ROOT / "scripts/node-bootstrap.sh"), "root@203.0.113.20:cvp-node-bootstrap.sh"])
+        self.assertIn("StrictHostKeyChecking=yes", scp)
+        run = next(call for call in calls if call[0] == "ssh" and "-O" not in call)
+        self.assertEqual(run[-2], "root@203.0.113.20")
+        self.assertEqual(run[-1], f"sh cvp-node-bootstrap.sh {shlex.quote(self.public_key)}; status=$?; "
+                                  "rm -f cvp-node-bootstrap.sh; exit $status")
+        self.assertTrue(any(call[0] == "ssh" and "-O" in call for call in calls), "control master not closed")
+        self.assertEqual(calls[-1][0], "ansible")
+
+    def test_bootstrap_runs_with_sudo_for_a_provider_login_user(self):
         self.first_host()
         self.trust("203.0.113.20")
-        self.install_stubs("ansible-playbook", "ansible", "ssh", "ssh-keyscan")
+        self.install_stubs("ansible", "ssh", "scp")
+        self.bootstrap("--login-user", "admin")
+        run = next(call for call in self.recorded() if call[0] == "ssh" and "-O" not in call)
+        self.assertEqual(run[-2], "admin@203.0.113.20")
+        self.assertTrue(run[-1].startswith("sudo sh cvp-node-bootstrap.sh "))
 
-    def private(self, *extra, **kwargs):
-        env = {"SYNTHETIC_TS_KEY": "synthetic-ts-key", "CVP_TEST_SCAN_KEY": HOST_KEY, **kwargs.pop("env", {})}
-        return self.cli("private", "server1", "--confirm", "server1", "--inventory", str(self.inventory), *extra,
-                        stub=True, env=env, **kwargs)
-
-    def test_private_moves_ssh_after_matching_host_key(self):
-        self.joined_server()
-        self.private(expected="now uses private SSH at 100.100.100.21")
-        host = self.host_vars("server1")
-        self.assertEqual(host["ansible_host"], "100.100.100.21")
-        self.assertEqual(host["tailscale_address"], "100.100.100.21")
-        self.assertEqual(host["k3s_tls_sans"], ["100.100.100.21"])
-        entry = self.operator()["cvp_operator_hosts"]["server1"]
-        self.assertEqual(entry["firewall_ssh_ipv4_source_cidrs"], ["100.100.100.10/32"])
-        self.assertEqual(entry["firewall_ssh_ipv6_source_cidrs"], [])
-        self.assertIn(f"100.100.100.21 ssh-ed25519 {HOST_KEY}", (self.home / ".ssh/known_hosts").read_text())
-        self.assertEqual(self.playbooks(), ["probe.yml", "site.yml", "probe-wireguard.yml", "verify.yml"])
+    def test_bootstrap_fails_when_ops_cannot_log_in_afterwards(self):
+        self.first_host()
+        self.trust("203.0.113.20")
+        self.install_stubs("ansible", "ssh", "scp")
+        self.bootstrap(env={"CVP_TEST_ANSIBLE_FAIL": "1"}, success=False, expected="ops could not log in")
         self.calls.unlink()
-        self.private(expected="nothing to do")
+        self.bootstrap(env={"CVP_TEST_SSH_FAIL": "1"}, success=False, expected="command failed")
+        self.assertNotIn("ansible", [call[0] for call in self.recorded()])
 
-    def test_private_refuses_a_different_host_key(self):
-        self.joined_server()
-        before = (self.inventory.parent / "host_vars/server1.yml").read_text()
-        self.private(env={"CVP_TEST_SCAN_KEY": OTHER_KEY}, success=False, expected="differs from the trusted")
-        self.assertEqual((self.inventory.parent / "host_vars/server1.yml").read_text(), before)
-        self.assertEqual(self.playbooks(), [])
-
-    def test_private_rolls_back_when_ansible_cannot_use_the_new_path(self):
-        self.joined_server()
-        host_before = (self.inventory.parent / "host_vars/server1.yml").read_text()
-        operator_before = (self.home / ".config/cvp/operator.yml").read_text()
-        self.private(env={"CVP_TEST_ANSIBLE_FAIL": "1"}, success=False, expected="Restored the previous")
-        self.assertEqual((self.inventory.parent / "host_vars/server1.yml").read_text(), host_before)
-        self.assertEqual((self.home / ".config/cvp/operator.yml").read_text(), operator_before)
-        self.assertNotIn("site.yml", self.playbooks())
-
-    def test_private_requires_a_tailnet_client_source_or_explicit_one(self):
-        self.joined_server()
-        connection = {"CVP_TEST_SSH_CONNECTION": "198.51.100.7 50000 100.100.100.21 22"}
-        self.private(env=connection, success=False, expected="--source")
-        self.private("--source", "100.100.100.99/32", env=connection, expected="now uses private SSH")
-        entry = self.operator()["cvp_operator_hosts"]["server1"]
-        self.assertEqual(entry["firewall_ssh_ipv4_source_cidrs"], ["100.100.100.99/32"])
+    def test_remote_script_validates_its_key_before_touching_the_host(self):
+        script = ROOT / "scripts/node-bootstrap.sh"
+        for key, expected in (("not-a-key", "not an approved SSH public key type"),
+                              ("ssh-ed25519 AAAA\nssh-ed25519 BBBB", "single line"),
+                              (self.public_key, "run as root")):
+            with self.subTest(key=key[:20]):
+                result = subprocess.run(["sh", str(script), key], text=True, capture_output=True, timeout=10)
+                if os.getuid() == 0:
+                    self.skipTest("the remote script must not run as root in tests")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected, result.stderr)
 
 
 if __name__ == "__main__":

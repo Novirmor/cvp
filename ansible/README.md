@@ -93,9 +93,9 @@ their kernel modules loaded and persisted by the base role. Forwarding-enabled
 uplinks retain IPv6 router advertisements via `accept_ra=2`. Before a fresh
 host probe, the OS must have `kmod` and `procps` available; `task probe` is
 read-only and does not install packages or require an active WireGuard mesh.
-Every node, including the initial server, is scaffolded, joined, and moved to
-private SSH through `docs/runbooks/nodes.md` (`task node-new`, `task node-join`,
-`task node-private`). `inventory/host_vars/example-newnode.yml.example`
+Every node, including the initial server, starts as a fresh Debian install and
+is scaffolded, bootstrapped, and joined through `docs/runbooks/nodes.md`
+(`task node-new`, `task node-bootstrap`, `task node-join`). `inventory/host_vars/example-newnode.yml.example`
 documents each host variable for hand edits.
 
 Node labels are declared per host in `k3s_node_labels`; `cvp.io/role` is
@@ -225,8 +225,8 @@ onboard` (`CVP_ONBOARD_NODE`, `CVP_ONBOARD_CONFIRM`) remains as an alias; its
 
 The normal play changes host state. Do not run it against a live node until the
 host compatibility gate and recovery or accepted-loss review have passed. The
-firewall defaults to private SSH through Tailscale or WireGuard. Put temporary
-trusted SSH CIDRs in the target's operator entry as a list, then use that same
+firewall accepts SSH only on the public uplinks, from the trusted SSH CIDRs in
+the target's operator entry. Put them there as a list, then use that same
 configuration for convergence and verification:
 
 ```sh
@@ -234,25 +234,25 @@ CVP_OPERATOR_CONFIG_FILE=/secure/cvp/operator.yml task site
 CVP_OPERATOR_CONFIG_FILE=/secure/cvp/operator.yml task verify
 ```
 
-The firewall installs `iproute2` (`ss` and `ip`) before administration preflight.
-For an available SSH session, a source CIDR must match the **client address the
-host actually sees**. Without that matching CIDR, automatic private-path approval
-requires the exact established SSH socket to be kernel-bound to `tailscale0` or
-the inventory's `wireguard_interface`, plus a direct return route through that
-interface. Tailscale also requires backend `Running` and a destination in its
-local `Self.TailscaleIPs`; WireGuard requires the configured destination and an
-inventory peer source address. A private destination or return route alone is
-not ingress-interface proof.
+The firewall installs `iproute2` before administration preflight. For an
+available SSH session, a source CIDR must match the **public client address the
+host actually sees**, and the session must not target a Tailscale or WireGuard
+address: neither interface accepts SSH. SSH source CIDRs that overlap the
+Tailscale ranges or the mesh `/24` (including `0.0.0.0/0` and `::/0`) are
+rejected. Without `SSH_CONNECTION`, an explicit CIDR is still required. The
+helper's rejection prints the matching CIDR to add to that host's external
+operator settings.
 
-**Ordinary stock sshd sockets are unbound**, including when a fresh Tailscale SSH
-login succeeds. Such operators must keep an explicit host-scoped
-`firewall_ssh_ipv4_source_cidrs` `/32` or `firewall_ssh_ipv6_source_cidrs` `/128`
-matching the current client source. When moving from public SSH to Tailscale,
-replace the public egress CIDR with the client's Tailscale source CIDR; do not
-clear both lists merely because Tailscale reports `Running`. The exception can
-be removed entirely only when the exact socket-binding and return-route proof
-passes. Tailnet ACLs and SSH authentication still apply. The helper's rejection
-prints the matching CIDR to add to that host's external operator settings.
+Public `80`/`443` on the ingress node accept only
+`firewall_public_ingress_ipv4_source_cidrs` and
+`firewall_public_ingress_ipv6_source_cidrs`, which default to Cloudflare's
+published ranges (refresh them from <https://www.cloudflare.com/ips/> when
+Cloudflare announces a change). The same restriction applies to DNAT traffic
+forwarded to ServiceLB. An empty list closes public ingress for that family.
+
+K3s servers add their live Tailscale addresses to the API certificate SANs on
+every convergence, so people can reach the API over the tailnet without
+editing `k3s_tls_sans`.
 
 If `SSH_CONNECTION` is unavailable even after the unprivileged fallback, an
 explicit independently verified source CIDR is required. Preflight reports

@@ -284,9 +284,12 @@ applies remain frozen.
 The Tailscale policy is deny-by-default and only permits TCP paths needed by
 the K3s layout:
 
-- `group:admin` to `tag:k3s`: SSH `22` and Kubernetes API `6443`.
-- `group:admin` to `tag:k3s-ingress`: ingress/API testing on `80`, `443`.
+- `group:admin` to `tag:k3s`: Kubernetes API `6443`.
+- `group:admin` to `tag:k3s-ingress`: internal applications on `80`, `443`.
 - `group:ci` and `tag:ci` to `tag:k3s`: Kubernetes API `6443` only.
+
+SSH (`22`) is never granted over the tailnet; the policy tests assert that it is
+denied. Nodes accept SSH only on their public addresses.
 
 Nodes need the `tag:k3s` tag. The operator-selected ingress node also needs
 `tag:k3s-ingress`, and an ephemeral CI device must use `tag:ci`. Only the admin

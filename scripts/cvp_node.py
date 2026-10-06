@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Operator node lifecycle: scaffold a node, join it, and move its SSH private.
+"""Operator node lifecycle: scaffold a node, bootstrap a fresh Debian host, join it.
 
-new      Write inventory, host vars, a WireGuard key, and the operator entry for
-         one node as a single validated transaction. Never contacts a host.
-join     Run the guarded join stages in order and record progress, so a rerun
-         resumes after the last completed stage. An interrupted mutating stage
-         is never retried without --retry-reviewed.
-private  Move a joined node's SSH to its Tailscale address after matching the
-         private host key against the already-trusted public one.
+new        Write inventory, host vars, a WireGuard key, and the operator entry for
+           one node as a single validated transaction. Never contacts a host.
+bootstrap  Trust a fresh Debian host's SSH key by its provider fingerprint, copy
+           scripts/node-bootstrap.sh to it, and run it as root to create the
+           `ops` operator. Root may log in with a password once.
+join       Run the guarded join stages in order and record progress, so a rerun
+           resumes after the last completed stage. An interrupted mutating stage
+           is never retried without --retry-reviewed.
+
+SSH always uses the node's public address. Tailscale is for people reaching
+internal services; WireGuard is node-to-node cluster traffic only.
 """
 
 import argparse
@@ -23,6 +27,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 try:
     import yaml
@@ -45,8 +50,6 @@ GROUPS = ("wireguard", "k3s_servers", "k3s_agents", "storage_stateful", "ingress
 INGRESS_LABELS = ["cvp.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
                   "svccontroller.k3s.cattle.io/lbpool=public"]
 STORAGE_PATH = "/var/lib/rancher/k3s/storage"
-TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
-TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 
 class NodeError(Exception):
@@ -401,8 +404,8 @@ def cmd_new(args):
             path.unlink(missing_ok=True)
         raise
     say(f"\n{node} is in the inventory. Store {key_path} in your external secret store, then run:")
-    fingerprint = " --host-key-fingerprint SHA256:<from the provider console>"
-    say(f"  task node-join -- {node} --confirm {node}{fingerprint}"
+    say(f"  task node-bootstrap -- {node} --confirm {node} --host-key-fingerprint SHA256:<provider console>")
+    say(f"  task node-join -- {node} --confirm {node}"
         + ("" if first or role == "agent" else f" --server-confirm {node}"))
     return 0
 
@@ -618,15 +621,16 @@ def cmd_join(args):
     if args.preview:
         say(f"\nPreview complete for {node}. Review the diff, then rerun without --preview.")
         return 0
-    say(f"\nJoin verified for {node}. Next: task node-private -- {node} --confirm {node}")
+    say(f"\nJoin verified for {node}.")
     return 0
 
 
 def prepare_access(args, node, host):
     operator_key = host.get("ansible_private_key_file", "")
     public_key = args.public_key or (operator_key + ".pub" if operator_key else "")
-    require(public_key and Path(public_key).is_file(),
-            "operator SSH login is not ready: pass --public-key with the operator public key to grant it")
+    require(public_key and Path(public_key).is_file() and (args.root_key or args.public_key),
+            f"ops cannot log in to {node} yet: run task node-bootstrap -- {node} --confirm {node} first "
+            "(or pass --root-key for key-based root access)")
     env = dict(os.environ, CVP_ACCESS_NODE=node, CVP_ACCESS_CONFIRM=node,
                CVP_ACCESS_PUBLIC_KEY_FILE=str(Path(public_key).resolve()))
     if operator_key:
@@ -636,123 +640,63 @@ def prepare_access(args, node, host):
     run([str(ROOT / "scripts/prepare-node-access")], env=env)
 
 
-# --- node-private -----------------------------------------------------------
+# --- node-bootstrap ---------------------------------------------------------
 
-def ssh_command(host, port, key, command):
-    argv = ["ssh", "-F", "/dev/null", "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes",
-            "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "ControlMaster=no",
-            "-o", "ControlPath=none", "-o", f"UserKnownHostsFile={known_hosts_file()}",
-            "-i", key, "-p", str(port), f"ops@{host}", command]
-    result = subprocess.run(argv, text=True, capture_output=True, timeout=60)
-    require(result.returncode == 0, f"SSH to {host} failed: {result.stderr.strip()[-300:]}")
-    return result.stdout.strip()
+BOOTSTRAP_SCRIPT = ROOT / "scripts/node-bootstrap.sh"
+BOOTSTRAP_REMOTE = "cvp-node-bootstrap.sh"  # in the login user's home directory
 
 
-def replace_scalar(text, key, value):
-    pattern = re.compile(rf"^{re.escape(key)}:.*$", re.MULTILINE)
-    require(len(pattern.findall(text)) == 1, f"host vars must contain exactly one top-level {key} line")
-    return pattern.sub(lambda _: f"{key}: {value}", text)
+def operator_public_key(args, host):
+    operator_key = host.get("ansible_private_key_file", "")
+    public_key = args.public_key or (operator_key + ".pub" if operator_key else "")
+    require(public_key and Path(public_key).is_file(),
+            "pass --public-key with the operator SSH public key (default: <ansible_private_key_file>.pub)")
+    lines = Path(public_key).read_text().splitlines()
+    require(len(lines) == 1 and lines[0].strip(), f"{public_key} must contain exactly one SSH public key")
+    result = subprocess.run(["ssh-keygen", "-lf", public_key], text=True, capture_output=True)
+    require(result.returncode == 0, f"ssh-keygen rejected {public_key}")
+    return public_key, lines[0].strip()
 
 
-def tailnet_address(value):
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError:
-        return None
-    return address if address in (TAILNET_V4 if address.version == 4 else TAILNET_V6) else None
-
-
-def cmd_private(args):
+def cmd_bootstrap(args):
     node = args.node
-    require(args.confirm == node, f"pass --confirm {node} after reviewing the private access change")
+    require(NAME.fullmatch(node) is not None, "node names are lowercase letters, digits, and hyphens")
+    require(args.confirm == node, f"pass --confirm {node} after checking the host is the fresh {node} install")
     inventory = Path(args.inventory).resolve()
     data = read_inventory(inventory)
-    require(node in members(data, "wireguard"), f"{node} must be in the wireguard group")
+    require(node in members(data, "wireguard"), f"{node} must be in the wireguard group (run task node-new)")
     host = data["_meta"]["hostvars"][node]
-    public_host, port = host["ansible_host"], host.get("ansible_port", 22)
-    key = host.get("ansible_private_key_file", "")
-    require(key and Path(key).is_absolute(), f"{node} needs an absolute ansible_private_key_file")
-    if tailnet_address(str(public_host)) and host.get("tailscale_address") == public_host:
-        say(f"{node} already uses its Tailscale address {public_host}; nothing to do.")
-        return 0
-    operator, _ = pin_operator()
-    require_operator_hosts(operator, data)
+    require(host.get("ansible_user", "ops") == "ops", "the bootstrap creates the ops operator; keep ansible_user: ops")
+    address, port = host["ansible_host"], host.get("ansible_port", 22)
+    _, key = operator_public_key(args, host)
+    trust_bootstrap_key(address, port, args.host_key_fingerprint)
 
-    say(f"==> reading {node}'s Tailscale address over the trusted public path")
-    reported = ssh_command(public_host, port, key, "tailscale ip -4").splitlines()
-    private_host = tailnet_address(reported[0]) if reported else None
-    require(private_host is not None, "the node did not report a Tailscale IPv4 address; is it enrolled?")
-    private_host = str(private_host)
-
-    say(f"==> matching the host key at {private_host} with the trusted key for {public_host}")
-    trusted = trusted_keys(public_host, port)
-    require(trusted, f"{public_host} has no trusted key in {known_hosts_file()}")
-    scanned = scan_keys(private_host, port)
-    match = scanned & trusted
-    require(match, f"{private_host} presented a host key that differs from the trusted {public_host} key; stop")
-    if not trusted_keys(private_host, port) & match:
-        remember_key(private_host, port, next(iter(match)))
-
-    say("==> proving a fresh private login, sudo, and the client source the host sees")
-    session = ssh_command(private_host, port, key, 'sudo -n true && printf "%s\\n" "$SSH_CONNECTION"')
-    if args.source:
-        source = host_cidr(args.source, "--source")
-    else:
-        client = tailnet_address(session.split()[0]) if session else None
-        require(client is not None, "the host did not see a Tailscale client source; "
-                                    "pass an independently verified --source CIDR")
-        source = ipaddress.ip_network(f"{client}/{client.max_prefixlen}")
-
-    host_vars = inventory.parent / "host_vars" / f"{node}.yml"
-    host_text = host_vars.read_text()
-    updated = replace_scalar(host_text, "ansible_host", quote(private_host))
-    updated = replace_scalar(updated, "tailscale_address", quote(private_host))
-    if host.get("k3s_role") == "server":
-        sans = list(host.get("k3s_tls_sans") or [])
-        if private_host not in sans:
-            updated = replace_scalar(updated, "k3s_tls_sans", flow([*sans, private_host]))
-    parsed = yaml.safe_load(updated)
-    require(parsed["ansible_host"] == private_host and parsed["tailscale_address"] == private_host,
-            "host vars rewrite did not produce the expected values")
-
-    operator_path = common.operator_path()
-    require(operator_path is not None, "the operator configuration is required to move SSH sources")
-    operator_text = operator_path.read_text()
-    operator = yaml.safe_load(operator_text)
-    entry = operator.get("cvp_operator_hosts", {}).get(node)
-    require(isinstance(entry, dict), f"the operator configuration has no entry for {node}")
-    entry["firewall_ssh_ipv4_source_cidrs"] = [str(source)] if source.version == 4 else []
-    entry["firewall_ssh_ipv6_source_cidrs"] = [str(source)] if source.version == 6 else []
-    new_operator = "---\n" + yaml.safe_dump(operator, sort_keys=False)
-
-    show_diff(host_vars.name, host_text, updated)
-    say(f"{operator_path}: SSH sources for {node} -> {source}")
-    atomic_write(host_vars, updated.encode(), host_vars.stat().st_mode & 0o777)
-    atomic_write(operator_path, new_operator.encode(), 0o600)
+    control = Path(tempfile.mkdtemp(prefix="cvp-"))
+    options = ["-F", "/dev/null", "-o", "StrictHostKeyChecking=yes",
+               "-o", f"UserKnownHostsFile={known_hosts_file()}", "-o", "ForwardAgent=no",
+               "-o", "ControlMaster=auto", "-o", f"ControlPath={control}/root", "-o", "ControlPersist=120"]
+    if args.root_key:
+        options += ["-o", "IdentitiesOnly=yes", "-i", str(common.external_path(args.root_key))]
+    user = args.login_user
+    require(NAME.fullmatch(user) is not None, "--login-user must be a plain account name")
+    sudo = "" if user == "root" else "sudo "
+    target = f"{user}@{address}"
+    copy_target = f"{user}@[{address}]" if ":" in str(address) else target
     try:
-        operator, _ = pin_operator()
-        require_operator_hosts(operator, read_inventory(inventory))
-        say("==> proving Ansible reaches the node over the private address")
-        require(operator_ssh_check(inventory, node, common.ssh_options()),
-                "Ansible could not log in and escalate over the private address")
-    except BaseException:
-        atomic_write(host_vars, host_text.encode(), host_vars.stat().st_mode & 0o777)
-        atomic_write(operator_path, operator_text.encode(), 0o600)
-        say("Restored the previous host vars and operator settings; public SSH is unchanged.")
-        raise
+        say(f"==> copying the bootstrap script to {address} ({user} may be asked for a password)")
+        run(["scp", *options, "-P", str(port), str(BOOTSTRAP_SCRIPT), f"{copy_target}:{BOOTSTRAP_REMOTE}"])
+        say(f"==> running the bootstrap script on {address} as root")
+        remote = (f"{sudo}sh {BOOTSTRAP_REMOTE} {shlex.quote(key)}; status=$?; "
+                  f"rm -f {BOOTSTRAP_REMOTE}; exit $status")
+        run(["ssh", *options, "-t", "-p", str(port), target, remote])
+    finally:
+        subprocess.run(["ssh", *options, "-p", str(port), "-O", "exit", target], capture_output=True)
+        shutil.rmtree(control, ignore_errors=True)
 
-    ssh = json.dumps(common.ssh_options())
-    for name, argv in (("probe", ["probe.yml", "--limit", node]), ("site", ["site.yml"]),
-                       ("mesh", ["probe-wireguard.yml", "--limit", node]), ("verify", ["verify.yml"])):
-        check_operator_pin()
-        say(f"\n==> {name}")
-        run(["ansible-playbook", "-i", str(inventory), str(PLAYBOOKS / argv[0]), "-e", ssh, *argv[1:]],
-            env=ansible_env())
-    say(f"\n{node} now uses private SSH at {private_host} from {source}.")
-    say("Remove the provider-firewall public SSH exception; keep UDP "
-        f"{host.get('wireguard_port', 51820)} open for the mesh.")
-    if host.get("k3s_role") == "server":
-        say(f"The API certificate now covers {private_host}; see the kubeconfig export step in docs/runbooks/nodes.md.")
+    say("==> verifying ops login and passwordless sudo with the operator key")
+    require(operator_ssh_check(inventory, node, common.ssh_options()),
+            "ops could not log in and escalate with the operator key; inspect the bootstrap output above")
+    say(f"\n{node} is ready for Ansible. Next: task node-join -- {node} --confirm {node}")
     return 0
 
 
@@ -799,12 +743,16 @@ def parser():
     join.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
     join.set_defaults(func=cmd_join)
 
-    private = commands.add_parser("private", help="move SSH to the Tailscale address")
-    private.add_argument("node")
-    private.add_argument("--confirm", default="")
-    private.add_argument("--source", help="verified controller /32 or /128 (default: read from the session)")
-    private.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
-    private.set_defaults(func=cmd_private)
+    bootstrap = commands.add_parser("bootstrap", help="prepare a fresh Debian host over root SSH")
+    bootstrap.add_argument("node")
+    bootstrap.add_argument("--confirm", default="")
+    bootstrap.add_argument("--host-key-fingerprint", help="provider-console SHA256 fingerprint for first contact")
+    bootstrap.add_argument("--login-user", default="root",
+                           help="provider login account; a non-root account runs the script with sudo")
+    bootstrap.add_argument("--root-key", help="SSH private key for the login account (default: password)")
+    bootstrap.add_argument("--public-key", help="operator public key to install (default: <ssh key>.pub)")
+    bootstrap.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    bootstrap.set_defaults(func=cmd_bootstrap)
     return root
 
 

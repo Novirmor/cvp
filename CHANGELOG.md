@@ -13,22 +13,37 @@ deployment; see the open items and exit gates in `PLAN.md`.
 
 ### Added
 
-- **Node workflow.** `task node-new`, `task node-join`, and `task node-private`
-  replace the manual first-host and onboarding procedures:
+- **Node workflow.** `task node-new`, `task node-bootstrap`, and
+  `task node-join` take every host from a fresh Debian install to a joined
+  node, replacing the manual first-host and onboarding procedures:
   - `node-new` allocates the mesh address, generates the WireGuard key
     (`~/.config/cvp/keys/<node>.wg-private`, mode `0600`), and writes host vars,
     inventory groups, and the host-scoped operator entry as one transaction. It
     is a dry run unless `--write`, and rolls back if inventory validation fails.
-  - `node-join` handles the first host and every later one. It trusts the
-    bootstrap host key only when it matches a provider-console fingerprint,
-    grants `ops` access when missing, then probes, checks fleet membership,
-    converges, probes the mesh, and verifies. Progress is recorded, so a rerun
-    resumes after the last completed mutating stage. An interrupted `site`
-    requires `--retry-reviewed`. `--preview` stops after a check-mode diff.
-  - `node-private` matches the private host key against the trusted public one,
-    proves private login and sudo, switches `ansible_host`, `tailscale_address`,
-    server API SANs, and the SSH source allowance to Tailscale, and reconverges.
-    It restores both files if Ansible cannot use the new path.
+  - `node-bootstrap` trusts a fresh host's SSH key only when it matches the
+    provider-console fingerprint, copies `scripts/node-bootstrap.sh` to the host
+    over SSH, and runs it as root (password allowed once; `--login-user` for
+    sudo-only cloud images). The script installs Python, sudo, SSH, and probe
+    tools and creates the `ops` operator; the command then proves `ops` login
+    and sudo.
+  - `node-join` handles the first host and every later one: it validates,
+    probes, checks fleet membership, converges, probes the mesh, and verifies.
+    Progress is recorded, so a rerun resumes after the last completed mutating
+    stage. An interrupted `site` requires `--retry-reviewed`. `--preview` stops
+    after a check-mode diff.
+- **Network rules.** The public IP carries SSH (listed operator sources only),
+  Cloudflare-proxied HTTP(S), and the WireGuard transport; WireGuard carries
+  node-to-node cluster traffic only; Tailscale carries people and CI to the API
+  and internal applications only:
+  - the firewall accepts SSH only on public uplinks, never on `tailscale0` or
+    `wg0`, and preflight rejects Tailscale or mesh SSH sessions and sources;
+  - public `80`/`443` on the ingress node, including forwarded ServiceLB DNAT
+    traffic, accept only Cloudflare's published ranges
+    (`firewall_public_ingress_ipv4_source_cidrs`/`_ipv6_`);
+  - the tailnet policy no longer grants SSH and its tests assert the denial;
+    Tailscale SSH is forced off (`--ssh=false`) on every node;
+  - K3s servers add their live Tailscale addresses to the API certificate, so
+    kubeconfigs reach the API over the tailnet with TLS verification.
 - `{file: PATH}` credential references in the operator configuration, for
   private (`0600`, user-owned) files outside the checkout. Referenced files are
   pinned with their own digest (`CVP_OPERATOR_FILES_SHA256`), so replacing one

@@ -6,20 +6,28 @@ using standard Kubernetes resources.
 ## I have a host; what next?
 
 **Start with [the node runbook](docs/runbooks/nodes.md).** Every host, the
-first and each later one, goes through the same three commands:
+first and each later one, starts as a freshly installed Debian system and goes
+through the same three commands:
 
 ```sh
 task node-new -- server1 --ssh 203.0.113.20 --virt vm --mesh-address 10.77.0.1 \
   --ssh-key "$HOME/.ssh/cvp-ops" --ssh-source 203.0.113.10/32 --write
-task node-join -- server1 --confirm server1 --host-key-fingerprint SHA256:...
-task node-private -- server1 --confirm server1
+task node-bootstrap -- server1 --confirm server1 --host-key-fingerprint SHA256:...
+task node-join -- server1 --confirm server1
 ```
 
 `node-new` writes and validates inventory, host vars, the WireGuard key, and
-host-scoped operator settings without touching the host. `node-join` trusts the
-host key, grants operator access, probes, joins, and verifies, resuming safely
-after a failure. `node-private` moves SSH to Tailscale. The runbook then exports
-a TLS-verified private kubeconfig.
+host-scoped operator settings without touching the host. `node-bootstrap`
+checks the host key against the provider-console fingerprint, then copies a
+setup script to the fresh host over SSH and runs it as root to create the `ops`
+operator. `node-join` probes, joins, and verifies, resuming safely after a
+failure. The runbook then exports a TLS-verified kubeconfig over Tailscale.
+
+**Network rules:** the public IP carries SSH (from your listed addresses only),
+Cloudflare-proxied HTTP(S) to the ingress node, and the encrypted WireGuard
+transport. WireGuard (`wg0`) carries node-to-node cluster traffic only.
+Tailscale carries people (and CI) to internal services: the Kubernetes API and
+internal applications. Neither WireGuard nor Tailscale carries SSH.
 
 Recommended baseline: Debian 13/systemd/amd64 VM. LXC requires provider-supplied
 kernel/cgroup/TUN facilities and a passing compatibility probe. This baseline
@@ -117,7 +125,7 @@ not a bootstrap script to run without configuration:
 ```sh
 task node-new            # scaffold one node's inventory, key, and operator entry (dry run)
 task node-join           # trust, access, probe, join, verify one node; resumable
-task node-private        # move one node's SSH to Tailscale and reconverge
+task node-bootstrap      # copy and run the setup script on a fresh Debian host
 task validate-inventory   # controller-only, read-only topology validation
 task prepare-access      # one new host: trusted root SSH -> ops key and sudo
 task probe               # read-only compatibility check before convergence
@@ -152,13 +160,11 @@ every loader invocation**, including probes/verification. See
 [the host layer guide](ansible/README.md) for the schema, authoritative SSH-key
 management, storage approvals, backups, and recovery details.
 
-Ordinary unbound sshd sessions require an explicit host-scoped SSH source CIDR
-matching the client address seen by the host, including the client's Tailscale
-`/32` or `/128` after migrating to private SSH. Tailscale `Running` and a private
-login do not permit clearing that allowance: CIDR-less firewall preflight requires
-kernel interface-bound socket evidence and a matching return route. Follow the
-[private SSH step](docs/runbooks/nodes.md#33-move-ssh-to-the-private-address)
-(`task node-private`).
+SSH is public-only: each host's firewall accepts TCP `22` on its public uplinks
+from the host-scoped `/32` or `/128` sources in the operator file, and nowhere
+else. Firewall preflight refuses to activate unless the current SSH client
+matches one of them, and rejects sources overlapping Tailscale or the mesh. See
+[changing your SSH address](docs/runbooks/nodes.md#your-public-ssh-address-changed).
 
 Ansible convergence does not bootstrap Flux. Before the separate cluster step,
 replace `example.invalid/repository.git` in `cluster/flux-system/source.yaml`
