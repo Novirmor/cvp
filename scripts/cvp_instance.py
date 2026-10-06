@@ -159,8 +159,10 @@ def cmd_new(args):
     git(destination, "config", "-f", ".gitmodules", "submodule.platform.url", platform_url)
     render_tree(destination, name, platform_url, repo_url, commit, destination / "platform")
     git(destination, "add", "-A")
-    git(destination, "-c", "user.name=cvp", "-c", "user.email=cvp@example.invalid",
-        "commit", "-q", "-m", f"chore: create instance {name} from platform {commit[:12]}")
+    # Commit as the operator when Git knows them; otherwise as a neutral placeholder.
+    identity = [] if git(destination, "config", "user.email", check=False) else [
+        "-c", "user.name=cvp", "-c", "user.email=cvp@example.invalid"]
+    git(destination, *identity, "commit", "-q", "-m", f"chore: create instance {name} from platform {commit[:12]}")
     say(f"\nCreated {destination} (instance {name}, platform {commit[:12]}).")
     say("Next:")
     say(f"  cd {destination} && mise install && task validate")
