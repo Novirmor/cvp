@@ -34,6 +34,7 @@ python3 scripts/test-cluster-traefik
 
 python3 scripts/test-cluster-manifests
 python3 scripts/test-cluster-bootstrap
+python3 scripts/test-cluster-platform-source
 python3 scripts/cluster-manifest-inputs validate
 
 printf 'checking policy fixtures\n'

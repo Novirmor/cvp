@@ -51,8 +51,21 @@ def ready(obj, expected):
     require(not any(c.get("type") in {"Stalled", "Reconciling"} and c.get("status") == "True" for c in conditions), f"{name} is still reconciling or stalled")
 
 
-def check(source, children, verified):
+def check_platform(source, verified):
+    """An instance's pinned platform source must serve exactly the pinned commit."""
+    pin = verified["platform"]
+    ready(source, pin["source"])
+    require(source["spec"].get("ref") == {"commit": pin["commit"]}, "platform source ref differs from the verified pin")
+    require(not any(source["spec"].get(key) for key in ("ignore", "include", "recurseSubmodules", "sparseCheckout")), "platform source has unverified artifact overrides")
+    require(source.get("status", {}).get("artifact", {}).get("revision") == f"sha1:{pin['commit']}", "platform source artifact is not the pinned commit")
+
+
+def check(source, children, verified, platform_source=None):
     revision = f"{verified['branch']}@sha1:{verified['revision']}"
+    revisions = {"flux-system": revision}
+    if "platform" in verified:
+        check_platform(platform_source, verified)
+        revisions["cvp-platform"] = f"sha1:{verified['platform']['commit']}"
     ready(source, verified["source"])
     require(source["spec"].get("ref") == verified["source"]["spec"]["ref"], "source ref differs from the verified branch")
     require(not any(source["spec"].get(key) for key in ("ignore", "include", "recurseSubmodules", "sparseCheckout")), "source has unverified artifact overrides")
@@ -67,7 +80,9 @@ def check(source, children, verified):
             require(subset(expected["spec"], obj["spec"]), f"{key[1]} has not adopted the verified spec")
         else:
             ready(obj, expected)
-            require(obj.get("status", {}).get("lastAppliedRevision") == revision, f"{key[1]} has not applied the verified commit")
+            expected_revision = revisions.get(expected["spec"]["sourceRef"]["name"])
+            require(expected_revision is not None, f"{key[1]} uses an unverified source")
+            require(obj.get("status", {}).get("lastAppliedRevision") == expected_revision, f"{key[1]} has not applied the verified commit")
         require(not any(obj["spec"].get(field) for field in BUILD_OVERRIDES), f"{key[1]} has unverified build overrides")
         require(obj["spec"]["sourceRef"].get("namespace", key[0]) == "flux-system", f"{key[1]} uses an unverified source namespace")
 
@@ -103,8 +118,9 @@ def wait(context, snapshot, timeout):
             preflight["assert_branch"](snapshot, verified, timeout=budget())
             source = get("gitrepository", "flux-system", "flux-system")
             children = {(obj["metadata"]["namespace"], obj["metadata"]["name"]): get("kustomization", obj["metadata"]["namespace"], obj["metadata"]["name"]) for obj in verified["reconciliations"]}
-            check(source, children, verified)
-            check(get("gitrepository", "flux-system", "flux-system"), children, verified)
+            platform = get("gitrepository", "flux-system", "cvp-platform") if "platform" in verified else None
+            check(source, children, verified, platform)
+            check(get("gitrepository", "flux-system", "flux-system"), children, verified, platform)
             preflight["assert_branch"](snapshot, verified, timeout=budget())
             budget()
             print(f"Flux source and active reconcilers are Ready at {verified['revision']}; reviewed suspended reconcilers match their declared state")

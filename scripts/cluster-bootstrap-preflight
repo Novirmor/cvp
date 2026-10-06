@@ -115,6 +115,64 @@ def assert_branch(snapshot, verified, command=None, timeout=60):
         raise ValueError("published branch changed during bootstrap; review and retry")
 
 
+PLATFORM_SOURCE = "cvp-platform"
+
+
+def platform_pin(cluster, inputs):
+    """The instance's pinned platform source, read from its flux-system files, or None."""
+    pins = []
+    for path in sorted((cluster / "flux-system").glob("*.yaml")):
+        for obj in inputs["documents"](path.read_text()):
+            if isinstance(obj, dict) and obj.get("kind") == "GitRepository" and (obj.get("metadata") or {}).get("name") == PLATFORM_SOURCE:
+                pins.append(obj)
+    if not pins:
+        return None
+    if len(pins) != 1:
+        raise ValueError(f"exactly one {PLATFORM_SOURCE} GitRepository is supported")
+    spec = pins[0].get("spec") or {}
+    ref, url = spec.get("ref"), spec.get("url")
+    if not isinstance(ref, dict) or set(ref) != {"commit"} or not re.fullmatch(r"[0-9a-f]{40}", str(ref["commit"])):
+        raise ValueError(f"{PLATFORM_SOURCE} must pin exactly one full ref.commit")
+    if not isinstance(url, str) or not re.fullmatch(r"https://[^\s@]+", url):
+        raise ValueError(f"{PLATFORM_SOURCE} must use a public https:// URL")
+    return {"url": url, "commit": ref["commit"], "source": pins[0]}
+
+
+def fetch_platform(url, commit, destination, env):
+    """Export the platform's cluster/ tree at exactly the pinned commit."""
+    repository = destination / ".git"
+    repository.mkdir(parents=True, mode=0o700)
+    git(repository, "init", "--bare", env=env)
+    git(repository, "-c", "core.hooksPath=/dev/null", "fetch", "--no-tags", "--depth=1", url, commit, env=env)
+    if git(repository, "rev-parse", "FETCH_HEAD", env=env) != commit:
+        raise ValueError("the fetched platform commit differs from the pin")
+    for entry in git(repository, "ls-tree", "-rz", commit, "--", "cluster", env=env).split("\0"):
+        if not entry:
+            continue
+        header, name = entry.split("\t", 1)
+        mode, kind, oid = header.split()
+        target = destination / name
+        if not target.resolve().is_relative_to(destination / "cluster") or any(character in name for character in ("\n", "\r", "\t")):
+            raise ValueError(f"unsupported platform pathname: {name!r}")
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise ValueError(f"the platform cluster tree must contain regular files only: {name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output(["git", "-C", str(repository), "cat-file", "blob", oid],
+                                                   env=git_environment(env)))
+        target.chmod(0o444)
+
+
+def check_platform_pin(root, snapshot, revision, pin, env):
+    """The reviewed checkout and the published commit must both record the pinned platform."""
+    recorded = git(snapshot / ".git", "ls-tree", revision, "platform", env=env).split()
+    if recorded[:3] != ["160000", "commit", pin["commit"]]:
+        raise ValueError("the published platform/ submodule pointer differs from the Flux platform pin")
+    if git(root, "rev-parse", "HEAD:platform", env=env) != pin["commit"]:
+        raise ValueError("the reviewed local platform/ pointer differs from the Flux platform pin")
+    if git(root / "platform", "rev-parse", "HEAD", env=env) != pin["commit"]:
+        raise ValueError("the local platform/ checkout is not at the pinned commit; run git submodule update")
+
+
 def prepare(root, snapshot, url, command):
     inputs = runpy.run_path(str(Path(__file__).resolve().parent / "cluster-manifest-inputs"))
     source = inputs["documents"]((root / "cluster/flux-system/source.yaml").read_text())[0]
@@ -123,7 +181,13 @@ def prepare(root, snapshot, url, command):
     fetched = inputs["documents"]((snapshot / "cluster/flux-system/source.yaml").read_text())[0]
     if source_branch(fetched, url) != branch:
         raise ValueError("fetched source branch differs from the reviewed branch")
-    objects = inputs["validate"](snapshot / "cluster")
+    pin = platform_pin(snapshot / "cluster", inputs)
+    platform = None
+    if pin is not None:
+        check_platform_pin(root, snapshot, revision, pin, os.environ)
+        fetch_platform(pin["url"], pin["commit"], snapshot / "platform", os.environ)
+        platform = {"root": snapshot / "platform", "commit": pin["commit"]}
+    objects = inputs["validate"](snapshot / "cluster", platform=platform)
     for name in ("namespace.yaml", "gotk-components.yaml", "source.yaml", "sync.yaml"):
         for obj in inputs["documents"]((snapshot / "cluster/flux-system" / name).read_text()):
             if obj not in objects:
@@ -138,6 +202,8 @@ def prepare(root, snapshot, url, command):
     if not {("flux-system", name) for name in ("flux-system", "policy", "infrastructure", "operations")} <= active:
         raise ValueError("required bootstrap reconcilers must be present and active")
     verified = {"url": url, "branch": branch, "revision": revision, "source": fetched, "reconciliations": reconciliations}
+    if pin is not None:
+        verified["platform"] = pin
     assert_branch(snapshot, verified, command)
     (snapshot / "verified.json").write_text(json.dumps(verified))
     print(f"Verified published cluster tree at {branch}@{revision}")
@@ -155,7 +221,15 @@ def main():
     repository = os.environ["FLUX_GITHUB_REPOSITORY"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repository):
         raise ValueError("invalid GitHub owner or repository")
-    prepare(Path(__file__).resolve().parent.parent, args.snapshot.resolve(), f"ssh://git@github.com/{owner}/{repository}.git", ssh_command())
+    prepare(bootstrap_root(), args.snapshot.resolve(), f"ssh://git@github.com/{owner}/{repository}.git", ssh_command())
+
+
+def bootstrap_root():
+    """The repository whose cluster/ Flux bootstraps: the instance, or this platform used standalone."""
+    instance = os.environ.get("CVP_INSTANCE_DIR")
+    if instance and (Path(instance) / "cluster/flux-system").is_dir():
+        return Path(instance).resolve()
+    return Path(__file__).resolve().parent.parent
 
 
 if __name__ == "__main__":

@@ -65,7 +65,10 @@ python3 scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
 kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/source.yaml"
 kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/sync.yaml"
 python3 scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
-python3 scripts/cluster-ingress-ready --context "$FLUX_KUBE_CONTEXT" --root "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
+# An instance's ingress layer comes from its pinned platform tree.
+ingress_root="$snapshot"
+[[ ! -d "$snapshot/platform/cluster" ]] || ingress_root="$snapshot/platform"
+python3 scripts/cluster-ingress-ready --context "$FLUX_KUBE_CONTEXT" --root "$ingress_root" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
 python3 scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
 
 printf 'Flux bootstrap complete for context %s.\n' "$FLUX_KUBE_CONTEXT"

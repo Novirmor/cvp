@@ -15,6 +15,12 @@ SCHEMA_COMMAND = [
     "-kubernetes-version", "1.35.0", "-strict", "-summary",
 ]
 FLUX_API = "kustomize.toolkit.fluxcd.io/v1"
+SOURCE_API = "source.toolkit.fluxcd.io/v1"
+# An instance repository reconciles platform layers from this GitRepository,
+# pinned to the exact commit of its platform/ submodule. Those layers are
+# rendered and validated from that checkout, never trusted unseen.
+PLATFORM_SOURCE = "cvp-platform"
+SOURCE_OVERRIDES = ("ignore", "include", "recurseSubmodules", "sparseCheckout", "secretRef", "verify")
 BUILD_OVERRIDES = {"targetNamespace", "namePrefix", "nameSuffix", "patches", "images", "postBuild", "components", "commonMetadata", "kubeConfig"}
 CONTROLLERS = {"helm-controller", "kustomize-controller", "source-controller", "notification-controller", "image-reflector-controller", "image-automation-controller"}
 CLUSTER_KINDS = {"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding", "PersistentVolume", "StorageClass", "PriorityClass", "IngressClass", "Node", "CSIDriver", "CSINode", "VolumeAttachment", "MutatingWebhookConfiguration", "ValidatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
@@ -112,15 +118,39 @@ def check_build_inputs(root):
             require(target.is_relative_to(root) and target.exists(), f"{config}: build input must exist within cluster: {value}")
 
 
-def render_graph(root):
+def platform_checkout(path):
+    """A platform checkout and the commit it is at (the instance's platform/ submodule)."""
+    root = Path(path).resolve()
+    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    return {"root": root, "commit": commit}
+
+
+def check_platform_source(obj, platform):
+    spec = obj.get("spec") or {}
+    require(spec.get("suspend") is False, f"{PLATFORM_SOURCE} must explicitly set suspend: false")
+    require(spec.get("ref") == {"commit": platform["commit"]},
+            f"{PLATFORM_SOURCE} must pin ref.commit to the platform checkout {platform['commit']}")
+    require(isinstance(spec.get("url"), str) and re.fullmatch(r"https://[^\s@]+", spec["url"]),
+            f"{PLATFORM_SOURCE} must use a public https:// URL")
+    require(not any(spec.get(field) for field in SOURCE_OVERRIDES),
+            f"{PLATFORM_SOURCE} must not filter, extend, or authenticate its artifact")
+
+
+def render_graph(root, platform=None):
     root = root.resolve()
     check_build_inputs(root)
+    roots = [root]
+    if platform is not None:
+        platform_cluster = (platform["root"] / "cluster").resolve()
+        check_build_inputs(platform_cluster)
+        roots.append(platform_cluster)
     pending, renders, objects = [root], {}, {}
     while pending:
         path = pending.pop(0)
         if path in renders:
             continue
-        require(path.is_relative_to(root) and path.is_dir(), f"Flux path must be a local directory within {root}: {path}")
+        require(any(path.is_relative_to(base) for base in roots) and path.is_dir(),
+                f"Flux path must be a local directory within {root}: {path}")
         text = subprocess.check_output(["kustomize", "build", str(path)], text=True)
         renders[path] = text
         for obj in documents(text):
@@ -136,12 +166,22 @@ def render_graph(root):
             spec = obj["spec"]
             require(not any(spec.get(field) for field in BUILD_OVERRIDES), f"{key}: unsupported Flux build overrides; put transformations in the local Kustomize overlay")
             source = spec["sourceRef"]
-            require(source.get("kind") == "GitRepository" and source.get("name") == "flux-system" and source.get("namespace", metadata.get("namespace")) == "flux-system", f"uncovered Flux source: {key}")
+            require(source.get("kind") == "GitRepository" and source.get("name") in {"flux-system", PLATFORM_SOURCE} and source.get("namespace", metadata.get("namespace")) == "flux-system", f"uncovered Flux source: {key}")
+            if source["name"] == PLATFORM_SOURCE:
+                require(platform is not None, f"{key}: validating the {PLATFORM_SOURCE} source needs the platform checkout (--platform-root)")
+                base, limit = platform["root"], roots[1]
+            else:
+                base, limit = root.parent, root
             value = spec.get("path", "")
             require(isinstance(value, str) and value and not Path(value).is_absolute(), f"invalid Flux path: {value}")
-            target = (root.parent / value).resolve()
-            require(target.is_relative_to(root), f"Flux path escapes cluster: {value}")
+            target = (base / value).resolve()
+            require(target.is_relative_to(limit), f"Flux path escapes cluster: {value}")
             pending.append(target)
+    platform_sources = [obj for obj in objects.values() if obj.get("apiVersion") == SOURCE_API and obj.get("kind") == "GitRepository" and obj["metadata"].get("name") == PLATFORM_SOURCE]
+    if platform_sources or platform is not None and any(obj.get("kind") == "Kustomization" and obj.get("spec", {}).get("sourceRef", {}).get("name") == PLATFORM_SOURCE for obj in objects.values()):
+        require(platform is not None and len(platform_sources) == 1 and platform_sources[0]["metadata"].get("namespace") == "flux-system",
+                f"exactly one flux-system/{PLATFORM_SOURCE} GitRepository must pin the validated platform checkout")
+        check_platform_source(platform_sources[0], platform)
     return renders, list(objects.values())
 
 
@@ -163,7 +203,7 @@ def system_resource(obj):
         ("NetworkPolicy", "allow-webhooks"),
     }:
         return True
-    return (obj["apiVersion"] == FLUX_API and kind == "Kustomization") or (obj["apiVersion"] == "source.toolkit.fluxcd.io/v1" and kind == "GitRepository" and name == "flux-system")
+    return (obj["apiVersion"] == FLUX_API and kind == "Kustomization") or (obj["apiVersion"] == SOURCE_API and kind == "GitRepository" and name in {"flux-system", PLATFORM_SOURCE})
 
 
 def check_namespaces(objects):
@@ -193,9 +233,9 @@ def check_namespaces(objects):
         require(any(item["kind"] == "LimitRange" and any(limit.get("type") == "Container" and all(positive(limit.get(section, {}).get(key, "")) for section in ("default", "defaultRequest", "min", "max") for key in ("cpu", "memory", "ephemeral-storage")) for limit in item["spec"].get("limits", [])) for item in resources), f"namespace {name}: missing bounded container LimitRange")
 
 
-def validate(root, schema=True):
+def validate(root, schema=True, platform=None):
     check_sources(root)
-    renders, objects = render_graph(root)
+    renders, objects = render_graph(root, platform)
     check_namespaces(objects)
     with tempfile.TemporaryDirectory(prefix="cvp-manifests-") as directory:
         for index, (path, text) in enumerate(renders.items()):
@@ -212,11 +252,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("sources", "schema", "validate"))
     parser.add_argument("--root", type=Path, default=Path("cluster"))
+    parser.add_argument("--platform-root", type=Path,
+                        help="platform checkout pinned by an instance's cvp-platform source")
     args = parser.parse_args()
     if args.mode == "sources":
         check_sources(args.root)
     elif args.mode == "validate":
-        validate(args.root)
+        validate(args.root, platform=platform_checkout(args.platform_root) if args.platform_root else None)
     else:
         # The original stream must pass conftest before this schema-only copy is used.
         print("\n---\n".join(schema_input(sys.stdin.read())))

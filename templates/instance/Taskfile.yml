@@ -1,0 +1,25 @@
+---
+# Instance tasks. Every platform task (init, node-*, site, verify,
+# bootstrap-flux, cloudflare-*, tailscale-*, ...) comes from the pinned
+# platform/ submodule and runs against this repository's inventory and cluster.
+version: "3"
+
+includes:
+  platform:
+    taskfile: ./platform/tasks/ops.yml
+    flatten: true
+    vars:
+      INSTANCE_NAME: __NAME__
+
+tasks:
+  validate:
+    desc: Credential-free checks for this instance (platform pin, cluster manifests, inventory)
+    deps:
+      - deps
+    cmds:
+      - mise exec -- python3 -B platform/scripts/cvp_instance.py validate {{.CLI_ARGS}}
+
+  platform-upgrade:
+    desc: Move to another platform release and refresh the pin (e.g. task platform-upgrade -- v0.2.0)
+    cmds:
+      - mise exec -- python3 -B platform/scripts/cvp_instance.py upgrade {{.CLI_ARGS}}

@@ -1,0 +1,6 @@
+---
+# Instance overrides for platform defaults
+# (platform/ansible/defaults/group_vars/all.yml). This file outranks both the
+# platform defaults and the all.vars in hosts.yml. Never put secrets here: they
+# belong in the per-user operator file (~/.config/cvp/__NAME__/operator.yml).
+{}
