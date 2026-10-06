@@ -153,7 +153,7 @@ class Wizard:
 
     def tailscale_key(self):
         path = Path(self.args.tailscale_auth_key_file or
-                    node_cli.xdg("XDG_CONFIG_HOME", ".config") / "cvp/keys" / f"{self.node}.ts-authkey")
+                    node_cli.common.config_dir() / "keys" / f"{self.node}.ts-authkey")
         if path.exists():
             return str(path)
         self.step("Tailscale enrollment key")
@@ -226,7 +226,7 @@ class Wizard:
         call(argv)
 
     def kubeconfig(self):
-        output = Path(self.args.kubeconfig or node_cli.xdg("XDG_CONFIG_HOME", ".config") / "cvp/kubeconfig")
+        output = Path(self.args.kubeconfig or node_cli.common.config_dir() / "kubeconfig")
         if not self.first or self.args.skip_kubeconfig:
             return None
         if output.exists():
@@ -258,7 +258,7 @@ class Wizard:
             say("  - Bootstrap Flux: docs/runbooks/cluster.md#bootstrap")
             say("  - Enable backups and run a restore drill before production data: ansible/README.md")
         say("  - Add another host: install Debian on it, then run `task init` again.")
-        say(f"  - Store {node_cli.xdg('XDG_CONFIG_HOME', '.config') / 'cvp/keys'} in your secret store.")
+        say(f"  - Store {node_cli.common.config_dir() / 'keys'} in your secret store.")
 
     def run(self):
         say(__doc__.splitlines()[0])
@@ -305,7 +305,7 @@ def parser():
     root.add_argument("--server-confirm", help="the node name, confirming an additional etcd server")
     root.add_argument("--kubeconfig", help="kubeconfig output for the first host (default: ~/.config/cvp/kubeconfig)")
     root.add_argument("--skip-kubeconfig", action="store_true")
-    root.add_argument("--inventory", default=str(node_cli.DEFAULT_INVENTORY))
+    root.add_argument("--inventory", default=str(node_cli.common.instance_inventory()))
     root.add_argument("--retry-reviewed", action="store_true",
                       help="retry an interrupted join stage after inspecting the hosts")
     root.add_argument("--yes", action="store_true", help="accept detected values and plans without asking")

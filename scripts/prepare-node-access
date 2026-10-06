@@ -5,6 +5,8 @@ root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$root_dir"
 export ANSIBLE_HOST_KEY_CHECKING=True
 export ANSIBLE_SSH_HOST_KEY_CHECKING=True ANSIBLE_TRANSPORT=ssh
+inventory_sources=(-i "$root_dir/ansible/defaults/inventory.yml"
+  -i "${CVP_INSTANCE_DIR:-$root_dir/examples/instance}/inventory/hosts.yml")
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -49,7 +51,7 @@ print(json.dumps(lines))
 ssh-keygen -lf "$public_key_file" > /dev/null || fail 'ssh-keygen rejected the public key'
 
 inventory="$(ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-inventory \
-  -i ansible/inventory/hosts.yml --list)" || fail 'could not read the Ansible inventory'
+  "${inventory_sources[@]}" --list)" || fail 'could not read the Ansible inventory'
 printf '%s\n' "$inventory" | python3 -B scripts/cvp_wrapper_common.py ssh-inventory
 printf '%s\n' "$inventory" | python3 -c '
 import json
@@ -69,17 +71,17 @@ if host.get("node_name") != node or not host.get("ansible_host"):
 printf 'Preparing root-to-ops SSH access on %s without changing network policy...\n' "$node"
 mise exec -- task deps
 CVP_BOOTSTRAP_ADMIN_KEYS="$keys_json" ANSIBLE_CONFIG=ansible/ansible.cfg \
-  mise exec -- ansible-playbook -i ansible/inventory/hosts.yml \
+  mise exec -- ansible-playbook "${inventory_sources[@]}" \
     ansible/playbooks/bootstrap-access.yml --limit "$node" \
     -e ansible_user=root -e ansible_become=false "${root_ssh_args[@]}"
 
 printf 'Verifying operator SSH login and passwordless sudo on %s...\n' "$node"
 ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible \
-  -i ansible/inventory/hosts.yml "$node" -m ansible.builtin.shell \
+  "${inventory_sources[@]}" "$node" -m ansible.builtin.shell \
   -a "test \"\$(id -un)\" = ops" -e ansible_user=ops -e ansible_become=false \
   "${operator_ssh_args[@]}"
 ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible \
-  -i ansible/inventory/hosts.yml "$node" -m ansible.builtin.shell \
+  "${inventory_sources[@]}" "$node" -m ansible.builtin.shell \
   -a "test \"\$(id -un)\" = root" -e ansible_user=ops -e ansible_become=true \
   "${operator_ssh_args[@]}"
 

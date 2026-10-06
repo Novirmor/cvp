@@ -154,7 +154,7 @@ class SiteFixture:
         self.hosts = ["alpha", "beta", "gamma"] if servers == 2 else ["alpha", "beta", "delta", "gamma"]
         self.selected = list(self.hosts)
         self.fail: list[str] | None = None
-        self.vars = yaml.safe_load((ROOT / "ansible/inventory/group_vars/all.yml").read_text())
+        self.vars = yaml.safe_load((ROOT / "ansible/defaults/group_vars/all.yml").read_text())
         self.vars.update(ansible_connection="local", ansible_become=False,
                          ansible_python_interpreter=sys.executable)
         self.hostvars = {}

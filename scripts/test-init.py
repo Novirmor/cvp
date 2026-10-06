@@ -78,8 +78,7 @@ class InitWizardTests(unittest.TestCase):
         self.directory = Path(workspace.name)
         self.inventory = self.directory / "inventory/hosts.yml"
         self.inventory.parent.mkdir()
-        shutil.copyfile(ROOT / "ansible/inventory/hosts.yml", self.inventory)
-        shutil.copytree(ROOT / "ansible/inventory/group_vars", self.inventory.parent / "group_vars")
+        shutil.copyfile(ROOT / "examples/instance/inventory/hosts.yml", self.inventory)
         self.home = self.directory / "home"
         (self.home / ".ssh").mkdir(parents=True, mode=0o700)
         self.ssh_key = self.home / ".ssh/cvp-ops"

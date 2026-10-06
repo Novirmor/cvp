@@ -11,6 +11,45 @@ import stat
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULTS_INVENTORY = ROOT / "ansible/defaults/inventory.yml"
+INSTANCE_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def instance_dir():
+    """The instance repository: its inventory, cluster apps, and operator scope.
+
+    An instance repository includes this platform as a submodule and exports
+    CVP_INSTANCE_DIR through its Taskfile. Run inside the platform repository
+    itself, the bundled example instance is used.
+    """
+    return Path(os.environ.get("CVP_INSTANCE_DIR") or ROOT / "examples/instance").resolve()
+
+
+def instance_inventory():
+    return instance_dir() / "inventory/hosts.yml"
+
+
+def inventory_args(inventory=None):
+    """Platform defaults first, so the instance inventory's group_vars override them."""
+    return ["-i", str(DEFAULTS_INVENTORY), "-i", str(inventory or instance_inventory())]
+
+
+def instance_name():
+    name = os.environ.get("CVP_INSTANCE_NAME", "")
+    if name and not INSTANCE_NAME.fullmatch(name):
+        raise ValueError("CVP_INSTANCE_NAME must be a lowercase name (letters, digits, hyphens)")
+    return name
+
+
+def config_dir():
+    """Per-user operator files, scoped by CVP_INSTANCE_NAME when several instances share a machine."""
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "cvp"
+    return base / instance_name() if instance_name() else base
+
+
+def state_dir():
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "cvp"
+    return base / instance_name() if instance_name() else base
 
 
 def external_path(value, *, output=False):
@@ -221,15 +260,13 @@ def operator_path():
     if os.environ.get("CVP_OPERATOR_CONFIG_ABSENT") == "1":
         if os.environ.get("CVP_OPERATOR_CONFIG_SHA256"):
             raise ValueError("operator configuration cannot be both present-pinned and absent-pinned")
-        directory = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-        candidate = directory / "cvp/operator.yml"
+        candidate = config_dir() / "operator.yml"
         if explicit or candidate.exists() or candidate.is_symlink():
             raise ValueError("operator configuration appeared during onboarding")
         return None
     if explicit:
         return external_path(explicit)
-    directory = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    candidate = directory / "cvp/operator.yml"
+    candidate = config_dir() / "operator.yml"
     if candidate.exists() or candidate.is_symlink():
         return external_path(str(candidate))
     if os.environ.get("CVP_OPERATOR_CONFIG_SHA256"):

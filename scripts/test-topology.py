@@ -314,7 +314,7 @@ class ControllerTests(unittest.TestCase):
                  ]},
             ]))
         result = subprocess.run(
-            ["ansible-playbook", "-i", str(ROOT / "ansible/inventory/hosts.yml"), "-i", str(inventory),
+            ["ansible-playbook", "-i", str(ROOT / "ansible/defaults/inventory.yml"), "-i", str(inventory),
              str(playbook), "--limit", "localhost" if empty else "gamma",
              "-e", json.dumps(extra or ({"cvp_onboard_node": "gamma", "cvp_onboard_server_confirm": ""}
                                        if onboard else {"cvp_topology_allow_empty": empty})),

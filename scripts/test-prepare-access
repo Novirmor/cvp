@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-unset CVP_ACCESS_ROOT_IDENTITY_FILE CVP_ACCESS_OPERATOR_IDENTITY_FILE
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+inventory_call="exec -- ansible-inventory -i $root_dir/ansible/defaults/inventory.yml"
+inventory_call+=" -i $root_dir/examples/instance/inventory/hosts.yml --list"
+unset CVP_ACCESS_ROOT_IDENTITY_FILE CVP_ACCESS_OPERATOR_IDENTITY_FILE CVP_INSTANCE_DIR
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 mkdir "$work_dir/bin"
@@ -11,7 +13,7 @@ tee "$work_dir/bin/mise" > /dev/null <<'STUB'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf '%s\n' "$*" >> "$CVP_ACCESS_TEST_CALLS"
-if [[ "$*" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]; then
+if [[ "$*" == 'exec -- ansible-inventory '*' --list' ]]; then
   printf '%s\n' "$CVP_ACCESS_TEST_INVENTORY"
 fi
 STUB
@@ -45,7 +47,7 @@ mapfile -t calls < "$CVP_ACCESS_TEST_CALLS"
   printf 'expected five ordered calls, got %s\n' "${#calls[@]}" >&2
   exit 1
 }
-[[ "${calls[0]}" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]
+[[ "${calls[0]}" == "$inventory_call" ]]
 [[ "${calls[1]}" == 'exec -- task deps' ]]
 [[ "${calls[2]}" == *'bootstrap-access.yml --limit worker1 -e ansible_user=root -e ansible_become=false'* ]]
 [[ "${calls[3]}" == *"-a test \"\$(id -un)\" = ops -e ansible_user=ops -e ansible_become=false"* ]]
@@ -75,6 +77,6 @@ mapfile -t calls < "$CVP_ACCESS_TEST_CALLS"
   printf '%s\n' 'access bootstrap proceeded past empty inventory' >&2
   exit 1
 }
-[[ "${calls[0]}" == 'exec -- ansible-inventory -i ansible/inventory/hosts.yml --list' ]]
+[[ "${calls[0]}" == "$inventory_call" ]]
 
 printf '%s\n' 'access bootstrap guards and verification order passed'

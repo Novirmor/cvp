@@ -417,8 +417,8 @@ class WrapperSafety(unittest.TestCase):
         alias = self.work / "repository"
         alias.symlink_to(ROOT, target_is_directory=True)
         for value in (
-            alias / "ansible/inventory/group_vars/all.yml",
-            ROOT.parent / ".." / ROOT.parent.name / ROOT.name / "ansible/inventory/group_vars/all.yml",
+            alias / "ansible/defaults/group_vars/all.yml",
+            ROOT.parent / ".." / ROOT.parent.name / ROOT.name / "ansible/defaults/group_vars/all.yml",
         ):
             self.env["CVP_OPERATOR_CONFIG_FILE"] = str(value)
             self.run_wrapper("onboard-node", code=None)

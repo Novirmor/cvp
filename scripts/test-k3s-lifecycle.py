@@ -220,7 +220,7 @@ exit 97
 ''', 0o700)
         inventory_vars = {}
         if inventory_escalation:
-            defaults = yaml.safe_load((ROOT / "ansible/inventory/hosts.yml").read_text())["all"]["vars"]
+            defaults = yaml.safe_load((ROOT / "ansible/defaults/group_vars/all.yml").read_text())
             assert defaults["ansible_become"] is True
             inventory_vars = {"ansible_become": defaults["ansible_become"], "ansible_become_method": "sudo",
                               "ansible_become_exe": str(fake_sudo)}

@@ -371,7 +371,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def topology_inventory(self):
-        shared = YAML.safe_load((ROOT / "ansible/inventory/group_vars/all.yml").read_bytes())
+        shared = YAML.safe_load((ROOT / "ansible/defaults/group_vars/all.yml").read_bytes())
         shared.update(ansible_become=True, ansible_host="must-not-contact.invalid",
                       ansible_connection="ssh", k3s_server_host="alpha", k3s_cluster_init_host="alpha")
         hosts = {}
@@ -416,7 +416,8 @@ class ControllerTests(unittest.TestCase):
             "scripts/export-kubeconfig", "scripts/cvp_export_kubeconfig.py",
             "scripts/cvp_wrapper_common.py", "scripts/cvp-topology.py",
             "scripts/test-kubeconfig-export.py", "ansible/ansible.cfg",
-            "ansible/inventory/group_vars/all.yml", "ansible/playbooks/export-kubeconfig.yml",
+            "ansible/defaults/group_vars/all.yml", "ansible/defaults/inventory.yml",
+            "ansible/playbooks/export-kubeconfig.yml",
             "ansible/playbooks/validate-inventory.yml", "ansible/playbooks/load-operator-config.yml",
             "ansible/playbooks/tasks/validate-topology.yml", "ansible/playbooks/tasks/validate-node-tags.yml",
         )
@@ -424,7 +425,8 @@ class ControllerTests(unittest.TestCase):
             destination = snapshot / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, destination)
-        inventory = snapshot / "ansible/inventory/hosts.yml"
+        inventory = snapshot / "examples/instance/inventory/hosts.yml"
+        inventory.parent.mkdir(parents=True)
         inventory.write_text(YAML.safe_dump(self.topology_inventory()))
         self.run_play(inventory, snapshot / "ansible/playbooks/validate-inventory.yml", success=True)
         selected = ["ExportTests", *(

@@ -133,7 +133,7 @@ class OperatorConfigTests(unittest.TestCase):
     def test_unsafe_credential_file_references_fail(self):
         shared = self.private_file("shared.wg-private", "synthetic-key\n", 0o644)
         multiline = self.private_file("multi.wg-private", "first\nsecond\n")
-        repository = ROOT / "ansible/inventory/group_vars/all.yml"
+        repository = ROOT / "ansible/defaults/group_vars/all.yml"
         for values in (
             {"wireguard_private_key": {"file": str(shared)}},
             {"wireguard_private_key": {"file": str(multiline)}},
@@ -190,7 +190,8 @@ class OperatorConfigTests(unittest.TestCase):
         sudo.chmod(0o700)
         env = dict(self.env, ANSIBLE_BECOME_EXE=str(sudo))
         result = subprocess.run(
-            ["ansible-playbook", "-i", str(ROOT / "ansible/inventory/hosts.yml"),
+            ["ansible-playbook", "-i", str(ROOT / "ansible/defaults/inventory.yml"),
+             "-i", str(ROOT / "examples/instance/inventory/hosts.yml"),
              str(ROOT / "ansible/playbooks/test-labels.yml")],
             env=env, text=True, capture_output=True, timeout=90,
         )

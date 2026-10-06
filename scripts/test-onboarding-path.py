@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NODES = ROOT / "docs/runbooks/nodes.md"
 CLI = ROOT / "scripts/cvp_node.py"
 VALIDATOR = ROOT / "ansible/playbooks/validate-inventory.yml"
+INVENTORY_DEFAULTS = ["-i", str(ROOT / "ansible/defaults/inventory.yml")]
 DOC_HOME = "/home/operator"
 
 
@@ -63,12 +64,11 @@ class OnboardingPathTests(unittest.TestCase):
         self.directory = Path(temporary.name)
         self.inventory = self.directory / "inventory/hosts.yml"
         self.inventory.parent.mkdir()
-        shutil.copyfile(ROOT / "ansible/inventory/hosts.yml", self.inventory)
-        shutil.copytree(ROOT / "ansible/inventory/group_vars", self.inventory.parent / "group_vars")
+        shutil.copyfile(ROOT / "examples/instance/inventory/hosts.yml", self.inventory)
         self.home = self.directory / "home"
-        keys = self.home / ".config/cvp/keys"
+        keys = self.home / ".config/cvp/example/keys"
         keys.mkdir(parents=True)
-        for directory in (self.home / ".config", self.home / ".config/cvp", keys):
+        for directory in (self.home / ".config", self.home / ".config/cvp", keys.parent, keys):
             directory.chmod(0o700)
         self.secrets = []
         for node in ("server1", "worker1"):
@@ -85,6 +85,7 @@ class OnboardingPathTests(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items() if not key.startswith(("ANSIBLE_", "CVP_"))}
         self.env.update(HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
                         XDG_STATE_HOME=str(self.home / ".local/state"), PYTHONDONTWRITEBYTECODE="1",
+                        CVP_INSTANCE_NAME="example",
                         ANSIBLE_CONFIG=str(ROOT / "ansible/ansible.cfg"), ANSIBLE_NOCOLOR="1",
                         ANSIBLE_LOCAL_TEMP=str(self.directory / "ansible-local"),
                         ANSIBLE_SSH_EXECUTABLE=str(blocker), ANSIBLE_BECOME_EXE=str(blocker))
@@ -114,7 +115,7 @@ class OnboardingPathTests(unittest.TestCase):
         self.scaffold("worker1")
 
     def validate(self, *, check=False, success=True, expected=None):
-        return self.run_command(["ansible-playbook", "-i", str(self.inventory), str(VALIDATOR),
+        return self.run_command(["ansible-playbook", *INVENTORY_DEFAULTS, "-i", str(self.inventory), str(VALIDATOR),
                                  *(["--check"] if check else [])], success=success, expected=expected)
 
     def test_documented_commands_generate_the_documented_files(self):
@@ -127,7 +128,7 @@ class OnboardingPathTests(unittest.TestCase):
                 self.assertEqual(documented.pop("wireguard_public_key"), f"REPLACE_WITH_{node.upper()}_WG_PUBLIC_KEY")
                 generated.pop("wireguard_public_key")
                 self.assertEqual(generated, documented)
-        self.assertEqual(self.generated(self.home / ".config/cvp/operator.yml"),
+        self.assertEqual(self.generated(self.home / ".config/cvp/example/operator.yml"),
                          example(lambda data: "cvp_operator_hosts" in data))
 
     def test_generated_inventory_validates_in_check_mode_without_host_access(self):
@@ -137,18 +138,19 @@ class OnboardingPathTests(unittest.TestCase):
 
     def test_real_inventory_precedence_exposes_conflicting_group_selection(self):
         self.documented_pair()
+        # An instance's group_vars/all.yml outranks the inventory's all.vars selections.
         group_path = self.inventory.parent / "group_vars/all.yml"
-        defaults = yaml.safe_load(group_path.read_text())
-        defaults["k3s_cluster_init_host"] = ""
-        group_path.write_text(yaml.safe_dump(defaults, sort_keys=False))
-        result = self.run_command(["ansible-inventory", "-i", str(self.inventory), "--list"])
+        group_path.parent.mkdir()
+        group_path.write_text(yaml.safe_dump({"k3s_cluster_init_host": ""}))
+        result = self.run_command(["ansible-inventory", *INVENTORY_DEFAULTS, "-i", str(self.inventory), "--list"])
         hostvars = json.loads(result.stdout)["_meta"]["hostvars"]
         for host in ("server1", "worker1"):
             self.assertEqual(hostvars[host]["k3s_cluster_init_host"], "")
         self.validate(success=False, expected="explicitly configured")
 
     def test_documented_shell_examples_parse_and_reference_existing_tasks(self):
-        tasks = yaml.safe_load((ROOT / "Taskfile.yml").read_text())["tasks"]
+        tasks = {name for path in (ROOT / "Taskfile.yml", ROOT / "tasks/ops.yml")
+                 for name in yaml.safe_load(path.read_text())["tasks"]}
         for document in (NODES,):
             for block in snippets(document, "sh") + snippets(document, "bash"):
                 with self.subTest(document=document.name, snippet=block.splitlines()[0]):

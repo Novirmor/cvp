@@ -1,0 +1,5 @@
+---
+# Platform defaults, loaded as the first inventory source on every run. The
+# variables live in group_vars/all.yml next to this file; an instance overrides
+# any of them in its own inventory/group_vars/all.yml, which loads later.
+all: {}

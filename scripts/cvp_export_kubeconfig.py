@@ -18,7 +18,7 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
-from cvp_wrapper_common import ROOT, external_path, private_bytes, ssh_options, trusted_parent
+from cvp_wrapper_common import ROOT, external_path, inventory_args, private_bytes, ssh_options, trusted_parent
 
 
 def yaml_module(script=None):
@@ -219,9 +219,8 @@ def export(yaml):
                ANSIBLE_TRANSPORT="ssh", ANSIBLE_LOG_PATH=os.devnull, ANSIBLE_DEBUG="False",
                ANSIBLE_STDOUT_CALLBACK="default", ANSIBLE_CALLBACKS_ENABLED="",
                ANSIBLE_DISPLAY_ARGS_TO_STDOUT="False", ANSIBLE_KEEP_REMOTE_FILES="False")
-    inventory = str(ROOT / "ansible/inventory/hosts.yml")
     try:
-        data = json.loads(quiet_run(["ansible-inventory", "-i", inventory, "--list"], env,
+        data = json.loads(quiet_run(["ansible-inventory", *inventory_args(), "--list"], env,
                                    "cannot read inventory; install pinned Ansible with mise", capture=True))
     except (json.JSONDecodeError, UnicodeError):
         raise ValueError("Ansible returned invalid inventory data") from None
@@ -235,7 +234,7 @@ def export(yaml):
             staging = directory / "remote.b64"
             private_write(staging, b"")
             env.update(CVP_KUBECONFIG_STAGING_FILE=str(staging), ANSIBLE_LOCAL_TEMP=str(directory / "ansible-local"))
-            quiet_run(["ansible-playbook", "-i", inventory,
+            quiet_run(["ansible-playbook", *inventory_args(),
                        str(ROOT / "ansible/playbooks/export-kubeconfig.yml"), "--limit", host,
                        "-e", json.dumps(options)], env,
                       "could not stage admin kubeconfig; check inventory identity, trusted SSH access, remote sudo and K3s availability")

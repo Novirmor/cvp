@@ -44,7 +44,6 @@ import cvp_wrapper_common as common  # noqa: E402
 
 ROOT = common.ROOT
 PLAYBOOKS = ROOT / "ansible/playbooks"
-DEFAULT_INVENTORY = ROOT / "ansible/inventory/hosts.yml"
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 GROUPS = ("wireguard", "k3s_servers", "k3s_agents", "storage_stateful", "ingress")
 INGRESS_LABELS = ["cvp.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
@@ -63,10 +62,6 @@ def require(condition, message):
 
 def say(message):
     print(message, flush=True)
-
-
-def xdg(variable, fallback):
-    return Path(os.environ.get(variable) or Path.home() / fallback)
 
 
 def known_hosts_file():
@@ -131,7 +126,7 @@ def ansible_env():
 
 
 def read_inventory(inventory):
-    result = run(["ansible-inventory", "-i", str(inventory), "--list"], capture=True, env=ansible_env())
+    result = run(["ansible-inventory", *common.inventory_args(inventory), "--list"], capture=True, env=ansible_env())
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -170,7 +165,7 @@ def generate_wireguard_key():
 
 def operator_file_for_write():
     explicit = os.environ.get("CVP_OPERATOR_CONFIG_FILE", "")
-    path = Path(explicit) if explicit else xdg("XDG_CONFIG_HOME", ".config") / "cvp/operator.yml"
+    path = Path(explicit) if explicit else common.config_dir() / "operator.yml"
     require(path.is_absolute(), "CVP_OPERATOR_CONFIG_FILE must be an absolute path")
     resolved = path.resolve()
     require(resolved != ROOT and ROOT not in resolved.parents,
@@ -298,7 +293,9 @@ def cmd_new(args):
     ssh_key = args.ssh_key or (keys.pop() if len(keys) == 1 else None)
     require(ssh_key and Path(ssh_key).is_absolute(),
             "--ssh-key must be the absolute path of the operator SSH private key")
-    port = int(shared.get("wireguard_port", 51820))
+    overrides = inventory.parent / "group_vars/all.yml"
+    instance_vars = (yaml.safe_load(overrides.read_text()) or {}) if overrides.is_file() else {}
+    port = int(instance_vars.get("wireguard_port") or shared.get("wireguard_port") or 51820)
     labels = list(args.label) if args.label else (
         ["cvp.io/compute=true", "cvp.io/storage=true", "cvp.io/system=true"] if first else ["cvp.io/compute=true"])
     if first:
@@ -307,7 +304,7 @@ def cmd_new(args):
     sources = [host_cidr(value, "--ssh-source") for value in args.ssh_source]
     require(sources, "--ssh-source is required: the controller's public egress address as /32 or /128")
 
-    config_dir = xdg("XDG_CONFIG_HOME", ".config") / "cvp"
+    config_dir = common.config_dir()
     key_path = Path(args.wireguard_key_file) if args.wireguard_key_file else config_dir / "keys" / f"{node}.wg-private"
     require(key_path.is_absolute(), "--wireguard-key-file must be absolute")
     operator_path = operator_file_for_write()
@@ -357,10 +354,14 @@ def cmd_new(args):
     }
     hosts[node] = entry
 
-    relative = inventory.relative_to(ROOT) if ROOT in inventory.parents else inventory
+    def shown(path):
+        instance = common.instance_dir()
+        return path.relative_to(instance) if instance in path.parents else path
+
+    relative = shown(inventory)
     say(f"Plan for {node} ({'first host, cluster init' if first else role}, mesh {address}):\n")
     show_diff(relative, inventory_text, new_inventory)
-    show_diff(host_vars.relative_to(ROOT) if ROOT in host_vars.parents else host_vars, "", host_text)
+    show_diff(shown(host_vars), "", host_text)
     say(f"\n{operator_path}: add cvp_operator_hosts.{node}:")
     say("  " + yaml.safe_dump(entry, sort_keys=False).replace("\n", "\n  ").rstrip())
     say(f"{key_path}: {'generate a new' if new_key else 'reuse the existing'} WireGuard private key (mode 0600)")
@@ -389,7 +390,7 @@ def cmd_new(args):
         env["CVP_OPERATOR_CONFIG_FILE"] = str(operator_path)
         for variable in ("CVP_OPERATOR_CONFIG_SHA256", "CVP_OPERATOR_FILES_SHA256", "CVP_OPERATOR_CONFIG_ABSENT"):
             env.pop(variable, None)
-        result = run(["ansible-playbook", "-i", str(inventory), str(PLAYBOOKS / "validate-inventory.yml")],
+        result = run(["ansible-playbook", *common.inventory_args(inventory), str(PLAYBOOKS / "validate-inventory.yml")],
                      capture=True, check=False, env=env)
         if result.returncode:
             sys.stderr.write(result.stdout[-4000:] + result.stderr[-2000:])
@@ -510,7 +511,7 @@ def trust_bootstrap_key(host, port, fingerprint):
 # --- node-join --------------------------------------------------------------
 
 def state_path(node, inventory):
-    directory = xdg("XDG_STATE_HOME", ".local/state") / "cvp/nodes"
+    directory = common.state_dir() / "nodes"
     private_directory(directory)
     scope = hashlib.sha256(str(inventory).encode()).hexdigest()[:12]
     return directory / f"{node}-{scope}.json"
@@ -528,7 +529,7 @@ def save_state(path, state):
 
 def operator_ssh_check(inventory, node, ssh):
     options = dict(ssh, ansible_ssh_extra_args="-o BatchMode=yes")
-    result = run(["ansible", "-i", str(inventory), node, "-o", "-m", "ansible.builtin.command", "-a", "id -un",
+    result = run(["ansible", *common.inventory_args(inventory), node, "-o", "-m", "ansible.builtin.command", "-a", "id -un",
                   "-e", json.dumps(options)], capture=True, check=False, env=ansible_env())
     return result.returncode == 0 and "root" in result.stdout
 
@@ -559,9 +560,9 @@ def cmd_join(args):
     onboard = json.dumps({"cvp_onboard_node": node, "cvp_onboard_server_confirm": args.server_confirm or ""})
 
     def playbook(name, *extra):
-        return ["ansible-playbook", "-i", str(inventory), str(PLAYBOOKS / name), "-e", json.dumps(ssh), *extra]
+        return ["ansible-playbook", *common.inventory_args(inventory), str(PLAYBOOKS / name), "-e", json.dumps(ssh), *extra]
 
-    stages = [("validate", False, ["ansible-playbook", "-i", str(inventory),
+    stages = [("validate", False, ["ansible-playbook", *common.inventory_args(inventory),
                                    str(PLAYBOOKS / "validate-inventory.yml")]),
               ("access", True, None),
               ("probe", False, playbook("probe.yml", "--limit", node))]
@@ -758,7 +759,7 @@ def parser():
     auth = new.add_mutually_exclusive_group()
     auth.add_argument("--tailscale-auth-key-file", help="private file holding the Tailscale auth key")
     auth.add_argument("--tailscale-auth-key-env", help="environment variable holding the Tailscale auth key")
-    new.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    new.add_argument("--inventory", default=str(common.instance_inventory()))
     new.add_argument("--write", action="store_true", help="apply the plan (default: dry run)")
     new.add_argument("--no-next-steps", action="store_true", help=argparse.SUPPRESS)
     new.set_defaults(func=cmd_new)
@@ -774,7 +775,7 @@ def parser():
     join.add_argument("--retry-reviewed", action="store_true", help="retry an interrupted mutating stage")
     join.add_argument("--restart", action="store_true", help="ignore completed stages")
     join.add_argument("--existing-cluster", action="store_true", help=argparse.SUPPRESS)
-    join.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    join.add_argument("--inventory", default=str(common.instance_inventory()))
     join.set_defaults(func=cmd_join)
 
     bootstrap = commands.add_parser("bootstrap", help="prepare a fresh Debian host over root SSH")
@@ -785,7 +786,7 @@ def parser():
                            help="provider login account; a non-root account runs the script with sudo")
     bootstrap.add_argument("--root-key", help="SSH private key for the login account (default: password)")
     bootstrap.add_argument("--public-key", help="operator public key to install (default: <ssh key>.pub)")
-    bootstrap.add_argument("--inventory", default=str(DEFAULT_INVENTORY))
+    bootstrap.add_argument("--inventory", default=str(common.instance_inventory()))
     bootstrap.set_defaults(func=cmd_bootstrap)
     return root
 

@@ -1,17 +1,26 @@
 ---
 version: "3"
 
+vars:
+  # Platform development runs against the bundled, empty example instance.
+  EXAMPLE_INVENTORY: -i ansible/defaults/inventory.yml -i examples/instance/inventory/hosts.yml
+
+includes:
+  ops:
+    taskfile: ./tasks/ops.yml
+    flatten: true
+
 tasks:
+  new-instance:
+    desc: >-
+      Create an instance repository that pins this platform
+      (e.g. task new-instance -- ../my-platform --platform-url https://github.com/OWNER/cvp.git)
+    cmds:
+      - mise exec -- python3 -B scripts/cvp_instance.py new {{.CLI_ARGS}}
+
   default:
     cmds:
       - task: lint
-
-  deps:
-    desc: Install pinned Ansible collections locally
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-galaxy collection install
-        -r ansible/requirements.yml -p ansible/collections
 
   lint:
     desc: Run repository formatting and lint checks
@@ -27,35 +36,35 @@ tasks:
     cmds:
       - git diff --check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/site.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/probe.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/probe-wireguard.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/restore-k3s.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/bootstrap-access.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/export-kubeconfig.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/validate-inventory.yml --syntax-check
       - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
+        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook {{.EXAMPLE_INVENTORY}}
         ansible/playbooks/verify.yml --syntax-check
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
         -i localhost, ansible/playbooks/test-templates.yml
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
-        -i ansible/inventory/hosts.yml ansible/playbooks/test-labels.yml
+        {{.EXAMPLE_INVENTORY}} ansible/playbooks/test-labels.yml
       - mise exec -- python3 -B scripts/test-node-lifecycle.py
       - mise exec -- python3 -B scripts/test-init.py
       - mise exec -- ./scripts/test-prepare-access
@@ -109,218 +118,3 @@ tasks:
     desc: Run WireGuard reconciliation checks in isolated unprivileged network namespaces
     cmds:
       - mise exec -- python3 -B scripts/test-wireguard-dataplane.py
-
-  tailscale-identity-init:
-    desc: Establish the protected tailnet identity in empty state before imports
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale establish-identity {{.CLI_ARGS}}
-
-  probe:
-    desc: Check host capabilities before convergence, without requiring an active WireGuard mesh
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
-        ansible/playbooks/probe.yml {{.CLI_ARGS}}
-
-  validate-inventory:
-    desc: Validate operator configuration, topology, and node tags without contacting hosts
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
-        -i ansible/inventory/hosts.yml ansible/playbooks/validate-inventory.yml
-
-  export-kubeconfig:
-    desc: Export a private TLS-verified cluster-admin kubeconfig with explicit host confirmation
-    cmds:
-      - mise exec -- ./scripts/export-kubeconfig
-
-  probe-wireguard:
-    desc: Check the converged WireGuard mesh and path MTU (run after task site)
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
-        ansible/playbooks/probe-wireguard.yml {{.CLI_ARGS}}
-
-  init:
-    desc: >-
-      Guided setup: take a fresh Debian host to a joined node (first run creates
-      the cluster; rerun to add hosts or resume). See README Quickstart.
-    interactive: true
-    cmds:
-      - mise exec -- python3 -B scripts/cvp_init.py {{.CLI_ARGS}}
-
-  node-new:
-    desc: >-
-      Scaffold one node's inventory, host vars, WireGuard key, and operator entry
-      without contacting it (dry run unless --write;
-      e.g. task node-new -- worker1 --ssh 203.0.113.21 --virt vm --ssh-source 203.0.113.10/32)
-    cmds:
-      - mise exec -- python3 -B scripts/cvp_node.py new {{.CLI_ARGS}}
-
-  node-join:
-    desc: >-
-      Resumably prepare access, probe, and join one node, including the first
-      (e.g. task node-join -- worker1 --confirm worker1)
-    cmds:
-      - mise exec -- python3 -B scripts/cvp_node.py join {{.CLI_ARGS}}
-
-  node-bootstrap:
-    desc: >-
-      Copy scripts/node-bootstrap.sh to a fresh Debian host over SSH and run it
-      as root to create the ops operator
-      (e.g. task node-bootstrap -- worker1 --confirm worker1 --host-key-fingerprint SHA256:...)
-    interactive: true
-    cmds:
-      - mise exec -- python3 -B scripts/cvp_node.py bootstrap {{.CLI_ARGS}}
-
-  onboard:
-    desc: >-
-      Compatibility alias for node-join on an existing cluster
-      (set CVP_ONBOARD_NODE and CVP_ONBOARD_CONFIRM)
-    cmds:
-      - mise exec -- ./scripts/onboard-node
-
-  prepare-access:
-    desc: >-
-      Prepare one new host for Ansible (set CVP_ACCESS_NODE,
-      CVP_ACCESS_CONFIRM, and CVP_ACCESS_PUBLIC_KEY_FILE)
-    cmds:
-      - mise exec -- ./scripts/prepare-node-access
-
-  bootstrap-access:
-    desc: >-
-      Low-level root-to-ops bootstrap without changing network policy
-      (requires CVP_BOOTSTRAP_ADMIN_KEYS, --limit, and
-      -e ansible_user=root -e ansible_become=false; prefer task prepare-access)
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
-        ansible/playbooks/bootstrap-access.yml {{.CLI_ARGS}}
-
-  site:
-    desc: >-
-      Converge hosts and the K3s cluster
-      (e.g. task site -- --check --diff, or
-      task site -- -e '{"firewall_ssh_ipv4_source_cidrs":["203.0.113.10/32"]}')
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
-        ansible/playbooks/site.yml {{.CLI_ARGS}}
-
-  verify:
-    desc: Read-only verification of hosts, network, storage, and cluster health
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook -i ansible/inventory/hosts.yml
-        ansible/playbooks/verify.yml {{.CLI_ARGS}}
-
-  restore-k3s:
-    desc: >-
-      Destructively restore the K3s datastore and tokens from an age archive
-      (requires the K3S_RESTORE_* environment variables and --limit; see ansible/README.md)
-    cmds:
-      - >-
-        ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
-        -i ansible/inventory/hosts.yml ansible/playbooks/restore-k3s.yml {{.CLI_ARGS}}
-
-  bootstrap-flux:
-    desc: >-
-      One-time Flux bootstrap against an explicit context
-      (requires FLUX_GITHUB_OWNER, FLUX_GITHUB_REPOSITORY,
-      FLUX_KUBE_CONTEXT, FLUX_GIT_SSH_KEY_FILE,
-      FLUX_GIT_KNOWN_HOSTS_FILE, and SOPS_AGE_KEY_FILE)
-    cmds:
-      - mise exec -- ./scripts/bootstrap-flux
-
-  render:
-    desc: Render a Kustomize overlay (e.g. task render -- cluster/apps/overlays/smoke)
-    cmds:
-      - mise exec -- kubectl kustomize {{.CLI_ARGS}}
-
-  cloudflare-init:
-    desc: >-
-      Initialize the Cloudflare root against its backend
-      (e.g. task cloudflare-init -- -backend-config=/secure/path/backend.hcl)
-    cmds:
-      - mise exec -- tofu -chdir=tofu/cloudflare init -input=false {{.CLI_ARGS}}
-
-  cloudflare-plan:
-    desc: >-
-      Plan the Cloudflare root
-      (e.g. task cloudflare-plan -- -var-file=/secure/path/cloudflare.tfvars -out=/secure/path/plan.tfplan)
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare plan {{.CLI_ARGS}}
-
-  cloudflare-drift-plan:
-    desc: Save a refresh-only Cloudflare drift plan for review
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare drift-plan {{.CLI_ARGS}}
-
-  cloudflare-show:
-    desc: Show a saved Cloudflare plan (e.g. task cloudflare-show -- /secure/path/plan.tfplan)
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare show {{.CLI_ARGS}}
-
-  cloudflare-apply:
-    desc: Apply a reviewed Cloudflare plan (e.g. task cloudflare-apply -- /secure/path/plan.tfplan)
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare apply {{.CLI_ARGS}}
-
-  cloudflare-import:
-    desc: Import one existing Cloudflare resource after inventory review
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare import {{.CLI_ARGS}}
-
-  cloudflare-state-list:
-    desc: List addresses in the Cloudflare state
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare state-list
-
-  cloudflare-state-pull:
-    desc: Snapshot Cloudflare state to an absolute path outside the repository
-    cmds:
-      - mise exec -- ./scripts/tofu-operation cloudflare state-pull {{.CLI_ARGS}}
-
-  tailscale-init:
-    desc: >-
-      Initialize the Tailscale root against its backend
-      (e.g. task tailscale-init -- -backend-config=/secure/path/backend.hcl)
-    cmds:
-      - mise exec -- tofu -chdir=tofu/tailscale init -input=false {{.CLI_ARGS}}
-
-  tailscale-plan:
-    desc: >-
-      Plan the Tailscale root
-      (e.g. task tailscale-plan -- -var-file=/secure/path/tailscale.tfvars -out=/secure/path/plan.tfplan)
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale plan {{.CLI_ARGS}}
-
-  tailscale-drift-plan:
-    desc: Save a refresh-only Tailscale drift plan for review
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale drift-plan {{.CLI_ARGS}}
-
-  tailscale-show:
-    desc: Show a saved Tailscale plan (e.g. task tailscale-show -- /secure/path/plan.tfplan)
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale show {{.CLI_ARGS}}
-
-  tailscale-apply:
-    desc: Apply a reviewed Tailscale plan (e.g. task tailscale-apply -- /secure/path/plan.tfplan)
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale apply {{.CLI_ARGS}}
-
-  tailscale-import:
-    desc: Import one existing Tailscale resource after inventory review
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale import {{.CLI_ARGS}}
-
-  tailscale-state-list:
-    desc: List addresses in the Tailscale state
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale state-list
-
-  tailscale-state-pull:
-    desc: Snapshot Tailscale state to an absolute path outside the repository
-    cmds:
-      - mise exec -- ./scripts/tofu-operation tailscale state-pull {{.CLI_ARGS}}

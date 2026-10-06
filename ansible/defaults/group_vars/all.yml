@@ -1,6 +1,17 @@
 ---
-# These values are deliberately ordinary variables. Secret material is supplied
-# through an external vars file, environment lookup, or the host itself.
+# Platform defaults for every instance. These are deliberately ordinary
+# variables. Secret material is supplied through an external vars file,
+# environment lookup, or the host itself.
+#
+# An instance overrides any of them in its own inventory/group_vars/all.yml.
+# (Values in an instance's hosts.yml all.vars rank below this file.)
+
+# Connection and mesh identity shared by every node.
+ansible_user: ops
+ansible_become: true
+wireguard_interface: wg0
+wireguard_port: 51820
+wireguard_peers_group: wireguard
 
 base_packages:
   - ca-certificates

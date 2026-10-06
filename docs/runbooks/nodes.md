@@ -36,8 +36,12 @@ manual path.
 | `task node-bootstrap` | Trusts the fresh host's SSH key only if it matches the provider-console fingerprint, copies `scripts/node-bootstrap.sh` to it over SSH, and runs it as root: installs Python, sudo, and SSH, and creates the `ops` operator with your key and passwordless sudo. Then proves `ops` login and sudo. | The new host (accounts and packages only) |
 | `task node-join` | Validates, probes, checks fleet membership, converges, probes the mesh, verifies. Records progress and resumes. | The new host and, during `site`, the whole fleet |
 
-Run controller commands from the repository root. The default inventory is
-empty and creates no machines. Add **one node at a time**.
+Run every command from the root of your **instance repository** (created with
+`task new-instance` in the platform repository; see the platform README). Its
+`platform/` submodule provides these tasks; your inventory, cluster apps, and
+Flux entry point live beside it. `example` below stands for your instance
+name: per-user files live in `~/.config/cvp/<instance>/`. A new instance's
+inventory is empty and creates no machines. Add **one node at a time**.
 
 All public IPs (`203.0.113.*`, `2001:db8::*`), Tailscale addresses, paths, and
 fingerprints below are **illustrative; replace them**. The mesh example
@@ -127,12 +131,12 @@ Paste the Tailscale enrollment key from your secret store into a private file
 (it is not echoed or kept in shell history), then preview the node:
 
 ```sh
-mkdir -p -m 0700 "$HOME/.config/cvp/keys"
-(umask 077 && read -rs key && printf '%s\n' "$key" > "$HOME/.config/cvp/keys/server1.ts-authkey")
+mkdir -p -m 0700 "$HOME/.config/cvp/example/keys"
+(umask 077 && read -rs key && printf '%s\n' "$key" > "$HOME/.config/cvp/example/keys/server1.ts-authkey")
 task node-new -- server1 --ssh 203.0.113.20 --virt vm \
   --mesh-address 10.77.0.1 --ssh-key "$HOME/.ssh/cvp-ops" \
   --ssh-source 203.0.113.10/32 \
-  --tailscale-auth-key-file "$HOME/.config/cvp/keys/server1.ts-authkey"
+  --tailscale-auth-key-file "$HOME/.config/cvp/example/keys/server1.ts-authkey"
 ```
 
 Review the printed plan, then rerun the same command with `--write`. The first
@@ -140,10 +144,10 @@ node is always the cluster-init server, the designated API server, and the sole
 ingress node; it gets directory-backed local storage on the root filesystem
 (no formatting). The command writes:
 
-- `ansible/inventory/hosts.yml`: group membership and both shared server selections;
-- `ansible/inventory/host_vars/server1.yml`: identity, mesh, labels, storage;
-- `~/.config/cvp/keys/server1.wg-private` (mode `0600`): a new WireGuard key;
-- `~/.config/cvp/operator.yml` (mode `0600`): credential references and your SSH source.
+- `inventory/hosts.yml`: group membership and both shared server selections;
+- `inventory/host_vars/server1.yml`: identity, mesh, labels, storage;
+- `~/.config/cvp/example/keys/server1.wg-private` (mode `0600`): a new WireGuard key;
+- `~/.config/cvp/example/operator.yml` (mode `0600`): credential references and your SSH source.
 
 **Store the WireGuard private key in your external secret store now.** The
 generated files are shown in [section 8](#8-reference-generated-files). Pass
@@ -194,9 +198,9 @@ ssh -i "$HOME/.ssh/cvp-ops" ops@203.0.113.20 tailscale ip -4
 CVP_KUBECONFIG_HOST=server1 CVP_KUBECONFIG_CONFIRM=server1 \
 CVP_KUBECONFIG_CONTEXT=cvp \
 CVP_KUBECONFIG_SERVER=https://100.100.100.20:6443 \
-CVP_KUBECONFIG_OUTPUT="$HOME/.config/cvp/kubeconfig-server1" \
+CVP_KUBECONFIG_OUTPUT="$HOME/.config/cvp/example/kubeconfig" \
   task export-kubeconfig
-export KUBECONFIG="$HOME/.config/cvp/kubeconfig-server1"
+export KUBECONFIG="$HOME/.config/cvp/example/kubeconfig"
 mise exec -- kubectl --context cvp get --raw=/readyz
 mise exec -- kubectl --context cvp get nodes -o wide
 ```
@@ -241,7 +245,7 @@ Install Debian and read its fingerprint as in [section 3.1](#31-install-debian-f
 ```sh
 task node-new -- worker1 --ssh 203.0.113.21 --virt vm \
   --ssh-source 203.0.113.10/32 \
-  --tailscale-auth-key-file "$HOME/.config/cvp/keys/worker1.ts-authkey"
+  --tailscale-auth-key-file "$HOME/.config/cvp/example/keys/worker1.ts-authkey"
 task node-bootstrap -- worker1 --confirm worker1 \
   --host-key-fingerprint SHA256:REPLACE_WITH_CONSOLE_FINGERPRINT
 ```
@@ -270,7 +274,7 @@ time. SQLite permits only one server. Confirm the quorum review explicitly:
 ```sh
 task node-new -- server2 --ssh 203.0.113.22 --virt vm --role server \
   --ssh-source 203.0.113.10/32 \
-  --tailscale-auth-key-file "$HOME/.config/cvp/keys/server2.ts-authkey"
+  --tailscale-auth-key-file "$HOME/.config/cvp/example/keys/server2.ts-authkey"
 task node-bootstrap -- server2 --confirm server2 \
   --host-key-fingerprint SHA256:REPLACE_WITH_CONSOLE_FINGERPRINT
 task node-join -- server2 --confirm server2 --server-confirm server2
@@ -304,7 +308,7 @@ it does not evict existing pods.
 | `mesh` | read-only | The node's WireGuard peers and no-fragment path MTU |
 | `verify` | read-only | Every host and cluster node |
 
-Progress lives in `~/.local/state/cvp/nodes/` (`$XDG_STATE_HOME`). Rerunning the
+Progress lives in `~/.local/state/cvp/example/nodes/` (`$XDG_STATE_HOME`). Rerunning the
 same command after a failure skips the stages before the last **completed
 mutating** stage and reruns the read-only checks after it on fresh state. If a
 mutating stage was **interrupted**, the command refuses to retry it until you
@@ -360,17 +364,12 @@ coordinated topology and recovery change, not an inventory edit.
 
 ## 8. Reference: generated files
 
-After `server1` and `worker1`, `ansible/inventory/hosts.yml` is:
+After `server1` and `worker1`, `inventory/hosts.yml` is:
 
 ```yaml
 ---
 all:
   vars:
-    ansible_user: ops
-    ansible_become: true
-    wireguard_interface: wg0
-    wireguard_port: 51820
-    wireguard_peers_group: wireguard
     k3s_cluster_init_host: server1
     k3s_server_host: server1
   children:
@@ -392,8 +391,11 @@ all:
 ```
 
 Both server selections stay in `all.vars` so every node inherits them.
-`group_vars/all.yml` takes precedence over inventory `all.vars` and must not
-override them. Every mesh host is in exactly one of `k3s_servers` and
+Connection and mesh settings (`ansible_user: ops`, `wg0`, UDP `51820`) are
+platform defaults in `platform/ansible/defaults/group_vars/all.yml`. Override a
+platform default in the instance's `inventory/group_vars/all.yml`, which
+outranks both the platform defaults and `all.vars`; it must not override the
+server selections. Every mesh host is in exactly one of `k3s_servers` and
 `k3s_agents`, matching its `k3s_role`.
 
 `host_vars/server1.yml`:
@@ -464,7 +466,7 @@ the [storage gate](../../ansible/README.md#controlled-bootstrap). For a custom
 SSH port, align `ansible_port`, `base_ssh_port`, `firewall_ssh_port`, the host
 listener, the provider firewall, and the tailnet ACL **before** joining.
 
-`~/.config/cvp/operator.yml` (mode `0600`, outside Git):
+`~/.config/cvp/example/operator.yml` (mode `0600`, outside Git):
 
 ```yaml
 ---
@@ -472,17 +474,17 @@ cvp_operator_defaults: {}
 cvp_operator_hosts:
   server1:
     wireguard_private_key:
-      file: /home/operator/.config/cvp/keys/server1.wg-private
+      file: /home/operator/.config/cvp/example/keys/server1.wg-private
     tailscale_auth_key:
-      file: /home/operator/.config/cvp/keys/server1.ts-authkey
+      file: /home/operator/.config/cvp/example/keys/server1.ts-authkey
     firewall_ssh_ipv4_source_cidrs:
     - 203.0.113.10/32
     firewall_ssh_ipv6_source_cidrs: []
   worker1:
     wireguard_private_key:
-      file: /home/operator/.config/cvp/keys/worker1.wg-private
+      file: /home/operator/.config/cvp/example/keys/worker1.wg-private
     tailscale_auth_key:
-      file: /home/operator/.config/cvp/keys/worker1.ts-authkey
+      file: /home/operator/.config/cvp/example/keys/worker1.ts-authkey
     firewall_ssh_ipv4_source_cidrs:
     - 203.0.113.10/32
     firewall_ssh_ipv6_source_cidrs: []

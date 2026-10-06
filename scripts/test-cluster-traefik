@@ -24,7 +24,7 @@ def asset(name, url):
 def main():
     pin = json.loads(Path("cluster/infrastructure/ingress/packaged-chart.json").read_text())
     version = pin["k3sVersion"]
-    inventory = parse(Path("ansible/inventory/group_vars/all.yml").read_text())
+    inventory = parse(Path("ansible/defaults/group_vars/all.yml").read_text())
     assert inventory["k3s_version"] == version, "review packaged Traefik pin when upgrading K3s"
     prefix = f"https://raw.githubusercontent.com/k3s-io/k3s/{version}"
     manifest = parse(asset(f"k3s-{version}-traefik.yaml", f"{prefix}/manifests/traefik.yaml").decode())
