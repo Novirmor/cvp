@@ -5,7 +5,7 @@ metadata:
   name: traefik
   namespace: kube-system
   annotations:
-    cvp.example.com/owner: cluster
+    cvp.novirmor.io/owner: cluster
 spec:
   valuesContent: |-
     additionalArguments:
@@ -21,7 +21,7 @@ spec:
       general:
         level: WARN
     nodeSelector:
-      cvp.io/ingress: "true"
+      cvp.novirmor.io/ingress: "true"
     ports:
       web:
         expose:

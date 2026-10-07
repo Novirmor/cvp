@@ -115,7 +115,7 @@
   vars:
     managed_label_prefixes: "{{ k3s_managed_label_domains | join('|') }}"
     tag_target_nodes: "{{ ansible_play_hosts_all }}"
-    taint_ownership_key: cvp.io/managed-taints
+    taint_ownership_key: cvp.novirmor.io/managed-taints
   tasks:
     # Delegation works even when --limit selects only agents. A newly joined
     # node may take a short time to register after its role has completed.
@@ -191,7 +191,7 @@
           - bootstrap_taints | length <= 1
           - >-
             bootstrap_taints | length == 0 or
-            ((item.resources[0].metadata.labels | default({})).get('cvp.io/bootstrap-quarantine') == 'true'
+            ((item.resources[0].metadata.labels | default({})).get('cvp.novirmor.io/bootstrap-quarantine') == 'true'
              and bootstrap_taints[0].get('value') == 'true'
              and bootstrap_taints[0].get('effect') == 'NoSchedule')
         fail_msg: The bootstrap quarantine does not match the owned registration state; refusing to remove it.
@@ -199,7 +199,7 @@
       vars:
         bootstrap_taints: >-
           {{ item.resources[0].spec.taints | default([])
-             | selectattr('key', 'equalto', 'cvp.io/bootstrap') | list }}
+             | selectattr('key', 'equalto', 'cvp.novirmor.io/bootstrap') | list }}
       when: not ansible_check_mode
 
     # Construct Python/Jinja dictionaries, never JSON text interpolated from
@@ -213,9 +213,9 @@
         node_res: "{{ item.resources[0] }}"
         current_labels: "{{ node_res.metadata.labels | default({}) }}"
         node_role_label: >-
-          {{ 'cvp.io/role=control-plane'
+          {{ 'cvp.novirmor.io/role=control-plane'
              if hostvars[item.item]['k3s_role'] | default('agent') == 'server'
-             else 'cvp.io/role=agent' }}
+             else 'cvp.novirmor.io/role=agent' }}
         node_labels: "{{ [node_role_label] + hostvars[item.item]['k3s_node_labels'] }}"
         node_taints: "{{ hostvars[item.item]['k3s_node_taints'] }}"
         desired_keys: "{{ node_labels | map('regex_replace', '=.*$', '') | list }}"
@@ -246,7 +246,7 @@
             {%- set ns.desired = ns.desired + [dict(key=key, value=value, effect=effect)] -%}
           {%- endfor -%}
           {%- for taint in old_taints -%}
-            {%- if taint.key != 'cvp.io/bootstrap' and
+            {%- if taint.key != 'cvp.novirmor.io/bootstrap' and
                    (not (ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list) or
                    (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list)) -%}
               {%- set ns.retained = ns.retained + [taint] -%}
@@ -266,7 +266,7 @@
               {%- endif -%}
               {%- for taint in old_taints | reverse | list -%}
                 {%- set index = (old_taints | length - 1) - loop.index0 -%}
-                {%- if taint.key == 'cvp.io/bootstrap' or
+                {%- if taint.key == 'cvp.novirmor.io/bootstrap' or
                        (ns.owned | selectattr('key', 'equalto', taint.key) | selectattr('effect', 'equalto', taint.effect) | list and
                        not (ns.desired | selectattr('key', 'equalto', taint.key) | selectattr('value', 'equalto', taint.value | default('')) | selectattr('effect', 'equalto', taint.effect) | list)) -%}
                   {%- set ns.ops = ns.ops + [dict(op='remove', path='/spec/taints/' ~ index)] -%}

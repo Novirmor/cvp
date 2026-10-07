@@ -14,7 +14,6 @@ base_kernel_modules:
   - br_netfilter
   - overlay
   - vxlan
-base_public_ingress_ports: []
 base_disable_swap: true
 base_manage_admin_user: false
 base_admin_user: cvp-admin

@@ -56,7 +56,7 @@ if fail and fail in name + " " + joined:
 if name == "ansible":
     if os.environ.get("CVP_TEST_ANSIBLE_FAIL"):
         sys.exit(4)
-    print("node | CHANGED | rc=0 | (stdout) root")
+    print("node | CHANGED | rc=0 >>\\nroot")
 elif name == "ssh-keyscan":
     key = os.environ.get("CVP_TEST_SCAN_KEY", "")
     print(args[-1] + " ssh-ed25519 " + key)
@@ -166,7 +166,7 @@ class NodeLifecycleTests(unittest.TestCase):
         self.assertIn("svccontroller.k3s.cattle.io/lbpool=public", server["k3s_node_labels"])
         self.assertEqual(worker["wireguard_address"], "10.77.0.2")
         self.assertEqual(worker["ansible_private_key_file"], str(self.ssh_key))
-        self.assertEqual(worker["k3s_node_labels"], ["cvp.io/compute=true"])
+        self.assertEqual(worker["k3s_node_labels"], ["cvp.novirmor.io/compute=true"])
         operator = self.operator()["cvp_operator_hosts"]["worker1"]
         key_file = Path(operator["wireguard_private_key"]["file"])
         self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)

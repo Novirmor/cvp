@@ -75,7 +75,7 @@
       {%- for node in cvp_onboard_nodes.resources -%}
         {%- set selected = namespace(labels={}, addresses=[], conditions=[]) -%}
         {%- for key in ['node-role.kubernetes.io/control-plane', 'node-role.kubernetes.io/master',
-                        'node-role.kubernetes.io/etcd', 'cvp.io/role'] -%}
+                        'node-role.kubernetes.io/etcd', 'cvp.novirmor.io/role'] -%}
           {%- if key in node.metadata.labels | default({}) -%}
             {%- set selected.labels = selected.labels | combine({key: node.metadata.labels[key]}) -%}
           {%- endif -%}

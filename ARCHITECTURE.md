@@ -65,41 +65,41 @@ that disagrees with the detected environment fails all three.
 
 All nodes are intended to remain schedulable after bootstrap; labels, taints,
 affinity, resource requests, and limits define intentional placement. New nodes
-register with the reserved `cvp.io/bootstrap=true:NoSchedule` taint and
-`cvp.io/bootstrap-quarantine=true` label. A single concurrency-checked API patch
+register with the reserved `cvp.novirmor.io/bootstrap=true:NoSchedule` taint and
+`cvp.novirmor.io/bootstrap-quarantine=true` label. A single concurrency-checked API patch
 per node applies desired labels and taints and removes the quarantine before
 lifecycle ownership is released. These reserved keys cannot be set in inventory.
 
 ## Node tags and allocation
 
-Tags are orthogonal boolean labels under `cvp.io/`:
+Tags are orthogonal boolean labels under `cvp.novirmor.io/`:
 
 | Tag | Meaning |
 | --- | --- |
-| `cvp.io/role=control-plane` | Every server. Not used for scheduling. |
-| `cvp.io/compute=true` | Runs general application workloads. |
-| `cvp.io/storage=true` | Holds local-path volumes and storage-backed workloads. |
-| `cvp.io/stateful=true` | Accepts stateful services (databases, queues). |
-| `cvp.io/ingress=true` | Serves public ingress (Traefik and ServiceLB). |
-| `cvp.io/gpu=true` | Reserved capability tag; assigned only after accelerator hardware is actually attached. |
-| `cvp.io/system=true` | Hosts small system workloads. |
+| `cvp.novirmor.io/role=control-plane` | Every server. Not used for scheduling. |
+| `cvp.novirmor.io/compute=true` | Runs general application workloads. |
+| `cvp.novirmor.io/storage=true` | Holds local-path volumes and storage-backed workloads. |
+| `cvp.novirmor.io/stateful=true` | Accepts stateful services (databases, queues). |
+| `cvp.novirmor.io/ingress=true` | Serves public ingress (Traefik and ServiceLB). |
+| `cvp.novirmor.io/gpu=true` | Reserved capability tag; assigned only after accelerator hardware is actually attached. |
+| `cvp.novirmor.io/system=true` | Hosts small system workloads. |
 
 Tags combine freely. A workload that needs storage and compute states both in
-its node selector or affinity (`cvp.io/storage=true` AND `cvp.io/compute=true`
+its node selector or affinity (`cvp.novirmor.io/storage=true` AND `cvp.novirmor.io/compute=true`
 selectors all match); a workload that accepts either uses multiple
 `nodeSelectorTerms`. Removing a tag from inventory reconciles it off the node,
 affecting future scheduling; existing pods are not evicted by a node-label
 change. Tag changes follow the same review path as ingress or storage
 changes. Taints are optional per node (`k3s_node_taints`) and are reconciled
 through the Kubernetes API. Apart from the reserved bootstrap quarantine,
-Ansible only removes taints recorded as its own in the `cvp.io/managed-taints`
+Ansible only removes taints recorded as its own in the `cvp.novirmor.io/managed-taints`
 Node annotation. Kubernetes/controller taints are never cleared merely because
 they are absent from inventory.
 
-Ansible reconciles the `cvp.io/*` and `svccontroller.k3s.cattle.io/*` label
+Ansible reconciles the `cvp.novirmor.io/*` and `svccontroller.k3s.cattle.io/*` label
 namespaces through the `kubernetes.core` collection; it does not manage other
-node labels. The `cvp.io/role` label is derived from `k3s_role` and cannot be
-declared per node, and `cvp.io/` accepts only the boolean catalog tags.
+node labels. The `cvp.novirmor.io/role` label is derived from `k3s_role` and cannot be
+declared per node, and `cvp.novirmor.io/` accepts only the boolean catalog tags.
 Additional custom label domains can be brought under reconciliation by
 extending `k3s_managed_label_domains` with anchored, escaped literal DNS
 prefixes (not arbitrary regular expressions). Every

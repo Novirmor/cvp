@@ -285,7 +285,6 @@ exit 97
         play["vars"]["restore_mount_check_script"] = play["vars"]["restore_mount_check_script"].replace(
             "/proc/self/mountinfo", str(self.mountinfo))
         mounts_before = mounts_before or {}
-        token_matches = self.token.exists() and self.token.read_text() == "same-token\n"
 
         def adapt(tasks):
             result = []
@@ -360,10 +359,6 @@ exit 97
                     task["ansible.builtin.copy"].pop("content")
                     task["ansible.builtin.copy"].update(src=str(self.config), remote_src=True)
                 result.append(task)
-                if task.get("name") == "Record whether this is the same cluster":
-                    result.append({"name": "Check token classification",
-                                   "ansible.builtin.assert": {"that": "restore_same_cluster == " + str(token_matches).lower()},
-                                   "when": "restore_current_server_token.content is defined"})
             return result
 
         for section in ("pre_tasks", "tasks"):

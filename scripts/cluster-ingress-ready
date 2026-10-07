@@ -88,8 +88,8 @@ def check(snapshot, expected, chart_version):
     require(condition(job, "Complete") and not condition(job, "Failed") and not job["metadata"].get("deletionTimestamp"), "K3s chart operation has not completed")
     require(any(ref.get("uid") == chart["metadata"]["uid"] for ref in job["metadata"].get("ownerReferences", [])), "chart Job is not owned by the current HelmChart")
 
-    ingress = [node for node in snapshot["nodes"]["items"] if node["metadata"].get("labels", {}).get("cvp.io/ingress") == "true"]
-    require(len(ingress) == 1, "exactly one node must have cvp.io/ingress=true")
+    ingress = [node for node in snapshot["nodes"]["items"] if node["metadata"].get("labels", {}).get("cvp.novirmor.io/ingress") == "true"]
+    require(len(ingress) == 1, "exactly one node must have cvp.novirmor.io/ingress=true")
     node_name = ingress[0]["metadata"]["name"]
     for node in snapshot["nodes"]["items"]:
         labels = node["metadata"].get("labels", {})
@@ -102,7 +102,7 @@ def check(snapshot, expected, chart_version):
     deployment, service = snapshot["deployment"], snapshot["service"]
     rollout(deployment)
     template = deployment["spec"]["template"]["spec"]
-    require(template.get("nodeSelector", {}).get("cvp.io/ingress") == "true", "Traefik has not adopted ingress placement")
+    require(template.get("nodeSelector", {}).get("cvp.novirmor.io/ingress") == "true", "Traefik has not adopted ingress placement")
     args = [arg.lower() for container in template["containers"] for arg in container.get("args", [])]
     require("--entrypoints.web.http.redirections.entrypoint.to=:443" in args, "Traefik has not adopted the public HTTPS redirect")
     require(service["spec"].get("externalTrafficPolicy") == "Local" and service["spec"].get("allocateLoadBalancerNodePorts", True), "ServiceLB Local traffic requires allocated NodePorts")

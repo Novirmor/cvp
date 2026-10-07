@@ -31,7 +31,7 @@ SITE = yaml.safe_load((PLAYBOOKS / "site.yml").read_text())
 RECONCILE = "Reconcile K3s node labels and taints through the Kubernetes API"
 CONTROLLER_TAINTS = [{"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
                       {"key": "controller.io/protected", "effect": "NoExecute"}]
-INGRESS_LABELS = ["cvp.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
+INGRESS_LABELS = ["cvp.novirmor.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
                   "svccontroller.k3s.cattle.io/lbpool=public"]
 
 
@@ -165,20 +165,20 @@ class SiteFixture:
                 "k3s_server_host": "alpha", "wireguard_peers_group": "wireguard",
                 "wireguard_address": f"10.77.0.{index}",
                 "wireguard_public_key": base64.b64encode(bytes([index]) * 32).decode(),
-                "k3s_node_labels": ["cvp.io/compute=true"] + (INGRESS_LABELS if host == "alpha" else []),
+                "k3s_node_labels": ["cvp.novirmor.io/compute=true"] + (INGRESS_LABELS if host == "alpha" else []),
                 "k3s_node_taints": ["dedicated=batch:NoSchedule"],
                 "cvp_lifecycle_lock_path": str(self.lock(host)),
                 "k3s_data_dir": str(root / "hosts" / host / "data"),
                 "k3s_bin_path": str(root / "k3s"),
             }
-            labels = {"cvp.io/bootstrap-quarantine": "true", "cvp.io/obsolete": "true", "kubernetes.io/os": "linux"}
+            labels = {"cvp.novirmor.io/bootstrap-quarantine": "true", "cvp.novirmor.io/obsolete": "true", "kubernetes.io/os": "linux"}
             if host != "gamma":
                 labels["node-role.kubernetes.io/control-plane"] = "true"
             self.set_node(host, {
                 "metadata": {"name": host, "resourceVersion": "1", "labels": labels,
                              "annotations": {"controller.io/state": "keep"}},
                 "spec": {"taints": [CONTROLLER_TAINTS[0],
-                                    {"key": "cvp.io/bootstrap", "value": "true", "effect": "NoSchedule"},
+                                    {"key": "cvp.novirmor.io/bootstrap", "value": "true", "effect": "NoSchedule"},
                                     CONTROLLER_TAINTS[1]]},
                 "status": {"addresses": [{"type": "InternalIP", "address": f"10.77.0.{index}"}],
                            "conditions": [{"type": "Ready", "status": "True"}]},
@@ -300,15 +300,15 @@ class SiteOrchestrationTests(unittest.TestCase):
             node = self.f.node(host)
             self.assertEqual(node["spec"]["taints"], CONTROLLER_TAINTS + [
                 {"key": "dedicated", "value": "batch", "effect": "NoSchedule"}])
-            expected_labels = {"kubernetes.io/os": "linux", "cvp.io/compute": "true",
-                               "cvp.io/role": "agent" if host == "gamma" else "control-plane"}
+            expected_labels = {"kubernetes.io/os": "linux", "cvp.novirmor.io/compute": "true",
+                               "cvp.novirmor.io/role": "agent" if host == "gamma" else "control-plane"}
             if host != "gamma":
                 expected_labels["node-role.kubernetes.io/control-plane"] = "true"
             if host == "alpha":
-                expected_labels.update({"cvp.io/ingress": "true", "svccontroller.k3s.cattle.io/enablelb": "true",
+                expected_labels.update({"cvp.novirmor.io/ingress": "true", "svccontroller.k3s.cattle.io/enablelb": "true",
                                         "svccontroller.k3s.cattle.io/lbpool": "public"})
             self.assertEqual(node["metadata"]["labels"], expected_labels)
-            self.assertEqual(json.loads(node["metadata"]["annotations"]["cvp.io/managed-taints"]),
+            self.assertEqual(json.loads(node["metadata"]["annotations"]["cvp.novirmor.io/managed-taints"]),
                              [{"key": "dedicated", "value": "batch", "effect": "NoSchedule"}])
             self.assertEqual(node["metadata"]["annotations"]["controller.io/state"], "keep")
             self.assertFalse(self.f.lock(host).exists())
@@ -323,7 +323,7 @@ class SiteOrchestrationTests(unittest.TestCase):
         self.assertEqual([(row["phase"], row["host"]) for row in self.f.events() if row["phase"] != "acquire"],
                          [("base", "alpha"), ("restore-blocked", "alpha")])
         for host in self.f.hosts:
-            self.assertIn("cvp.io/bootstrap-quarantine", self.f.node(host)["metadata"]["labels"])
+            self.assertIn("cvp.novirmor.io/bootstrap-quarantine", self.f.node(host)["metadata"]["labels"])
             result = self.f.lifecycle("acquire", host, secrets.token_hex(32))
             self.failure(result, "another invocation")
 
@@ -399,7 +399,7 @@ class SiteOrchestrationTests(unittest.TestCase):
         self.f.fail = ["patch-attempt", "alpha"]
         self.failure(self.f.run(), "injected site failure: patch-attempt:alpha")
         self.assert_owned_locks()
-        self.assertIn("cvp.io/bootstrap-quarantine", self.f.node("alpha")["metadata"]["labels"])
+        self.assertIn("cvp.novirmor.io/bootstrap-quarantine", self.f.node("alpha")["metadata"]["labels"])
 
     def test_check_mode_skipped_registration_results_do_not_acquire_or_mutate(self):
         before = {host: self.f.node(host) for host in self.f.hosts}
@@ -420,14 +420,14 @@ class SiteOrchestrationTests(unittest.TestCase):
         cases = [("owned", valid, True)]
         absent = copy.deepcopy(valid)
         absent["spec"]["taints"] = copy.deepcopy(CONTROLLER_TAINTS)
-        absent["metadata"]["labels"].pop("cvp.io/bootstrap-quarantine")
+        absent["metadata"]["labels"].pop("cvp.novirmor.io/bootstrap-quarantine")
         cases.append(("absent", absent, True))
         for field, values in (("label", [None, "false", True]), ("value", [None, "false", True]),
                               ("effect", [None, "NoExecute", "PreferNoSchedule"])):
             for value in values:
                 node = copy.deepcopy(valid)
                 target = node["metadata"]["labels"] if field == "label" else node["spec"]["taints"][1]
-                key = "cvp.io/bootstrap-quarantine" if field == "label" else field
+                key = "cvp.novirmor.io/bootstrap-quarantine" if field == "label" else field
                 if value is None:
                     target.pop(key)
                 else:
@@ -450,7 +450,7 @@ class SiteOrchestrationTests(unittest.TestCase):
 
     def test_unowned_quarantine_aborts_reconciliation_before_any_patch_or_release(self):
         node = self.f.node("gamma")
-        del node["metadata"]["labels"]["cvp.io/bootstrap-quarantine"]
+        del node["metadata"]["labels"]["cvp.novirmor.io/bootstrap-quarantine"]
         self.f.set_node("gamma", node)
         self.failure(self.f.run(), "bootstrap quarantine does not match")
         self.assert_owned_locks()
@@ -468,8 +468,8 @@ class SiteOrchestrationTests(unittest.TestCase):
             for host in self.f.hosts:
                 with self.subTest(role=role, host=host):
                     config = yaml.safe_load((self.f.root / f"{role}-{host}.yaml").read_text())
-                    self.assertEqual(config["node-taint"], ["cvp.io/bootstrap=true:NoSchedule"])
-                    self.assertEqual(config["node-label"], ["cvp.io/bootstrap-quarantine=true"]
+                    self.assertEqual(config["node-taint"], ["cvp.novirmor.io/bootstrap=true:NoSchedule"])
+                    self.assertEqual(config["node-label"], ["cvp.novirmor.io/bootstrap-quarantine=true"]
                                      + self.f.hostvars[host]["k3s_node_labels"])
                     self.assertEqual(config["node-name"], host)
 

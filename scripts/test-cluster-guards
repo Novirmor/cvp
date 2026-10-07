@@ -220,20 +220,20 @@ def test_list_wrappers(directory):
 def test_ingress():
     chart_version = "39.0.701+up39.0.7"
     ready = {"conditions": [{"type": "Ready", "status": "True"}]}
-    labels = {"cvp.io/ingress": "true", "svccontroller.k3s.cattle.io/enablelb": "true", "svccontroller.k3s.cattle.io/lbpool": "public"}
+    labels = {"cvp.novirmor.io/ingress": "true", "svccontroller.k3s.cattle.io/enablelb": "true", "svccontroller.k3s.cattle.io/lbpool": "public"}
     expected = {"spec": {"valuesContent": "fixture"}}
     ports = {"web": {"port": 8000, "exposedPort": 80, "protocol": "TCP"}, "websecure": {"port": 8443, "exposedPort": 443, "protocol": "TCP"}}
     container = {"name": "traefik", "args": ["--entryPoints.web.http.redirections.entryPoint.to=:443", "--entryPoints.web.address=:8000/tcp", "--entryPoints.websecure.address=:8443/tcp"], "ports": [{"name": name, "containerPort": port["port"], "protocol": port["protocol"]} for name, port in ports.items()]}
     state = {
-        "config": copy.deepcopy(expected), "expected_values": {"nodeSelector": {"cvp.io/ingress": "true"}},
+        "config": copy.deepcopy(expected), "expected_values": {"nodeSelector": {"cvp.novirmor.io/ingress": "true"}},
         "expected_ports": ports,
         "chart": {"metadata": {"uid": "chart"}, "status": {"jobName": "helm-install-traefik"}},
-        "release": {"name": "traefik", "namespace": "kube-system", "version": 7, "info": {"status": "deployed", "description": "Upgrade complete"}, "config": {"nodeSelector": {"cvp.io/ingress": "true"}}},
+        "release": {"name": "traefik", "namespace": "kube-system", "version": 7, "info": {"status": "deployed", "description": "Upgrade complete"}, "config": {"nodeSelector": {"cvp.novirmor.io/ingress": "true"}}},
         "release_metadata": {"name": "traefik", "namespace": "kube-system", "revision": 7, "status": "deployed", "chart": "traefik", "version": chart_version, "appVersion": "3.6.13", "deployedAt": "2026-10-03T00:00:00Z"},
-        "release_values": {"nodeSelector": {"cvp.io/ingress": "true"}},
+        "release_values": {"nodeSelector": {"cvp.novirmor.io/ingress": "true"}},
         "job": {"metadata": {"ownerReferences": [{"uid": "chart"}]}, "status": {"conditions": [{"type": "Complete", "status": "True"}]}},
         "nodes": {"items": [{"metadata": {"name": "ingress", "labels": labels}, "status": ready}]},
-        "deployment": {"metadata": {"generation": 2}, "spec": {"replicas": 1, "template": {"spec": {"nodeSelector": {"cvp.io/ingress": "true"}, "containers": [copy.deepcopy(container)]}}}, "status": {"observedGeneration": 2, "replicas": 1, "updatedReplicas": 1, "readyReplicas": 1, "availableReplicas": 1}},
+        "deployment": {"metadata": {"generation": 2}, "spec": {"replicas": 1, "template": {"spec": {"nodeSelector": {"cvp.novirmor.io/ingress": "true"}, "containers": [copy.deepcopy(container)]}}}, "status": {"observedGeneration": 2, "replicas": 1, "updatedReplicas": 1, "readyReplicas": 1, "availableReplicas": 1}},
         "service": {"metadata": {"uid": "service", "labels": {"svccontroller.k3s.cattle.io/lbpool": "public"}}, "spec": {"selector": {"app.kubernetes.io/name": "traefik"}, "type": "LoadBalancer", "externalTrafficPolicy": "Local", "allocateLoadBalancerNodePorts": True, "ports": [{"name": "web", "port": 80, "targetPort": "web", "protocol": "TCP", "nodePort": 30080}, {"name": "websecure", "port": 443, "targetPort": "websecure", "protocol": "TCP", "nodePort": 30443}]}},
         "daemonsets": {"items": [{"metadata": {"name": "svclb-traefik-a1b2c3d4", "uid": "ds", "generation": 2, "ownerReferences": [{"uid": "service"}]}, "spec": {"template": {"spec": {"nodeSelector": {"svccontroller.k3s.cattle.io/enablelb": "true", "svccontroller.k3s.cattle.io/lbpool": "public"}}}}, "status": {"observedGeneration": 2, "desiredNumberScheduled": 1, "currentNumberScheduled": 1, "updatedNumberScheduled": 1, "numberReady": 1, "numberAvailable": 1}}]},
         "lb_pods": {"items": [{"metadata": {"ownerReferences": [{"uid": "ds"}]}, "spec": {"nodeName": "ingress"}, "status": ready}]},
@@ -410,7 +410,7 @@ def test_ingress_snapshot(state, expected, chart_version):
         ("release_metadata", {"version": "old"}),
         ("release_metadata", {"revision": 8}),
         ("release_metadata", {"status": "superseded"}),
-        ("release_values", {"nodeSelector": {"cvp.io/ingress": "false"}}),
+        ("release_values", {"nodeSelector": {"cvp.novirmor.io/ingress": "false"}}),
     ):
         bad = copy.deepcopy(state)
         bad[key].update(change)

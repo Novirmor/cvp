@@ -60,7 +60,7 @@ def main():
         args = [arg.lower() for arg in pod["containers"][0]["args"]]
         assert "--entrypoints.web.http.redirections.entrypoint.to=:443" in args, args
         assert "--entrypoints.web.http.redirections.entrypoint.scheme=https" in args
-        assert pod["nodeSelector"]["cvp.io/ingress"] == "true"
+        assert pod["nodeSelector"]["cvp.novirmor.io/ingress"] == "true"
         assert service["metadata"]["labels"]["svccontroller.k3s.cattle.io/lbpool"] == "public"
         assert service["spec"]["externalTrafficPolicy"] == "Local"
         assert service["spec"]["allocateLoadBalancerNodePorts"] is True

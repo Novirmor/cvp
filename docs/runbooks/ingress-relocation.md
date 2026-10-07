@@ -15,7 +15,7 @@ repository's Ansible inventory:
    `ingress_v6` role installs the systemd socat forwarders that bridge public
    IPv6 `:80`/`:443` to the local IPv4 ServiceLB listeners.
 2. The node labels in the host's `inventory/host_vars/<node>.yml`:
-   `cvp.io/ingress=true` (Traefik's node selector in the committed
+   `cvp.novirmor.io/ingress=true` (Traefik's node selector in the committed
    `HelmChartConfig`), plus `svccontroller.k3s.cattle.io/enablelb=true` and
    `svccontroller.k3s.cattle.io/lbpool=public` (the ServiceLB allow-list).
 3. The Tailscale tag `tag:k3s-ingress` in `tailscale_advertise_tags`, which

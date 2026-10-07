@@ -9,9 +9,9 @@ kube-proxy-arg:
   - "nodeport-addresses=127.0.0.1/32,{{ wireguard_address }}/32,::1/128"
 flannel-iface: "{{ k3s_flannel_iface }}"
 node-label:
-  - "cvp.io/bootstrap-quarantine=true"
+  - "cvp.novirmor.io/bootstrap-quarantine=true"
 {% for label in k3s_node_labels %}
   - "{{ label }}"
 {% endfor %}
 node-taint:
-  - "cvp.io/bootstrap=true:NoSchedule"
+  - "cvp.novirmor.io/bootstrap=true:NoSchedule"

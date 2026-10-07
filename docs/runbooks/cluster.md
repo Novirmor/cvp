@@ -9,11 +9,11 @@ respective layers.
 Render manifests without contacting a cluster:
 
 ```sh
-kubectl kustomize cluster
-kubectl kustomize cluster/infrastructure/policy/overlays/cluster
-kubectl kustomize cluster/infrastructure/ingress/overlays/k3s
-kubectl kustomize cluster/apps/overlays/smoke
-kubectl kustomize cluster/operations/overlays/cluster
+kustomize build cluster
+kustomize build cluster/infrastructure/policy/overlays/cluster
+kustomize build cluster/infrastructure/ingress/overlays/k3s
+kustomize build cluster/apps/overlays/smoke
+kustomize build cluster/operations/overlays/cluster
 ```
 
 Flux v2.5.1 components and CRDs are committed in
@@ -70,7 +70,7 @@ through an SSH stub and a kubectl stub; it never contacts Kubernetes.
 2. Verify that only the intended ingress node has both
    `svccontroller.k3s.cattle.io/enablelb=true` and
    `svccontroller.k3s.cattle.io/lbpool=public`. It must also have
-   `cvp.io/ingress=true` for Traefik.
+   `cvp.novirmor.io/ingress=true` for Traefik.
 3. Replace the `example.invalid/repository.git` placeholder in
    `cluster/flux-system/source.yaml` with the reviewed repository URL and branch.
    Set both `FLUX_GITHUB_OWNER` and `FLUX_GITHUB_REPOSITORY` explicitly to match

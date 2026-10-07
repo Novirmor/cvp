@@ -416,10 +416,10 @@ k3s_role: server
 k3s_server_init: true
 k3s_tls_sans: []
 k3s_node_labels:
-  - cvp.io/compute=true
-  - cvp.io/storage=true
-  - cvp.io/system=true
-  - cvp.io/ingress=true
+  - cvp.novirmor.io/compute=true
+  - cvp.novirmor.io/storage=true
+  - cvp.novirmor.io/system=true
+  - cvp.novirmor.io/ingress=true
   - svccontroller.k3s.cattle.io/enablelb=true
   - svccontroller.k3s.cattle.io/lbpool=public
 k3s_node_taints: []
@@ -448,7 +448,7 @@ k3s_role: agent
 k3s_server_init: false
 k3s_tls_sans: []
 k3s_node_labels:
-  - cvp.io/compute=true
+  - cvp.novirmor.io/compute=true
 k3s_node_taints: []
 storage_enabled: false
 storage_device: ""
@@ -457,7 +457,7 @@ storage_allow_format: false
 ```
 
 The ingress node must declare all three ingress labels; other nodes must omit
-the ServiceLB labels. `cvp.io/role` is derived from `k3s_role`; do not declare
+the ServiceLB labels. `cvp.novirmor.io/role` is derived from `k3s_role`; do not declare
 it. Custom label domains must first be added to `k3s_managed_label_domains`
 (see [the host layer guide](../../ansible/README.md#inventory-inputs)).
 `storage_enabled: false` skips host storage preparation; it does not disable

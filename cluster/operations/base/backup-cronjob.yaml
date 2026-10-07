@@ -6,9 +6,9 @@ metadata:
   labels:
     app.kubernetes.io/name: application-backup
     app.kubernetes.io/part-of: cvp
-    cvp.example.com/lifecycle: non-production-template
+    cvp.novirmor.io/lifecycle: non-production-template
   annotations:
-    cvp.example.com/status: suspended-until-provider-and-application-are-selected
+    cvp.novirmor.io/status: suspended-until-provider-and-application-are-selected
 spec:
   schedule: 17 2 * * *
   suspend: true

@@ -41,9 +41,10 @@ deployment; see the open items and exit gates in `PLAN.md`.
   `task node-join` take every host from a fresh Debian install to a joined
   node, replacing the manual first-host and onboarding procedures:
   - `node-new` allocates the mesh address, generates the WireGuard key
-    (`~/.config/cvp/keys/<node>.wg-private`, mode `0600`), and writes host vars,
-    inventory groups, and the host-scoped operator entry as one transaction. It
-    is a dry run unless `--write`, and rolls back if inventory validation fails.
+    (`~/.config/cvp/<instance>/keys/<node>.wg-private`, mode `0600`), and writes
+    host vars, inventory groups, and the host-scoped operator entry as one
+    transaction. It is a dry run unless `--write`, and rolls back if inventory
+    validation fails.
   - `node-bootstrap` trusts a fresh host's SSH key only when it matches the
     provider-console fingerprint, copies `scripts/node-bootstrap.sh` to the host
     over SSH, and runs it as root (password allowed once; `--login-user` for
@@ -95,6 +96,27 @@ deployment; see the open items and exit gates in `PLAN.md`.
 - `task onboard` is now a compatibility alias for `node-join` on an existing
   cluster. It runs `task validate-inventory` instead of the full `task test`
   suite, which took over 20 minutes on the operator's critical path.
+
+### Fixed
+
+- Deep-analysis corrections: uncaught subprocess timeout in `task init`'s
+  kubeconfig step; uncaught parse errors in instance reconciliation rewriting;
+  `platform-upgrade` fetching the submodule from the local checkout it was
+  added from instead of the public URL (`git submodule sync` after pinning and
+  before upgrading); the wizard persisting a pasted Tailscale auth key even
+  when the inventory plan is declined; strict host-bit rejection for SSH source
+  CIDRs; exact `id -un` output matching for operator access checks; removal of
+  dead code (an unused restore fact, lifecycle bookkeeping, an unused firewall
+  default, the unoccupied `platform-system` namespace, and stale `.gitkeep`
+  directories); the vendored Flux controllers' policy exemption now matches the
+  image repository so Renovate digest-pinning cannot break it; the `flux2` CLI
+  pin is aligned with the vendored components and a test keeps them in step;
+  the platform-owned label and annotation domain is `cvp.novirmor.io`
+  (node tags, reserved bootstrap keys, and workload annotations — replacing
+  placeholder `cvp.example.com/*` annotations and the unowned `cvp.io/*`
+  domain); `docs/runbooks/tofu.md` now documents the working
+  `task tailscale-identity-init` entry point and the per-instance `TF_DATA_DIR`
+  for raw state-handoff commands.
 
 ### Removed
 

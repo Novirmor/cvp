@@ -46,7 +46,11 @@ def check(request):
     guard_conditions = [expected_condition]
     guard_contents = [request['guard_content']]
     if not request.get('require_guard', False):
-        legacy_condition = expected_condition[:2] + expected_condition[-1:] + expected_condition[3:5]
+        # Earlier guard drop-ins placed the legacy in-datastore restore guard
+        # second and carried no separate persistent guard path, so their argv
+        # was [interpreter, script, legacy_guard, authorization, lock].
+        legacy_condition = [expected_condition[0], expected_condition[1], expected_condition[5],
+                            expected_condition[3], expected_condition[4]]
         guard_conditions.append(legacy_condition)
         guard_contents.append(request['guard_content'].replace(
             'ExecCondition=' + ' '.join(expected_condition), 'ExecCondition=' + ' '.join(legacy_condition)))

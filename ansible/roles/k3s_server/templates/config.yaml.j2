@@ -33,12 +33,12 @@ tls-san:
   - "{{ san }}"
 {% endfor %}
 node-label:
-  - "cvp.io/bootstrap-quarantine=true"
+  - "cvp.novirmor.io/bootstrap-quarantine=true"
 {% for label in k3s_node_labels %}
   - "{{ label }}"
 {% endfor %}
 node-taint:
-  - "cvp.io/bootstrap=true:NoSchedule"
+  - "cvp.novirmor.io/bootstrap=true:NoSchedule"
 {% if k3s_disable_components | length > 0 %}
 disable:
 {% for component in k3s_disable_components %}

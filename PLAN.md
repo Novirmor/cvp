@@ -98,7 +98,7 @@ account, or restore drill is ticked, and no exit gate has been passed yet.
 - [ ] Add subsequent servers or agents with `task node-join` over the
   selected server's mesh address (example `192.0.2.1:6443`), reviewing quorum
   impact for each server addition.
-- [ ] Label nodes with the boolean `cvp.io/*` allocation tags (`compute`,
+- [ ] Label nodes with the boolean `cvp.novirmor.io/*` allocation tags (`compute`,
   `storage`, `stateful`, `ingress`, `system`) reconciled through the
   Kubernetes API.
 - [ ] Enable K3s secret encryption at rest.
@@ -147,18 +147,24 @@ account, or restore drill is ticked, and no exit gate has been passed yet.
 
 ### Deliverables
 
-- [ ] Create namespaces for infrastructure, operations, and each application.
-- [ ] Apply Pod Security Admission labels using the restricted profile by
+- [x] Create namespaces for infrastructure, operations, and each application.
+- [x] Apply Pod Security Admission labels using the restricted profile by
   default and narrowly document exceptions.
-- [ ] Add default-deny ingress and egress NetworkPolicies per namespace.
+- [x] Add default-deny ingress and egress NetworkPolicies per namespace.
 - [ ] Add DNS and explicitly required dependency egress rules.
-- [ ] Add LimitRanges and ResourceQuotas.
-- [ ] Require non-root execution, seccomp RuntimeDefault, dropped capabilities,
+- [x] Add LimitRanges and ResourceQuotas.
+- [x] Require non-root execution, seccomp RuntimeDefault, dropped capabilities,
   read-only root filesystems where possible, and bounded temporary storage.
 - [ ] Define minimal service accounts and RBAC.
-- [ ] Validate manifests against the exact cluster Kubernetes version.
+- [x] Validate manifests against the exact cluster Kubernetes version.
 - [x] Add policy tests for prohibited host networking, host paths, privileged
   containers, mutable production tags, and unbounded resources.
+
+Note: policy enforcement (PSA, default-deny, quotas, security contexts, schema
+validation) is enforced offline by `scripts/cluster-manifest-inputs` and
+mutation-tested in `scripts/test-cluster-policy`; the G5 gate still requires
+live-cluster evidence. Dependency egress rules beyond DNS and minimal RBAC
+remain open.
 
 ### Exit gate G5
 

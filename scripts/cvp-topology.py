@@ -45,9 +45,9 @@ def validate_topology(data, allow_empty=False):
     public_keys = set()
     shared = {key: set() for key in (
         "k3s_cluster_init_host", "k3s_server_host", "k3s_datastore", "k3s_default_local_storage_path")}
-    reserved = {"cvp.io/bootstrap", "cvp.io/bootstrap-quarantine"}
+    reserved = {"cvp.novirmor.io/bootstrap", "cvp.novirmor.io/bootstrap-quarantine"}
     ingress_labels = {
-        "cvp.io/ingress": "true",
+        "cvp.novirmor.io/ingress": "true",
         "svccontroller.k3s.cattle.io/enablelb": "true",
         "svccontroller.k3s.cattle.io/lbpool": "public",
     }
@@ -98,19 +98,19 @@ def validate_topology(data, allow_empty=False):
             keys = [re.split("[=:]", flag, maxsplit=1)[0] for flag in flags]
             require(len(keys) == len(set(keys)), key + " must not contain duplicate keys")
             require(not reserved.intersection(keys), "bootstrap quarantine tags are reserved for rendered configuration")
-            require("cvp.io/role" not in keys, "cvp.io/role must be derived from k3s_role")
+            require("cvp.novirmor.io/role" not in keys, "cvp.novirmor.io/role must be derived from k3s_role")
         labels = {}
         for label in host["k3s_node_labels"]:
             key, _, value = label.partition("=")
             labels[key] = value
         if name in ingress:
             require(all(labels.get(key) == value for key, value in ingress_labels.items()),
-                    "ingress node must declare cvp.io/ingress=true, "
+                    "ingress node must declare cvp.novirmor.io/ingress=true, "
                     "svccontroller.k3s.cattle.io/enablelb=true and svccontroller.k3s.cattle.io/lbpool=public")
         else:
-            require(labels.get("cvp.io/ingress") in (None, "false")
-                    and not (ingress_labels.keys() - {"cvp.io/ingress"}).intersection(labels),
-                    "non-ingress nodes must omit ServiceLB placement labels and omit cvp.io/ingress or set it to false")
+            require(labels.get("cvp.novirmor.io/ingress") in (None, "false")
+                    and not (ingress_labels.keys() - {"cvp.novirmor.io/ingress"}).intersection(labels),
+                    "non-ingress nodes must omit ServiceLB placement labels and omit cvp.novirmor.io/ingress or set it to false")
         require(type(host.get("storage_enabled")) is bool, "storage_enabled must be boolean")
         path = host["k3s_default_local_storage_path"]
         require(path.startswith("/") and path != "/" and posixpath.normpath(path) == path,
@@ -164,9 +164,9 @@ def validate_onboard(data, target, confirmation, nodes):
         require(server == (host["k3s_role"] == "server"), "cluster node role differs from inventory")
         require(not server or bool((server_labels - {"node-role.kubernetes.io/etcd"}).intersection(labels)),
                 "inventory servers must be initialized control-plane nodes")
-        require("cvp.io/role" not in labels
-                or labels["cvp.io/role"] == ("control-plane" if server else "agent"),
-                "cluster cvp.io/role differs from inventory")
+        require("cvp.novirmor.io/role" not in labels
+                or labels["cvp.novirmor.io/role"] == ("control-plane" if server else "agent"),
+                "cluster cvp.novirmor.io/role differs from inventory")
         addresses = [entry["address"] for entry in node.get("status", {}).get("addresses", [])
                      if entry.get("type") == "InternalIP"]
         ipv4 = [address for address in addresses if ipaddress.ip_address(address).version == 4]

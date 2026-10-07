@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: example
     app.kubernetes.io/part-of: cvp
-    cvp.example.com/lifecycle: non-production-smoke
+    cvp.novirmor.io/lifecycle: non-production-smoke
 spec:
   replicas: 1
   revisionHistoryLimit: 2
@@ -23,7 +23,7 @@ spec:
       labels:
         app.kubernetes.io/name: example
         app.kubernetes.io/part-of: cvp
-        cvp.example.com/lifecycle: non-production-smoke
+        cvp.novirmor.io/lifecycle: non-production-smoke
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -39,7 +39,7 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: cvp.io/compute
+                  - key: cvp.novirmor.io/compute
                     operator: In
                     values:
                       - "true"

@@ -9,7 +9,7 @@ import rego.v1
 
 # opt-out for containers that genuinely require a writable root filesystem
 allow_writable_rootfs(obj) if {
-	object.get(object_field(object_field(obj, "metadata"), "annotations"), "policy.cvp.io/allow-writable-rootfs", "false") == "true"
+	object.get(object_field(object_field(obj, "metadata"), "annotations"), "policy.cvp.novirmor.io/allow-writable-rootfs", "false") == "true"
 }
 
 deny contains sprintf("%s: container %q must not be privileged", [workload_ref(input), c.name]) if {

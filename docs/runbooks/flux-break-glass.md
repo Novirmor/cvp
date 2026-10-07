@@ -90,7 +90,7 @@ Controllers are ordinary Deployments in `flux-system`:
 ```sh
 kubectl -n flux-system get deploy
 kubectl -n flux-system get events --sort-by=.lastTimestamp
-kubectl -n flux-system rollout restart deploy/<controller>
+kubectl -n flux-system rollout restart 'deploy/<controller>'
 ```
 
 If the namespace or the CRDs are damaged, re-run the bootstrap helper against

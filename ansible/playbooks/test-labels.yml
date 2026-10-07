@@ -16,7 +16,7 @@
       ansible.builtin.add_host:
         name: valid-tag-host
         node_name: valid-tag-host
-        k3s_node_labels: ['svccontroller.k3s.cattle.io/needs_reconcile=', 'cvp.io/gpu=false']
+        k3s_node_labels: ['svccontroller.k3s.cattle.io/needs_reconcile=', 'cvp.novirmor.io/gpu=false']
         k3s_node_taints: ['dedicated.example/database:NoSchedule', 'testing=hello.world:NoExecute']
 
     - name: Validate valid declarations in isolation
@@ -33,17 +33,17 @@
           taints: []
           domains: ['^kubernetes\.io/']
           expected: reserved_pattern
-        - {name: derived-role, labels: ['cvp.io/role=agent'], taints: [], expected: role=}
-        - {name: catalog-typo, labels: ['cvp.io/copmute=true'], taints: [], expected: catalog_pattern}
+        - {name: derived-role, labels: ['cvp.novirmor.io/role=agent'], taints: [], expected: role=}
+        - {name: catalog-typo, labels: ['cvp.novirmor.io/copmute=true'], taints: [], expected: catalog_pattern}
         - {name: invalid-effect, labels: [], taints: ['dedicated=example:Always'], expected: taint_pattern}
         - {name: name-mismatch, node_name: wrong-name, labels: [], taints: []}
         - {name: bad-prefix-wildcard, domains: ['^.*'], labels: [], taints: []}
-        - {name: bad-prefix-broad, domains: ['^cvp\.io'], labels: [], taints: []}
-        - {name: bad-prefix-meta, domains: ['^cvp.io/'], labels: [], taints: []}
+        - {name: bad-prefix-broad, domains: ['^cvp\.novirmor\.io'], labels: [], taints: []}
+        - {name: bad-prefix-meta, domains: ['^cvp.novirmor.io/'], labels: [], taints: []}
         - {name: bad-prefix-dns, domains: ['^a_foo\.io/'], labels: [], taints: []}
         - {name: bad-label-prefix, labels: ['Upper.example/label=x'], taints: []}
-        - {name: bad-label-quote, labels: ['cvp.io/compute="true'], taints: []}
-        - {name: bad-label-newline, labels: ['cvp.io/compute=true\n'], taints: []}
+        - {name: bad-label-quote, labels: ['cvp.novirmor.io/compute="true'], taints: []}
+        - {name: bad-label-newline, labels: ['cvp.novirmor.io/compute=true\n'], taints: []}
         - {name: bad-taint-prefix, labels: [], taints: ['UPPER.example/key:NoSchedule']}
         - {name: bad-taint-reserved, labels: [], taints: ['node.kubernetes.io/not-ready:NoSchedule']}
         - {name: bad-taint-duplicate, labels: [], taints: ['dedicated=a:NoSchedule', 'dedicated=b:NoExecute']}

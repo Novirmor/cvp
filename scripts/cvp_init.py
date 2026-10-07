@@ -152,10 +152,11 @@ class Wizard:
         node_cli.trust_bootstrap_key(self.address, self.port, fingerprint)
 
     def tailscale_key(self):
+        """Return (path, created); created is True when this run wrote the file."""
         path = Path(self.args.tailscale_auth_key_file or
                     node_cli.common.config_dir() / "keys" / f"{self.node}.ts-authkey")
         if path.exists():
-            return str(path)
+            return str(path), False
         self.step("Tailscale enrollment key")
         say("Create a reusable or one-off auth key in the Tailscale admin console, tagged "
             + ("tag:k3s and tag:k3s-ingress." if self.first else "tag:k3s."))
@@ -166,7 +167,7 @@ class Wizard:
         with os.fdopen(fd, "w") as stream:
             stream.write(value + "\n")
         say(f"Saved to {path} (mode 0600)")
-        return str(path)
+        return str(path), True
 
     def detect_source(self, session):
         if self.args.ssh_source:
@@ -197,13 +198,21 @@ class Wizard:
     def prepare_host(self):
         if self.existing and self.operator_ready():
             return
-        tailscale_file = self.tailscale_key() if not self.existing else None
+        tailscale_file, pending_key = self.tailscale_key() if not self.existing else (None, False)
         login = self.args.login_user
         self.step(f"Connecting to {self.address} as {login} (enter its password if asked)")
         with node_cli.LoginSession(self.address, self.port, login, self.args.root_key) as session:
             if not self.existing:
-                source = self.detect_source(session)
-                self.scaffold(source, tailscale_file)
+                try:
+                    source = self.detect_source(session)
+                    self.scaffold(source, tailscale_file)
+                except BaseException:
+                    # The plan was not written: an auth key saved for it must not stay behind.
+                    if pending_key and tailscale_file:
+                        Path(tailscale_file).unlink(missing_ok=True)
+                        say(f"Removed the unconfirmed Tailscale key file {tailscale_file}; "
+                            "it will be asked for again.")
+                    raise
             public_key = Path(self.ssh_key + ".pub").read_text().strip()
             session.bootstrap(public_key)
         require(self.operator_ready(), "ops could not log in and use sudo after the bootstrap; see the output above")
@@ -261,7 +270,7 @@ class Wizard:
         say(f"  - Store {node_cli.common.config_dir() / 'keys'} in your secret store.")
 
     def run(self):
-        say(__doc__.splitlines()[0])
+        say((__doc__ or "").splitlines()[0])
         say(RULES)
         self.controller()
         self.choose_node()
@@ -319,7 +328,7 @@ def main(argv=None):
         return 2
     try:
         return Wizard(args).run()
-    except (NodeError, ValueError, OSError) as error:
+    except (NodeError, ValueError, OSError, subprocess.SubprocessError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     except (KeyboardInterrupt, EOFError):

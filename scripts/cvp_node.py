@@ -46,7 +46,7 @@ ROOT = common.ROOT
 PLAYBOOKS = ROOT / "ansible/playbooks"
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 GROUPS = ("wireguard", "k3s_servers", "k3s_agents", "storage_stateful", "ingress")
-INGRESS_LABELS = ["cvp.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
+INGRESS_LABELS = ["cvp.novirmor.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
                   "svccontroller.k3s.cattle.io/lbpool=public"]
 STORAGE_PATH = "/var/lib/rancher/k3s/storage"
 
@@ -289,15 +289,15 @@ def cmd_new(args):
                 "inventory all.vars must already select k3s_cluster_init_host and k3s_server_host")
 
     address = allocate_address([values["wireguard_address"] for values in existing.values()], args.mesh_address)
-    keys = {values.get("ansible_private_key_file") for values in existing.values()}
-    ssh_key = args.ssh_key or (keys.pop() if len(keys) == 1 else None)
+    keys = {values.get("ansible_private_key_file") for values in existing.values()} - {None}
+    ssh_key = args.ssh_key or (next(iter(keys)) if len(keys) == 1 else None)
     require(ssh_key and Path(ssh_key).is_absolute(),
             "--ssh-key must be the absolute path of the operator SSH private key")
     overrides = inventory.parent / "group_vars/all.yml"
     instance_vars = (yaml.safe_load(overrides.read_text()) or {}) if overrides.is_file() else {}
     port = int(instance_vars.get("wireguard_port") or shared.get("wireguard_port") or 51820)
     labels = list(args.label) if args.label else (
-        ["cvp.io/compute=true", "cvp.io/storage=true", "cvp.io/system=true"] if first else ["cvp.io/compute=true"])
+        ["cvp.novirmor.io/compute=true", "cvp.novirmor.io/storage=true", "cvp.novirmor.io/system=true"] if first else ["cvp.novirmor.io/compute=true"])
     if first:
         labels += [label for label in INGRESS_LABELS if label not in labels]
     storage = first if args.storage is None else args.storage
@@ -531,7 +531,8 @@ def operator_ssh_check(inventory, node, ssh):
     options = dict(ssh, ansible_ssh_extra_args="-o BatchMode=yes")
     result = run(["ansible", *common.inventory_args(inventory), node, "-o", "-m", "ansible.builtin.command", "-a", "id -un",
                   "-e", json.dumps(options)], capture=True, check=False, env=ansible_env())
-    return result.returncode == 0 and "root" in result.stdout
+    # `id -un` must print root as its whole output line, not merely contain it.
+    return result.returncode == 0 and any(line.strip() == "root" for line in result.stdout.splitlines())
 
 
 def cmd_join(args):

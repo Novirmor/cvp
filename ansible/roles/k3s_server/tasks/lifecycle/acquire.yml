@@ -22,8 +22,3 @@
   changed_when: cvp_lifecycle_acquisition.stdout == 'acquired'
   check_mode: false
   no_log: true
-
-- name: Record acquired lifecycle ownership
-  ansible.builtin.set_fact:
-    cvp_lifecycle_acquired: "{{ not ansible_check_mode }}"
-  no_log: true

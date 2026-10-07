@@ -40,10 +40,10 @@
         hostvars[item]['k3s_node_labels'] | reject('match', reserved_pattern) | list | length
         == hostvars[item]['k3s_node_labels'] | length
       - >-
-        hostvars[item]['k3s_node_labels'] | reject('match', '^cvp\.io/role=') | list | length
+        hostvars[item]['k3s_node_labels'] | reject('match', '^cvp\.novirmor\.io/role=') | list | length
         == hostvars[item]['k3s_node_labels'] | length
       - >-
-        hostvars[item]['k3s_node_labels'] | select('match', '^cvp\.io/')
+        hostvars[item]['k3s_node_labels'] | select('match', '^cvp\.novirmor\.io/')
         | reject('match', catalog_pattern) | list | length == 0
       - >-
         hostvars[item]['k3s_node_labels'] | map('regex_replace', '=.*$', '')
@@ -70,5 +70,5 @@
     label_pattern: "{{ '^' ~ key ~ '=' ~ value ~ '\\Z' }}"
     taint_pattern: "{{ '^' ~ key ~ '(?:=' ~ value ~ ')?:' ~ '(?:NoSchedule|PreferNoSchedule|NoExecute)\\Z' }}"
     reserved_pattern: '^(?:[a-z0-9-]+\.)*(?:kubernetes\.io|k8s\.io)/'
-    catalog_pattern: '^cvp\.io/(compute|storage|stateful|ingress|gpu|system)=(true|false)\Z'
+    catalog_pattern: '^cvp\.novirmor\.io/(compute|storage|stateful|ingress|gpu|system)=(true|false)\Z'
     managed_domains_pattern: "{{ k3s_managed_label_domains | join('|') }}"

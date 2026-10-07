@@ -156,7 +156,8 @@ tasks:
   render:
     desc: Render a Kustomize overlay (e.g. task render -- cluster/apps/overlays/smoke)
     cmds:
-      - mise exec -- kubectl kustomize {{.CLI_ARGS}}
+      # The same standalone kustomize the validator and bootstrap preflight use.
+      - mise exec -- kustomize build {{.CLI_ARGS}}
 
   cloudflare-init:
     desc: >-

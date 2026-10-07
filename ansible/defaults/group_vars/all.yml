@@ -81,7 +81,7 @@ node_vm_ids: [kvm, qemu, xen, vmware, microsoft, virtualbox, parallels, bhyve, a
 # present on a node outside these domains are never managed or removed.
 # Extend the list to bring custom tag domains under reconciliation.
 k3s_managed_label_domains:
-  - '^cvp\.io/'
+  - '^cvp\.novirmor\.io/'
   - '^svccontroller\.k3s\.cattle\.io/'
 
 # The IPv6-to-IPv4 ingress frontend is managed on hosts in the ingress group.

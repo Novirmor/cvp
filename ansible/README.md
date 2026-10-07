@@ -99,7 +99,7 @@ is scaffolded, bootstrapped, and joined through `docs/runbooks/nodes.md`
 (`task node-new`, `task node-bootstrap`, `task node-join`). `examples/instance/inventory/host_vars/example-newnode.yml.example`
 documents each host variable for hand edits.
 
-Node labels are declared per host in `k3s_node_labels`; `cvp.io/role` is
+Node labels are declared per host in `k3s_node_labels`; `cvp.novirmor.io/role` is
 derived from `k3s_role`. Validation rejects reserved Kubernetes keys, invalid
 catalog tags, mismatched `node_name`, and labels outside
 `k3s_managed_label_domains` before host configuration. Custom domains require
@@ -351,10 +351,10 @@ firewall policy controls public exposure; do not disable allocation as a substit
 
 `k3s_node_labels` contains `key=value` entries and `k3s_node_taints` contains
 `key=value:effect` entries. `site.yml` reconciles both through the Kubernetes API;
-only taints recorded in `cvp.io/managed-taints` may be removed. Matching unowned
+only taints recorded in `cvp.novirmor.io/managed-taints` may be removed. Matching unowned
 taints cause a conflict, and controller taints are preserved. The bootstrap
 exception is the reserved registration pair
-`cvp.io/bootstrap=true:NoSchedule` and `cvp.io/bootstrap-quarantine=true`, which
+`cvp.novirmor.io/bootstrap=true:NoSchedule` and `cvp.novirmor.io/bootstrap-quarantine=true`, which
 inventory cannot declare. New servers and agents register quarantined; a single
 concurrency-checked JSON patch per node applies desired labels/taints and their
 ownership ledger while removing that pair. Quarantine is not released separately

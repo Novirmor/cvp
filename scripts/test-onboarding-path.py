@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Keep docs/runbooks/nodes.md honest.
+"""Keep the runbooks honest.
 
-The documented `task node-new` commands are executed against a temporary
-inventory, and the files they generate must equal the documented reference
-examples. Every documented shell snippet must parse and name existing tasks.
+The `task node-new` commands documented in docs/runbooks/nodes.md are executed
+against a temporary inventory, and the files they generate must equal the
+documented reference examples. Every shell snippet in every runbook must parse
+and name existing tasks.
 """
 import json
 import os
@@ -151,7 +152,9 @@ class OnboardingPathTests(unittest.TestCase):
     def test_documented_shell_examples_parse_and_reference_existing_tasks(self):
         tasks = {name for path in (ROOT / "Taskfile.yml", ROOT / "tasks/ops.yml")
                  for name in yaml.safe_load(path.read_text())["tasks"]}
-        for document in (NODES,):
+        runbooks = sorted((ROOT / "docs/runbooks").glob("*.md"))
+        self.assertGreater(len(runbooks), 1, "expected more than one runbook to guard")
+        for document in runbooks:
             for block in snippets(document, "sh") + snippets(document, "bash"):
                 with self.subTest(document=document.name, snippet=block.splitlines()[0]):
                     result = subprocess.run(["bash", "--noprofile", "--norc", "-n"], input=block,

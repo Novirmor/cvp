@@ -3,31 +3,6 @@ apiVersion: v1
 kind: LimitRange
 metadata:
   name: container-defaults
-  namespace: platform-system
-spec:
-  limits:
-    - type: Container
-      default:
-        cpu: 500m
-        ephemeral-storage: 512Mi
-        memory: 512Mi
-      defaultRequest:
-        cpu: 100m
-        ephemeral-storage: 64Mi
-        memory: 128Mi
-      max:
-        cpu: "1"
-        ephemeral-storage: 1Gi
-        memory: 1Gi
-      min:
-        cpu: 10m
-        ephemeral-storage: 16Mi
-        memory: 16Mi
----
-apiVersion: v1
-kind: LimitRange
-metadata:
-  name: container-defaults
   namespace: example
 spec:
   limits:

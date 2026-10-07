@@ -380,7 +380,7 @@ class ControllerTests(unittest.TestCase):
                             "k3s_server_init": index == 1, "wireguard_peers_group": "wireguard",
                             "wireguard_address": f"10.77.0.{index}",
                             "wireguard_public_key": base64.b64encode(bytes([index]) * 32).decode(),
-                            "k3s_node_labels": ["cvp.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
+                            "k3s_node_labels": ["cvp.novirmor.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
                                                 "svccontroller.k3s.cattle.io/lbpool=public"] if index == 1 else []}
         return {"all": {"vars": shared, "children": {
             "wireguard": {"hosts": hosts}, "k3s_servers": {"hosts": {"alpha": {}}},

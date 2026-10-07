@@ -34,7 +34,7 @@ if tool in ("mise", "ansible-inventory", "ansible-playbook", "ansible"):
     if "ansible-inventory" in args or tool == "ansible-inventory":
         print(os.environ["TEST_INVENTORY"])
     if tool == "ansible":
-        print("worker1 | CHANGED | rc=0 | (stdout) root")
+        print("worker1 | CHANGED | rc=0 >>\nroot")
     if os.getenv("TEST_MUTATE_CONFIG") and playbook == "probe.yml":
         pathlib.Path(os.environ["CVP_OPERATOR_CONFIG_FILE"]).write_text(
             '{"cvp_operator_defaults":{"storage_enabled":false}}')

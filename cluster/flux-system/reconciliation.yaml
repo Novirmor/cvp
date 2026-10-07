@@ -45,7 +45,7 @@ metadata:
   name: data
   namespace: flux-system
   annotations:
-    cvp.example.com/status: reserved-until-a-stateful-service-is-approved
+    cvp.novirmor.io/status: reserved-until-a-stateful-service-is-approved
 spec:
   dependsOn:
     - name: policy
@@ -69,7 +69,7 @@ metadata:
   name: apps
   namespace: flux-system
   annotations:
-    cvp.example.com/status: opt-in-non-production-smoke-overlay
+    cvp.novirmor.io/status: opt-in-non-production-smoke-overlay
 spec:
   dependsOn:
     - name: infrastructure

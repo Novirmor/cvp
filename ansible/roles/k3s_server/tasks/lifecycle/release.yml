@@ -14,8 +14,3 @@
   changed_when: true
   no_log: true
   when: not ansible_check_mode
-
-- name: Clear released lifecycle ownership
-  ansible.builtin.set_fact:
-    cvp_lifecycle_acquired: false
-  no_log: true

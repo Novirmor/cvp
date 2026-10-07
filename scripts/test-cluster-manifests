@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import re
 import runpy
 import shutil
 import subprocess
@@ -108,7 +109,23 @@ def graph_cases(directory):
     rejected(inputs["check_namespaces"], objects, marker="explicit namespace")
 
 
+def pinned_flux_agrees():
+    """The vendored Flux components, the pinned flux2 CLI, and the docs must not drift apart."""
+    components = (ROOT / "cluster/flux-system/gotk-components.yaml").read_text()
+    match = re.search(r"^# Flux v(\d+\.\d+\.\d+) install\.yaml", components, re.MULTILINE)
+    assert match is not None, "gotk-components.yaml must state its Flux version in the header comment"
+    version = match.group(1)
+    mise = re.search(r'^flux2 = "([^"]+)"', (ROOT / "mise.toml").read_text(), re.MULTILINE)
+    assert mise is not None and mise.group(1) == version, (
+        f"mise.toml pins flux2 {mise.group(1) if mise else '?'} but the vendored components are "
+        f"v{version}; upgrade both together (the components also add/remove controllers)")
+    for relative in ("cluster/README.md", "docs/runbooks/cluster.md"):
+        assert f"Flux v{version}" in (ROOT / relative).read_text(), (
+            f"{relative} must reference the vendored Flux version v{version}")
+
+
 def main():
+    pinned_flux_agrees()
     _, objects = inputs["render_graph"](ROOT / "cluster")
     namespace_cases(objects)
     with tempfile.TemporaryDirectory(prefix="cvp-graph-tests-") as directory:

@@ -83,7 +83,11 @@ def reconciliation(platform_text):
     rendered = []
     for document in documents:
         body = document.removeprefix("---\n")
-        name = re.search(r"(?m)^  name: (\S+)$", body).group(1)
+        match = re.search(r"(?m)^  name: (\S+)$", body)
+        if match is None:
+            raise InstanceError("cannot repoint reconciliation.yaml: a document has no "
+                                "two-space-indented metadata.name")
+        name = match.group(1)
         if name in PLATFORM_LAYERS:
             body, count = re.subn(r"(?m)^(    kind: GitRepository\n    name: )flux-system$",
                                   rf"\g<1>{PLATFORM_SOURCE}", body)
@@ -157,6 +161,9 @@ def cmd_new(args):
     git(destination / "platform", "checkout", "-q", commit)
     # Clones use the public URL; this checkout keeps whatever source it was added from.
     git(destination, "config", "-f", ".gitmodules", "submodule.platform.url", platform_url)
+    # Point the submodule's origin at the public URL too, so `task platform-upgrade`
+    # fetches from it on this machine instead of the local checkout it was added from.
+    git(destination, "submodule", "sync")
     render_tree(destination, name, platform_url, repo_url, commit, destination / "platform")
     git(destination, "add", "-A")
     # Commit as the operator when Git knows them; otherwise as a neutral placeholder.
@@ -182,7 +189,8 @@ def instance_root():
 def pinned(root):
     text = (root / "cluster/flux-system/platform-source.yaml").read_text()
     match = re.search(r"(?m)^    commit: ([0-9a-f]{40})$", text)
-    require(match is not None, "platform-source.yaml must pin spec.ref.commit to a full commit")
+    if match is None:
+        raise InstanceError("platform-source.yaml must pin spec.ref.commit to a full commit")
     url = re.search(r"(?m)^  url: (\S+)$", text)
     return match.group(1), url.group(1) if url else ""
 
@@ -242,6 +250,9 @@ def cmd_upgrade(args):
     root = instance_root()
     old, url = pinned(root)
     require(not git(root, "status", "--porcelain"), "commit or stash instance changes before upgrading")
+    # Sync first: checkouts created before the public-URL sync would otherwise
+    # keep fetching the local platform path their submodule was added from.
+    git(root, "submodule", "sync")
     git(root / "platform", "fetch", "-q", "--tags", "origin")
     commit = git(root / "platform", "rev-parse", f"{args.ref}^{{commit}}")
     git(root / "platform", "checkout", "-q", commit)

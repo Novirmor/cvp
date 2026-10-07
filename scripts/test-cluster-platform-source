@@ -79,6 +79,11 @@ class PlatformSourceTests(unittest.TestCase):
         self.assertIn(f"commit: {self.commit}", self.original)
         self.assertEqual(git(self.instance, "config", "-f", ".gitmodules", "submodule.platform.url"),
                          "https://github.com/example/cvp.git")
+        # `new` syncs the submodule origin to the public URL so later upgrades
+        # fetch from it instead of the local checkout the submodule was added from.
+        # Read the raw config: `remote get-url` applies insteadOf rewrites.
+        self.assertEqual(git(self.instance / "platform", "config", "--get", "remote.origin.url"),
+                         "https://github.com/example/cvp.git")
         graph = (self.instance / "cluster/flux-system/reconciliation.yaml").read_text()
         for name, source in (("policy", "cvp-platform"), ("infrastructure", "cvp-platform"),
                              ("data", "cvp-platform"), ("operations", "cvp-platform"), ("apps", "flux-system")):
@@ -225,8 +230,13 @@ class PlatformSourceTests(unittest.TestCase):
         upgraded = git(self.platform, "rev-parse", "HEAD")
         self.addCleanup(lambda: (git(self.instance, "checkout", "-q", "--", "."),
                                  git(self.instance / "platform", "checkout", "-q", self.commit)))
-        git(self.instance, "submodule", "sync", "-q")
-        git(self.instance / "platform", "remote", "set-url", "origin", str(self.platform))
+        # The upgrade syncs origin from .gitmodules (the public URL), so rewrite
+        # that URL locally — untracked config, keeping the tree clean for the
+        # upgrade's gate — to reach the scratch platform without a remote host.
+        git(self.instance / "platform", "config", f"url.{self.platform}.insteadOf",
+            "https://github.com/example/cvp.git")
+        self.addCleanup(git, self.instance / "platform", "config", "--unset",
+                        f"url.{self.platform}.insteadOf")
         self.instance_tool("upgrade", "v2")
         self.assertIn(f"commit: {upgraded}", self.source_file.read_text())
         self.assertEqual(git(self.instance / "platform", "rev-parse", "HEAD"), upgraded)

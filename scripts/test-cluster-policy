@@ -140,6 +140,14 @@ def main():
             continue
         name = obj["metadata"]["name"]
         add(f"vendor-{name}", original=obj)
+        def repository(o):
+            return container(o)["image"].split("@")[0].rsplit(":", 1)[0]
+        # Renovate digest-pins images under cluster/; the vendored exemption
+        # must survive that rewrite and keep applying.
+        add(f"vendor-{name}-digest-pinned",
+            lambda o: container(o).update({"image": repository(o) + "@sha256:" + "a" * 64}), None, obj)
+        add(f"vendor-{name}-latest",
+            lambda o: container(o).update({"image": repository(o) + ":latest"}), ":latest", obj)
         add(f"vendor-{name}-changed-image", lambda o: container(o).update({"image": "nginx:1.27"}), "pinned by digest", obj)
         add(f"vendor-{name}-sidecar", lambda o: spec(o)["containers"].append({
             **copy.deepcopy(container(o)), "name": "extra",

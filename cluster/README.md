@@ -52,8 +52,8 @@ context only after reviewing the rendered output.
 2. Restrict K3s ServiceLB to the ingress pool. Label only the ingress node with
    both `svccontroller.k3s.cattle.io/enablelb=true` and
    `svccontroller.k3s.cattle.io/lbpool=public`; verify that other nodes carry
-   neither label. It must also have `cvp.io/ingress=true` for Traefik; the
-   smoke app itself schedules on any `cvp.io/compute=true` node.
+   neither label. It must also have `cvp.novirmor.io/ingress=true` for Traefik; the
+   smoke app itself schedules on any `cvp.novirmor.io/compute=true` node.
 3. Recover or generate the cluster age identity out of band and store its
    private half in an operator-chosen external secrets store. An operator seeds
    `sops-age`; Ansible does not create or recover this Secret. See
@@ -119,11 +119,11 @@ context only after reviewing the rendered output.
 Before applying, render every changed overlay locally:
 
 ```sh
-kubectl kustomize cluster
-kubectl kustomize cluster/infrastructure/policy/overlays/cluster
-kubectl kustomize cluster/infrastructure/ingress/overlays/k3s
-kubectl kustomize cluster/apps/overlays/smoke
-kubectl kustomize cluster/operations/overlays/cluster
+kustomize build cluster
+kustomize build cluster/infrastructure/policy/overlays/cluster
+kustomize build cluster/infrastructure/ingress/overlays/k3s
+kustomize build cluster/apps/overlays/smoke
+kustomize build cluster/operations/overlays/cluster
 ```
 
 ## Recovery Order
@@ -153,7 +153,7 @@ kubectl kustomize cluster/operations/overlays/cluster
 7. Reconcile the required data and app overlays, run HTTP and application smoke
    tests, and verify backup/check Job evidence.
 8. If the ingress node changed, move ingress as one sequenced change. Update
-   both the Traefik placement label `cvp.io/ingress=true` and the ServiceLB
+   both the Traefik placement label `cvp.novirmor.io/ingress=true` and the ServiceLB
    labels `svccontroller.k3s.cattle.io/enablelb=true` and
    `svccontroller.k3s.cattle.io/lbpool=public` together through the Ansible
    inventory and label reconciliation, removing them from the old node.
@@ -164,7 +164,7 @@ kubectl kustomize cluster/operations/overlays/cluster
    Service NodePorts, so `allocateLoadBalancerNodePorts` must remain true.
    Only then cut over the external DNS target and verify the public
    route before declaring recovery. The smoke workload's
-   `cvp.io/compute=true` affinity follows the surviving labeled nodes
+   `cvp.novirmor.io/compute=true` affinity follows the surviving labeled nodes
    when recovering from node loss.
 
 ServiceLB DaemonSets have a Service-UID suffix; discover them with both

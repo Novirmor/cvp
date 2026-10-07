@@ -5,4 +5,4 @@ resources:
   - ../../example/base
 namespace: example
 commonAnnotations:
-  cvp.example.com/overlay: non-production-smoke
+  cvp.novirmor.io/overlay: non-production-smoke

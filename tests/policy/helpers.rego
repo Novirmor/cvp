@@ -20,21 +20,32 @@ array_field(obj, key) := as_array(object.get(as_object(obj), key, []))
 
 workload_kinds := {"Pod", "PodTemplate", "Deployment", "ReplicaSet", "ReplicationController", "StatefulSet", "DaemonSet", "Job", "CronJob"}
 
-vendored_flux_images := {
-	"helm-controller": "ghcr.io/fluxcd/helm-controller:v1.2.0",
-	"image-automation-controller": "ghcr.io/fluxcd/image-automation-controller:v0.40.0",
-	"image-reflector-controller": "ghcr.io/fluxcd/image-reflector-controller:v0.34.0",
-	"kustomize-controller": "ghcr.io/fluxcd/kustomize-controller:v1.5.1",
-	"notification-controller": "ghcr.io/fluxcd/notification-controller:v1.5.0",
-	"source-controller": "ghcr.io/fluxcd/source-controller:v1.5.0",
+# Vendored Flux controllers are tag-pinned by the committed install manifest,
+# not digest-pinned like application images. The exemption matches the image
+# repository so Renovate digest-pinning (or a version bump) of these
+# controllers cannot break policy evaluation; :latest stays forbidden for them
+# too (see images.rego).
+vendored_flux_repositories := {
+	"ghcr.io/fluxcd/helm-controller",
+	"ghcr.io/fluxcd/image-automation-controller",
+	"ghcr.io/fluxcd/image-reflector-controller",
+	"ghcr.io/fluxcd/kustomize-controller",
+	"ghcr.io/fluxcd/notification-controller",
+	"ghcr.io/fluxcd/source-controller",
 }
+
+image_repository(image) := regex.replace(
+	regex.replace(image, `@.*$`, ""),
+	`:[^:/]+$`,
+	"",
+)
 
 vendored_flux_container(obj, c) if {
 	obj.apiVersion == "apps/v1"
 	obj.kind == "Deployment"
 	obj.metadata.namespace == "flux-system"
 	c.name == "manager"
-	c.image == vendored_flux_images[obj.metadata.name]
+	image_repository(c.image) in vendored_flux_repositories
 	c in obj.spec.template.spec.containers
 }
 

@@ -29,7 +29,10 @@ def networks(values, version):
     for value in values:
         if not isinstance(value, str) or "/" not in value:
             raise ValueError(f"Invalid SSH source CIDR: {value!r}")
-        network = ipaddress.ip_network(value)
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            raise ValueError(f"Invalid SSH source CIDR (host bits must be zero): {value}") from None
         if network.version != version:
             raise ValueError(f"Wrong address family for SSH source CIDR: {value}")
         result.append(network)

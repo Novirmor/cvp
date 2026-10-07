@@ -33,20 +33,20 @@ k3s_server_init: false      # true only for the one cluster-init server
 k3s_tls_sans: []            # extra API SANs for this node (its wireguard_address on init)
 
 # Node tags. Rules enforced by validation (task test runs it offline):
-#   - cvp.io/role is derived from k3s_role; declaring it fails validation.
-#   - cvp.io/ accepts only the boolean catalog tags from ARCHITECTURE.md
+#   - cvp.novirmor.io/role is derived from k3s_role; declaring it fails validation.
+#   - cvp.novirmor.io/ accepts only the boolean catalog tags from ARCHITECTURE.md
 #     (compute, storage, stateful, ingress, gpu, system); typos fail validation.
 #   - kubernetes.io/ and k8s.io/ keys are reserved by the API.
 #   - every label key must match an escaped literal DNS prefix in k3s_managed_label_domains
 #     (group_vars/all.yml): declared labels are both applied and reconciled
 #     away when removed from inventory, so an unmanaged domain is rejected.
 k3s_node_labels:
-  - cvp.io/compute=true
+  - cvp.novirmor.io/compute=true
   # Custom tag domains: first add the escaped prefix to k3s_managed_label_domains
   # in group_vars/all.yml (one reviewed change), then declare labels here, e.g.:
   # - example.com/zone=fra
   # Workloads select custom tags with node selectors or affinity exactly like
-  # cvp.io tags; removing a declared label reconciles it off the node.
+  # cvp.novirmor.io tags; removing a declared label reconciles it off the node.
 k3s_node_taints: []         # e.g. ["dedicated.example/database:NoSchedule"]
 
 # Storage intent for storage nodes; leave disabled on compute-only nodes.

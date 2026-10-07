@@ -4,7 +4,7 @@ kind: Ingress
 metadata:
   name: example
   annotations:
-    cvp.example.com/status: non-production-smoke-route
+    cvp.novirmor.io/status: non-production-smoke-route
     traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
 spec:

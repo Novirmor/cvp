@@ -304,11 +304,14 @@ def main():
             return
         inventory_hosts = json.load(sys.stdin)
         data = operator_config(path) if path else {}
-        assert isinstance(data, dict)
+        if not isinstance(data, dict):
+            raise ValueError("operator configuration must be a mapping")
         if set(data.get("cvp_operator_hosts", {})) - set(inventory_hosts):
             raise ValueError("operator configuration names a host absent from inventory")
         print(json.dumps(data))
         return
+    if len(sys.argv) < 3:
+        raise ValueError(f"{action} requires a path argument")
     value = sys.argv[2]
     path = external_path(value)
     if action in ("operator-config", "operator-inventory", "operator-digest", "operator-files-digest"):

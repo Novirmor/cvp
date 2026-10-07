@@ -671,37 +671,6 @@
           ansible.builtin.set_fact:
             restore_initialized: "{{ restore_current_db_stat.stat.exists }}"
 
-        - name: Read the current server token
-          ansible.builtin.slurp:
-            src: "{{ k3s_server_token_path }}"
-          register: restore_current_server_token
-          no_log: true
-          when: restore_original_tokens.results[0].stat.exists
-
-        - name: Compare the restored and current server tokens
-          ansible.builtin.command:
-            argv:
-              - timeout
-              - --kill-after=5s
-              - 15s
-              - cmp
-              - -s
-              - "{{ restore_remote_dir }}/server.token"
-              - /dev/stdin
-          args:
-            stdin: "{{ restore_current_server_token.content | b64decode }}"
-            stdin_add_newline: false
-          register: restore_token_compare
-          changed_when: false
-          failed_when: restore_token_compare.rc not in [0, 1]
-          no_log: true
-          when: restore_original_tokens.results[0].stat.exists
-
-        - name: Record whether this is the same cluster
-          ansible.builtin.set_fact:
-            restore_same_cluster: "{{ restore_token_compare.rc | default(1) == 0 }}"
-          when: restore_original_tokens.results[0].stat.exists
-
         - name: Back up the current SQLite datastore for rollback
           ansible.builtin.command:
             argv:

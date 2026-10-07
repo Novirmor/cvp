@@ -18,7 +18,7 @@ assert SPEC is not None and SPEC.loader is not None
 TOPOLOGY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TOPOLOGY)
 STORAGE = "/var/lib/rancher/k3s/storage"
-INGRESS_LABELS = ["cvp.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
+INGRESS_LABELS = ["cvp.novirmor.io/ingress=true", "svccontroller.k3s.cattle.io/enablelb=true",
                   "svccontroller.k3s.cattle.io/lbpool=public"]
 
 
@@ -83,11 +83,11 @@ class TopologyTests(unittest.TestCase):
                                      base64.b64encode(bytes(32)).decode()[:-2] + "B="],
             "storage_enabled": [None, "true"], "storage_mountpoint": [None, "/other"],
             "k3s_default_local_storage_path": [None, "/other", "relative", "/storage/../storage"],
-            "k3s_node_labels": [None, "flag", ["a=b", "a=c"], ["cvp.io/role=agent"],
-                                ["cvp.io/bootstrap-quarantine=false"], ["cvp.io/bootstrap=true"]],
+            "k3s_node_labels": [None, "flag", ["a=b", "a=c"], ["cvp.novirmor.io/role=agent"],
+                                ["cvp.novirmor.io/bootstrap-quarantine=false"], ["cvp.novirmor.io/bootstrap=true"]],
             "k3s_node_taints": [None, ["a:NoSchedule", "a:NoExecute"],
-                                ["cvp.io/bootstrap=false:NoSchedule"],
-                                ["cvp.io/bootstrap-quarantine:NoExecute"]],
+                                ["cvp.novirmor.io/bootstrap=false:NoSchedule"],
+                                ["cvp.novirmor.io/bootstrap-quarantine:NoExecute"]],
         }
         for field, values in cases.items():
             for value in values:
@@ -154,8 +154,8 @@ class TopologyTests(unittest.TestCase):
     def test_non_ingress_nodes_reject_contradictory_placement_intent(self):
         for labels in (
             INGRESS_LABELS,
-            ["cvp.io/ingress=true"], ["cvp.io/ingress="], ["cvp.io/ingress"],
-            ["cvp.io/ingress=True"],
+            ["cvp.novirmor.io/ingress=true"], ["cvp.novirmor.io/ingress="], ["cvp.novirmor.io/ingress"],
+            ["cvp.novirmor.io/ingress=True"],
             *([key + suffix] for key in ("svccontroller.k3s.cattle.io/enablelb",
                                         "svccontroller.k3s.cattle.io/lbpool")
               for suffix in ("", "=", "=true", "=false", "=public", "=private")),
@@ -169,7 +169,7 @@ class TopologyTests(unittest.TestCase):
     def test_non_ingress_false_and_unrelated_labels_remain_supported(self):
         data = topology()
         data["hosts"]["beta"]["k3s_node_labels"] = [
-            "cvp.io/ingress=false", "cvp.io/compute=true",
+            "cvp.novirmor.io/ingress=false", "cvp.novirmor.io/compute=true",
             "svccontroller.k3s.cattle.io/needs_reconcile=",
         ]
         TOPOLOGY.validate_topology(data)
@@ -179,7 +179,7 @@ class TopologyTests(unittest.TestCase):
         data["groups"]["ingress"] = ["beta"]
         with self.assertRaisesRegex(ValueError, "non-ingress nodes must omit"):
             TOPOLOGY.validate_topology(data)
-        data["hosts"]["alpha"]["k3s_node_labels"] = ["cvp.io/ingress=false"]
+        data["hosts"]["alpha"]["k3s_node_labels"] = ["cvp.novirmor.io/ingress=false"]
         with self.assertRaisesRegex(ValueError, "ingress node must declare"):
             TOPOLOGY.validate_topology(data)
         data["hosts"]["beta"]["k3s_node_labels"] = list(INGRESS_LABELS)
@@ -219,7 +219,7 @@ class TopologyTests(unittest.TestCase):
         for path, value in (
             (("metadata", "labels"), {}),
             (("metadata", "labels"), {"node-role.kubernetes.io/etcd": "true"}),
-            (("metadata", "labels"), {"node-role.kubernetes.io/control-plane": "", "cvp.io/role": "agent"}),
+            (("metadata", "labels"), {"node-role.kubernetes.io/control-plane": "", "cvp.novirmor.io/role": "agent"}),
             (("metadata", "deletionTimestamp"), "2026-01-01T00:00:00Z"),
             (("status", "conditions"), [{"type": "Ready", "status": "False"}]),
             (("status", "conditions"), []),
@@ -370,7 +370,7 @@ class ControllerTests(unittest.TestCase):
             ("wireguard_public_key", self.data["hosts"]["gamma"]["wireguard_public_key"], "unique"),
             ("storage_mountpoint", "/other", "storage_mountpoint"),
             ("k3s_cluster_init_host", "", "explicitly configured"),
-            ("k3s_node_taints", ["cvp.io/bootstrap=true:NoSchedule"], "reserved"),
+            ("k3s_node_taints", ["cvp.novirmor.io/bootstrap=true:NoSchedule"], "reserved"),
         ]
         for field, value, expected in cases:
             with self.subTest(field=field):
@@ -432,7 +432,7 @@ class ControllerTests(unittest.TestCase):
         for host in self.data["hosts"].values():
             host.update(ansible_connection="ssh", ansible_host="must-not-contact.invalid")
         self.data["groups"]["ingress"] = ["beta"]
-        self.data["hosts"]["alpha"]["k3s_node_labels"] = ["cvp.io/ingress=false"]
+        self.data["hosts"]["alpha"]["k3s_node_labels"] = ["cvp.novirmor.io/ingress=false"]
         self.data["hosts"]["beta"]["k3s_node_labels"] = list(INGRESS_LABELS)
         self.run_play(validate_inventory=True)
         self.run_play(validate_inventory=True, check=True)

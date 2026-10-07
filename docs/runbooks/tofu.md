@@ -169,10 +169,13 @@ task cloudflare-import -- \
 ```
 
 For a new, empty Tailscale state, establish the identity **before either
-import**. This guarded operation is intentionally separate from normal plans:
+import**. This guarded operation is intentionally separate from normal plans.
+Run it through its task, which points the operation at this root's per-instance
+state directory (`TF_DATA_DIR`); a raw wrapper invocation without that
+environment cannot find the initialized backend:
 
 ```sh
-mise exec -- ./scripts/tofu-operation tailscale establish-identity \
+task tailscale-identity-init -- \
   YOUR_EXPLICIT_TAILNET_ID_OR_DOMAIN \
   -var-file=/path/outside/repository/tailscale.tfvars
 ```
@@ -224,9 +227,13 @@ the resources. Two active states must never manage the same external object.
 
 For a complete root whose backend location alone is changing, initialize from
 that same root with the new backend configuration and let OpenTofu copy the
-whole state:
+whole state. These raw commands bypass the guarded tasks, so export the same
+per-instance state directory the tasks use
+(`TF_DATA_DIR=$INSTANCE_DIR/.tofu/<root>`, where `INSTANCE_DIR` is the instance
+repository) or they will initialize a fresh backend in the platform checkout:
 
 ```sh
+export TF_DATA_DIR=/path/to/instance/.tofu/cloudflare
 tofu init -migrate-state -backend-config=/path/outside/repository/new-backend.hcl
 tofu state pull > /path/outside/repository/state-backups/root-after-migration.tfstate
 ```
@@ -235,7 +242,9 @@ Do not use `-migrate-state` to split a shared old state into these two roots.
 For a split, make local state artifacts while the old automation is frozen,
 move each address into the destination artifact, then push the destination and
 remove the source ownership. Initialize both the old root and the destination
-root against their real backends before these commands.
+root against their real backends before these commands, and keep the same
+`TF_DATA_DIR` export (or replace `tofu/cloudflare` with the platform root's
+absolute path) so these raw commands reach the initialized backend:
 
 ```sh
 # Snapshot both remote states before changing either one.

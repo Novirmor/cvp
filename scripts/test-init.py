@@ -41,7 +41,7 @@ if fail and fail in name + " " + " ".join(args):
     sys.exit(3)
 if name == "ansible":
     if Path(os.environ["CVP_TEST_OPS_READY"]).exists():
-        print("node | CHANGED | rc=0 | (stdout) root")
+        print("node | CHANGED | rc=0 >>\\nroot")
     else:
         sys.exit(4)
 elif name == "ssh-keyscan":

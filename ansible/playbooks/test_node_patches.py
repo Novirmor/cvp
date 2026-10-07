@@ -37,11 +37,11 @@ def patch_for(node, labels, taints):
     env.filters["to_json"] = json.dumps
     current = node["metadata"].get("labels", {})
     desired_keys = [label.split("=", 1)[0] for label in labels]
-    obsolete = [key for key in current if key.startswith("cvp.io/") and key not in desired_keys]
+    obsolete = [key for key in current if key.startswith("cvp.novirmor.io/") and key not in desired_keys]
     return cast(list[dict[str, Any]], env.from_string(TEMPLATE).render(
         node_res=node, node_labels=labels, node_taints=taints,
         current_labels=current, obsolete_keys=obsolete,
-        taint_ownership_key="cvp.io/managed-taints",
+        taint_ownership_key="cvp.novirmor.io/managed-taints",
     ))
 
 
@@ -82,9 +82,9 @@ class NodePatchTests(unittest.TestCase):
     def test_unowned_taints_preserved_and_owned_removed(self):
         node = {
             "metadata": {
-                "labels": {"cvp.io/old": "value", "kubernetes.io/os": "linux"},
+                "labels": {"cvp.novirmor.io/old": "value", "kubernetes.io/os": "linux"},
                 "resourceVersion": "13",
-                "annotations": {"cvp.io/managed-taints": json.dumps([
+                "annotations": {"cvp.novirmor.io/managed-taints": json.dumps([
                     {"key": "dedicated", "value": "previous", "effect": "NoSchedule"}
                 ])},
             },
@@ -94,10 +94,10 @@ class NodePatchTests(unittest.TestCase):
                 {"key": "controller.io/protected", "effect": "NoExecute"},
             ]},
         }
-        ops = patch_for(node, ["cvp.io/new=abc"], ["new=ok:NoExecute"])
+        ops = patch_for(node, ["cvp.novirmor.io/new=abc"], ["new=ok:NoExecute"])
         self.assertEqual(ops[0], {"op": "test", "path": "/metadata/resourceVersion", "value": "13"})
         self.assertEqual([op["path"] for op in ops if op["op"] == "remove"],
-                         ["/metadata/labels/cvp.io~1old", "/spec/taints/1"])
+                         ["/metadata/labels/cvp.novirmor.io~1old", "/spec/taints/1"])
         self.assertIn({"op": "test", "path": "/spec/taints", "value": node["spec"]["taints"]}, ops)
         self.assertIn({"op": "add", "path": "/spec/taints/-",
                        "value": {"key": "new", "value": "ok", "effect": "NoExecute"}}, ops)
@@ -107,42 +107,42 @@ class NodePatchTests(unittest.TestCase):
 
     def test_idempotent_and_no_empty_taint_replacement(self):
         owned = {"key": "dedicated", "value": "ok", "effect": "NoSchedule"}
-        node = {"metadata": {"labels": {"cvp.io/role": "agent"}, "resourceVersion": "19",
-                             "annotations": {"cvp.io/managed-taints": json.dumps([owned])}},
+        node = {"metadata": {"labels": {"cvp.novirmor.io/role": "agent"}, "resourceVersion": "19",
+                             "annotations": {"cvp.novirmor.io/managed-taints": json.dumps([owned])}},
                 "spec": {"taints": [owned, {"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"}]}}
-        self.assertEqual(patch_for(node, ["cvp.io/role=agent"], ["dedicated=ok:NoSchedule"]), [])
+        self.assertEqual(patch_for(node, ["cvp.novirmor.io/role=agent"], ["dedicated=ok:NoSchedule"]), [])
         node["metadata"]["annotations"] = {}
-        self.assertEqual(patch_for(node, ["cvp.io/role=agent"], []), [])
+        self.assertEqual(patch_for(node, ["cvp.novirmor.io/role=agent"], []), [])
 
     def test_new_taints_and_structured_label_value(self):
         node = {"metadata": {"labels": {}, "annotations": {}, "resourceVersion": "25"}, "spec": {}}
-        ops = patch_for(node, ["cvp.io/role=agent", 'cvp.io/comment=a"b\\c'],
+        ops = patch_for(node, ["cvp.novirmor.io/role=agent", 'cvp.novirmor.io/comment=a"b\\c'],
                         ["dedicated:NoSchedule"])
         self.assertIn({"op": "add", "path": "/spec/taints",
                        "value": [{"key": "dedicated", "value": "", "effect": "NoSchedule"}]}, ops)
         self.assertEqual(ops[0], {"op": "test", "path": "/metadata/resourceVersion", "value": "25"})
-        self.assertEqual(ops[1], {"op": "add", "path": "/metadata/labels/cvp.io~1role", "value": "agent"})
+        self.assertEqual(ops[1], {"op": "add", "path": "/metadata/labels/cvp.novirmor.io~1role", "value": "agent"})
         self.assertEqual(ops[2]["value"], 'a"b\\c')
 
     def test_atomic_quarantine_removal_applies_inventory_and_preserves_controller_state(self):
-        quarantine = {"key": "cvp.io/bootstrap", "value": "true", "effect": "NoSchedule"}
+        quarantine = {"key": "cvp.novirmor.io/bootstrap", "value": "true", "effect": "NoSchedule"}
         previous = {"key": "dedicated", "value": "old", "effect": "NoExecute"}
         controllers = [{"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"},
                        {"key": "controller.io/protected", "value": "keep", "effect": "NoExecute"}]
         node = {"metadata": {"resourceVersion": "42", "labels": {
-            "cvp.io/bootstrap-quarantine": "true", "cvp.io/old": "true", "kubernetes.io/os": "linux"},
-            "annotations": {"cvp.io/managed-taints": json.dumps([previous]), "controller.io/state": "keep"}},
+            "cvp.novirmor.io/bootstrap-quarantine": "true", "cvp.novirmor.io/old": "true", "kubernetes.io/os": "linux"},
+            "annotations": {"cvp.novirmor.io/managed-taints": json.dumps([previous]), "controller.io/state": "keep"}},
             "spec": {"taints": [controllers[0], previous, quarantine, controllers[1]]}}
-        labels = ["cvp.io/role=agent", "cvp.io/compute=true"]
+        labels = ["cvp.novirmor.io/role=agent", "cvp.novirmor.io/compute=true"]
         taints = ["dedicated=new:NoSchedule"]
         ops = patch_for(node, labels, taints)
         final = jsonpatch.apply_patch(node, ops)
         desired = {"key": "dedicated", "value": "new", "effect": "NoSchedule"}
         self.assertEqual(final["spec"]["taints"], controllers + [desired])
         self.assertEqual(final["metadata"]["labels"], {
-            "kubernetes.io/os": "linux", "cvp.io/role": "agent", "cvp.io/compute": "true"})
+            "kubernetes.io/os": "linux", "cvp.novirmor.io/role": "agent", "cvp.novirmor.io/compute": "true"})
         self.assertEqual(final["metadata"]["annotations"], {
-            "cvp.io/managed-taints": json.dumps([desired]), "controller.io/state": "keep"})
+            "cvp.novirmor.io/managed-taints": json.dumps([desired]), "controller.io/state": "keep"})
         self.assertEqual(patch_for(final, labels, taints), [])
         self.assertIn(quarantine, node["spec"]["taints"])
         for changed in ("version", "taints", "ledger"):
@@ -153,18 +153,18 @@ class NodePatchTests(unittest.TestCase):
                 elif changed == "taints":
                     concurrent["spec"]["taints"].append({"key": "another-controller", "effect": "NoExecute"})
                 else:
-                    concurrent["metadata"]["annotations"]["cvp.io/managed-taints"] = "[]"
+                    concurrent["metadata"]["annotations"]["cvp.novirmor.io/managed-taints"] = "[]"
                 with self.assertRaises(jsonpatch.JsonPatchTestFailed):
                     jsonpatch.apply_patch(concurrent, ops)
 
     def test_bootstrap_only_patch_does_not_claim_controller_taints(self):
         controller = {"key": "node.kubernetes.io/unreachable", "effect": "NoExecute"}
-        node = {"metadata": {"labels": {"cvp.io/bootstrap-quarantine": "true"}, "resourceVersion": "1"},
-                "spec": {"taints": [{"key": "cvp.io/bootstrap", "value": "true", "effect": "NoSchedule"},
+        node = {"metadata": {"labels": {"cvp.novirmor.io/bootstrap-quarantine": "true"}, "resourceVersion": "1"},
+                "spec": {"taints": [{"key": "cvp.novirmor.io/bootstrap", "value": "true", "effect": "NoSchedule"},
                                     controller]}}
-        final = jsonpatch.apply_patch(node, patch_for(node, ["cvp.io/role=control-plane"], []))
+        final = jsonpatch.apply_patch(node, patch_for(node, ["cvp.novirmor.io/role=control-plane"], []))
         self.assertEqual(final["spec"]["taints"], [controller])
-        self.assertEqual(final["metadata"]["labels"], {"cvp.io/role": "control-plane"})
+        self.assertEqual(final["metadata"]["labels"], {"cvp.novirmor.io/role": "control-plane"})
         self.assertNotIn("annotations", final["metadata"])
 
 
