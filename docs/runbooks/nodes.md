@@ -38,7 +38,8 @@ manual path.
 
 Run every command from the root of your **instance repository** (created with
 `task new-instance` in the platform repository; see the platform README). Its
-`platform/` submodule provides these tasks; your inventory, cluster apps, and
+pinned platform release (installed from `platform.lock` into `collections/`)
+provides these tasks; your inventory, cluster apps, and
 Flux entry point live beside it. `example` below stands for your instance
 name: per-user files live in `~/.config/cvp/<instance>/`. A new instance's
 inventory is empty and creates no machines. Add **one node at a time**.
@@ -392,7 +393,9 @@ all:
 
 Both server selections stay in `all.vars` so every node inherits them.
 Connection and mesh settings (`ansible_user: ops`, `wg0`, UDP `51820`) are
-platform defaults in `platform/ansible/defaults/group_vars/all.yml`. Override a
+platform defaults in the installed collection's
+`ansible/defaults/group_vars/all.yml` (see `platform.lock` for the release).
+Override a
 platform default in the instance's `inventory/group_vars/all.yml`, which
 outranks both the platform defaults and `all.vars`; it must not override the
 server selections. Every mesh host is in exactly one of `k3s_servers` and

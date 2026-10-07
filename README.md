@@ -11,16 +11,17 @@ availability.
 This repository is the **platform**: Ansible roles, guarded operator scripts,
 cluster policy/ingress/operations layers, OpenTofu roots, tests, and runbooks.
 It contains no hosts and no secrets. Each operator runs their own **instance
-repository**, which pins a platform commit as a `platform/` submodule and holds
+repository**, which pins one platform release in `platform.lock` and holds
 only what is theirs:
 
 | Instance path | Contents |
 | --- | --- |
-| `platform/` | This repository, pinned to one commit |
+| `platform.lock` | The single platform pin: version, commit, and public URL |
+| `collections/`, `tasks/ops.yml` | The installed `cvp.platform` release and its taskfile, materialized from the lock |
 | `inventory/` | Hosts, host vars, overrides of platform defaults |
 | `cluster/flux-system/` | Flux entry point: the instance's own source, the pinned `cvp-platform` source, the reconciliation graph |
 | `cluster/apps/` | The instance's applications |
-| `Taskfile.yml` | Includes every platform task; adds `validate` and `platform-upgrade` |
+| `Taskfile.yml` | Includes every platform task; adds `platform-install`, `validate`, and `platform-upgrade` |
 
 Flux pulls the platform layers (policy, ingress, operations, data) from the
 pinned platform commit and the applications from the instance, and every layer

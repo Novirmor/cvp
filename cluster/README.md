@@ -9,14 +9,14 @@ manifests, CRD schemas, operators, or private keys.
 An instance (created with `task new-instance`) carries its own
 `cluster/flux-system/`: the Flux components copied from the pinned platform, its
 own `flux-system` source, a `cvp-platform` source pinned with `ref.commit` to
-the `platform/` submodule commit, and a reconciliation graph in which `policy`,
+the commit recorded in `platform.lock`, and a reconciliation graph in which `policy`,
 `infrastructure`, `data`, and `operations` come from `cvp-platform` while
 `apps` comes from the instance. Validation (`task validate` in the instance,
 and the Flux bootstrap preflight) renders and policy-checks the platform layers
 from that exact commit; an unpinned, mismatched, authenticated, or filtered
 `cvp-platform` source is rejected. The bootstrap preflight additionally
-requires the published instance commit's `platform` submodule pointer and the
-local checkout to equal the pin. Flux's revision for a commit-pinned source is
+requires the published instance commit's `platform.lock` and the reviewed
+local lock to record the pinned commit and URL. Flux's revision for a commit-pinned source is
 `sha1:<commit>`; bootstrap readiness expects platform layers at that revision.
 Instance-specific additions (secrets, extra namespaces) belong in Kustomizations
 sourced from the instance.

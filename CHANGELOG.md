@@ -23,21 +23,28 @@ deployment; see the open items and exit gates in `PLAN.md`.
   `cvp-tofu`) from `scripts/`. `VERSION` is the single version source, kept in
   lockstep with the CHANGELOG by `scripts/test-collection-build.py`, which also
   proves the collection installs and its playbooks syntax-check from the
-  installed collection path. These artifacts are the foundation for pinning an
-  instance to one platform release across every channel (Ansible collection,
-  Python CLI, taskfile, and Flux source) without a git submodule.
+  installed collection path. These artifacts pin an instance to one platform
+  release across every channel (installed collection, copied taskfile, Flux
+  source, and the optional uv-installed CLI) without a git submodule.
 - **Platform and instance repositories.** This repository is now a reusable
   platform; each operator runs an instance repository created with
   `task new-instance -- ../my-platform --platform-url https://...`:
-  - the instance pins the platform as a `platform/` submodule and includes its
-    tasks (`tasks/ops.yml`), so `task init`, `node-*`, `site`, `verify`, and the
-    provider tasks run against the instance's inventory and cluster;
+  - the instance pins the platform in `platform.lock` (one version, one
+    commit, one public URL) and includes the platform's task surface
+    (`tasks/ops.yml`), so `task init`, `node-*`, `site`, `verify`, and the
+    provider tasks run against the instance's inventory and cluster. The
+    locked release materializes into `collections/` (gitignored) as the
+    `cvp.platform` Ansible collection: creation installs it, a fresh clone
+    runs `task platform-install` (bootstrapped through the `cvp-platform`
+    wheel fetched from the locked commit), and upgrades reinstall it;
   - Flux reconciles policy, ingress, operations, and data from a `cvp-platform`
-    GitRepository pinned to the submodule commit, and apps from the instance;
-    the validator and bootstrap preflight render those layers from that exact
-    commit and reject any mismatch;
-  - `task validate` and `task platform-upgrade -- <ref>` keep the submodule,
-    Flux pin, copied Flux components, and toolchain in step;
+    GitRepository pinned to the locked commit, and apps from the instance;
+    the validator and bootstrap preflight render those layers from the
+    installed collection and reject any mismatch, including a published
+    `platform.lock` that disagrees with the Flux pin;
+  - `task validate` and `task platform-upgrade -- <ref>` keep the lock, the
+    installed collection, the copied taskfile, the copied Flux components,
+    and the toolchain in step;
   - platform defaults moved to `ansible/defaults/` and load before the instance
     inventory, whose `group_vars/all.yml` overrides them; operator files, keys,
     state, and kubeconfigs are scoped per instance under
@@ -114,9 +121,7 @@ deployment; see the open items and exit gates in `PLAN.md`.
 
 - Deep-analysis corrections: uncaught subprocess timeout in `task init`'s
   kubeconfig step; uncaught parse errors in instance reconciliation rewriting;
-  `platform-upgrade` fetching the submodule from the local checkout it was
-  added from instead of the public URL (`git submodule sync` after pinning and
-  before upgrading); the wizard persisting a pasted Tailscale auth key even
+  the wizard persisting a pasted Tailscale auth key even
   when the inventory plan is declined; strict host-bit rejection for SSH source
   CIDRs; exact `id -un` output matching for operator access checks; removal of
   dead code (an unused restore fact, lifecycle bookkeeping, an unused firewall
