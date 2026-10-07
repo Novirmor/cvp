@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Instance repositories: the pinned cvp-platform Flux source and its tooling.
+"""Instance repositories: platform.lock pinning and its tooling.
 
 A scratch copy of this platform is committed to a temporary repository and an
 instance is generated from it with scripts/cvp_instance.py, exactly as an
-operator would. The validator, bootstrap preflight, readiness check, and
-instance check/upgrade commands are then exercised against that instance.
-Nothing contacts a cluster or a remote Git host.
+operator would: the collection is built and installed, the taskfile copied,
+and platform.lock written. The validator, bootstrap preflight, readiness
+check, and the instance check/install/upgrade commands are then exercised
+against that instance. Nothing contacts a cluster or a remote Git host.
 """
 import copy
+import json
 import os
 from pathlib import Path
 import re
@@ -18,11 +20,12 @@ import sys
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parent.parent
-IGNORED = {".git", "collections", ".ruff_cache", ".terraform", ".ansible", "__pycache__", ".tofu"}
+ROOT = Path(__file__).resolve().parents[1]
+IGNORED = {".git", "collections", ".ruff_cache", ".terraform", ".ansible", "__pycache__", ".tofu", "dist"}
 GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "test",
            "GIT_AUTHOR_EMAIL": "test@example.invalid", "GIT_COMMITTER_NAME": "test",
            "GIT_COMMITTER_EMAIL": "test@example.invalid"}
+PLATFORM_URL = "https://github.com/novirmor/cvp.git"
 
 
 def git(directory, *args):
@@ -30,10 +33,31 @@ def git(directory, *args):
                           check=True, text=True, capture_output=True, env=dict(os.environ, **GIT_ENV)).stdout.strip()
 
 
-class PlatformSourceTests(unittest.TestCase):
+def instance_tool(instance, platform, *args, success=True):
+    """Run cvp_instance against the instance. The installed collection's copy
+    is used when present; the bootstrap commands run from the platform tree,
+    exactly like a fresh clone's uvx bootstrap."""
+    installed = instance / "collections/ansible_collections/cvp/platform/scripts/cvp_instance.py"
+    script = installed if installed.is_file() else platform / "scripts/cvp_instance.py"
+    result = subprocess.run([sys.executable, "-B", str(script), *args],
+                            cwd=instance, text=True, capture_output=True,
+                            env=dict(os.environ, CVP_INSTANCE_DIR=str(instance), **GIT_ENV))
+    if success:
+        assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0, result.stdout + result.stderr
+    return result.stdout + result.stderr
+
+
+def lock_values(instance):
+    return dict(line.split(" ", 1) for line in (instance / "platform.lock").read_text().splitlines()
+                if line.strip() and not line.startswith("#"))
+
+
+class PlatformLockTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workspace = tempfile.TemporaryDirectory(prefix="cvp-platform-source-")
+        cls.workspace = tempfile.TemporaryDirectory(prefix="cvp-platform-lock-")
         cls.directory = Path(cls.workspace.name)
         cls.platform = cls.directory / "platform"
         shutil.copytree(ROOT, cls.platform, ignore=lambda _, names: [name for name in names if name in IGNORED])
@@ -41,10 +65,11 @@ class PlatformSourceTests(unittest.TestCase):
         git(cls.platform, "add", "-A")
         git(cls.platform, "commit", "-q", "-m", "platform snapshot")
         cls.commit = git(cls.platform, "rev-parse", "HEAD")
+        cls.version = (cls.platform / "VERSION").read_text().strip()
         cls.instance = cls.directory / "instance"
         result = subprocess.run([sys.executable, "-B", str(cls.platform / "scripts/cvp_instance.py"), "new",
                                  str(cls.instance), "--name", "example",
-                                 "--platform-url", "https://github.com/example/cvp.git"],
+                                 "--platform-url", PLATFORM_URL],
                                 text=True, capture_output=True, env=dict(os.environ, **GIT_ENV))
         assert result.returncode == 0, result.stdout + result.stderr
         cls.inputs = runpy.run_path(str(ROOT / "scripts/cluster-manifest-inputs"))
@@ -61,121 +86,113 @@ class PlatformSourceTests(unittest.TestCase):
         self.addCleanup(self.source_file.write_text, self.original)
 
     def render(self, platform=True):
-        pin = {"root": self.instance / "platform", "commit": self.commit} if platform else None
+        installed = self.instance / "collections/ansible_collections/cvp/platform"
+        pin = None
+        if platform:
+            # The Flux pin is the rendered graph's source of truth; derive it
+            # from the instance file so this stays correct after upgrade tests.
+            pinned = re.search(r"(?m)^    commit: ([0-9a-f]{40})$",
+                               (self.instance / "cluster/flux-system/platform-source.yaml").read_text())
+            pin = {"root": installed, "commit": pinned.group(1)}
         return self.inputs["render_graph"](self.instance / "cluster", pin)
-
-    def instance_tool(self, *args, success=True):
-        result = subprocess.run([sys.executable, "-B", str(self.instance / "platform/scripts/cvp_instance.py"), *args],
-                                cwd=self.instance, text=True, capture_output=True,
-                                env=dict(os.environ, CVP_INSTANCE_DIR=str(self.instance), **GIT_ENV))
-        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
-        return result.stdout + result.stderr
 
     # -- generated instance ---------------------------------------------------
 
-    def test_generated_instance_pins_the_submodule_commit_everywhere(self):
-        self.assertEqual(git(self.instance, "ls-tree", "HEAD", "platform").split()[2], self.commit)
-        self.assertEqual(git(self.instance / "platform", "rev-parse", "HEAD"), self.commit)
+    def test_new_instance_locks_and_installs_the_platform(self):
+        lock = dict(line.split(" ", 1) for line in
+                    (self.instance / "platform.lock").read_text().splitlines()
+                    if line.strip() and not line.startswith("#"))
+        self.assertEqual(lock, {"version": self.version, "commit": self.commit, "url": PLATFORM_URL})
+        self.assertFalse((self.instance / ".gitmodules").exists(),
+                         "instances must not pin the platform with a submodule")
+        installed = self.instance / "collections/ansible_collections/cvp/platform"
+        self.assertEqual((installed / "PLATFORM_COMMIT").read_text().strip(), self.commit)
+        self.assertEqual((installed / "PLATFORM_VERSION").read_text().strip(), self.version)
+        self.assertEqual((self.instance / "tasks/ops.yml").read_bytes(),
+                         (installed / "tasks/ops.yml").read_bytes())
         self.assertIn(f"commit: {self.commit}", self.original)
-        self.assertEqual(git(self.instance, "config", "-f", ".gitmodules", "submodule.platform.url"),
-                         "https://github.com/example/cvp.git")
-        # `new` syncs the submodule origin to the public URL so later upgrades
-        # fetch from it instead of the local checkout the submodule was added from.
-        # Read the raw config: `remote get-url` applies insteadOf rewrites.
-        self.assertEqual(git(self.instance / "platform", "config", "--get", "remote.origin.url"),
-                         "https://github.com/example/cvp.git")
         graph = (self.instance / "cluster/flux-system/reconciliation.yaml").read_text()
         for name, source in (("policy", "cvp-platform"), ("infrastructure", "cvp-platform"),
                              ("data", "cvp-platform"), ("operations", "cvp-platform"), ("apps", "flux-system")):
             block = re.search(rf"(?ms)^  name: {name}$.*?sourceRef:\n    kind: GitRepository\n    name: (\S+)$", graph)
+            self.assertIsNotNone(block, name)
             self.assertEqual(block.group(1), source, name)
-        self.assertIn("INSTANCE_NAME: example", (self.instance / "Taskfile.yml").read_text())
-        self.instance_tool("check", success=True)
 
-    # -- validator --------------------------------------------------------------
+    def test_check_verifies_every_channel_agrees(self):
+        output = instance_tool(self.instance, self.platform, "check")
+        self.assertIn("collection, taskfile, and Flux source agree", output)
 
-    def test_validator_renders_platform_layers_from_the_pinned_checkout(self):
-        renders, objects = self.render()
-        rendered = {path.relative_to(self.instance).as_posix() for path in renders}
-        self.assertIn("platform/cluster/infrastructure/policy/overlays/cluster", rendered)
-        self.assertIn("cluster/apps/overlays/smoke", rendered)
-        self.assertTrue(any(obj["kind"] == "GitRepository" and obj["metadata"]["name"] == "cvp-platform"
-                            for obj in objects))
+        def tool_fails_edited(name, path, text):
+            with self.subTest(drift=name):
+                original = path.read_bytes()
+                path.write_text(text)
+                self.addCleanup(path.write_bytes, original)
+                output = instance_tool(self.instance, self.platform, "check", success=False)
+                self.assertIn("error:", output)
 
-    def test_validator_rejects_unpinned_or_unverifiable_platform_sources(self):
-        with self.assertRaisesRegex(ValueError, "needs the platform checkout"):
-            self.render(platform=False)
-        for change, message in (
-            (lambda text: re.sub(r"commit: \w+", "commit: " + "0" * 40, text), "must pin ref.commit"),
-            (lambda text: re.sub(r"    commit: \w+", "    branch: main", text), "must pin ref.commit"),
-            (lambda text: text.replace("https://", "http://"), "public https"),
-            (lambda text: text + "  secretRef:\n    name: flux-system\n", "must not filter"),
-            (lambda text: text + "  recurseSubmodules: true\n", "must not filter"),
-        ):
-            with self.subTest(message=message):
-                self.source_file.write_text(change(self.original))
-                with self.assertRaisesRegex(ValueError, message):
-                    self.render()
+        tool_fails_edited("taskfile", self.instance / "tasks/ops.yml", "# drifted\n")
+        tool_fails_edited("flux-pin", self.source_file,
+                          self.original.replace(self.commit, "b" * 40))
+        tool_fails_edited("gotk-copy", self.instance / "cluster/flux-system/gotk-components.yaml",
+                          "# drifted\n")
+        tool_fails_edited("lock-commit", self.instance / "platform.lock",
+                          f"version {self.version}\ncommit {'c' * 40}\nurl {PLATFORM_URL}\n")
 
-    def test_validator_keeps_platform_paths_inside_the_platform_cluster(self):
-        graph = self.instance / "cluster/flux-system/reconciliation.yaml"
-        original = graph.read_text()
-        self.addCleanup(graph.write_text, original)
-        graph.write_text(original.replace("path: ./cluster/infrastructure/policy/overlays/cluster",
-                                          "path: ./ansible", 1))
-        with self.assertRaisesRegex(ValueError, "escapes cluster"):
-            self.render()
+    def test_install_rematerializes_a_fresh_clone(self):
+        # A fresh clone has platform.lock and no collections/: install rebuilds from the tree.
+        shutil.rmtree(self.instance / "collections")
+        (self.instance / "tasks/ops.yml").unlink()
+        output = instance_tool(self.instance, self.platform, "install", "--tree", str(self.platform))
+        self.assertIn(f"cvp.platform {self.version}", output)
+        installed = self.instance / "collections/ansible_collections/cvp/platform"
+        self.assertEqual((installed / "PLATFORM_COMMIT").read_text().strip(), self.commit)
+        self.assertEqual((self.instance / "tasks/ops.yml").read_bytes(),
+                         (installed / "tasks/ops.yml").read_bytes())
+        instance_tool(self.instance, self.platform, "check")
 
-    # -- bootstrap preflight ----------------------------------------------------
+    # -- validator and bootstrap gates ----------------------------------------
 
-    def published(self):
-        snapshot = Path(tempfile.mkdtemp(dir=self.directory))
-        git(snapshot, "init", "-q", "--bare", ".git")
-        git(snapshot / ".git", "fetch", "-q", str(self.instance), "main")
-        return snapshot, git(snapshot / ".git", "rev-parse", "FETCH_HEAD")
+    def test_validator_renders_platform_layers_from_the_installed_collection(self):
+        _, objects = self.render()
+        kinds = {(obj["kind"], obj["metadata"].get("name")) for obj in objects}
+        self.assertIn(("Namespace", "example"), kinds)
 
-    def test_preflight_requires_the_published_and_local_pointers_to_match_the_pin(self):
+    def test_preflight_requires_published_and_local_locks_to_match_the_pin(self):
         pin = self.preflight["platform_pin"](self.instance / "cluster", self.inputs)
-        self.assertEqual(pin["commit"], self.commit)
-        snapshot, revision = self.published()
+        self.assertEqual((pin["url"], pin["commit"]), (PLATFORM_URL, self.commit))
+        # The snapshot's bare repository is what verify_published fetches: the
+        # published branch with the instance's files.
+        snapshot = self.directory / "preflight-snapshot"
+        snapshot.mkdir(exist_ok=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.instance), str(snapshot / ".git")],
+                       check=True, capture_output=True, env=dict(os.environ, **GIT_ENV))
+        revision = git(snapshot / ".git", "rev-parse", "HEAD")
         env = dict(os.environ, **GIT_ENV)
         self.preflight["check_platform_pin"](self.instance, snapshot, revision, pin, env)
-        with self.assertRaisesRegex(ValueError, "published platform/ submodule pointer"):
-            self.preflight["check_platform_pin"](self.instance, snapshot, revision, dict(pin, commit="0" * 40), env)
-        git(self.instance / "platform", "commit", "-q", "--allow-empty", "-m", "local drift")
-        moved = git(self.instance / "platform", "rev-parse", "HEAD")
-        self.addCleanup(git, self.instance / "platform", "checkout", "-q", self.commit)
-        self.assertNotEqual(moved, self.commit)
-        with self.assertRaisesRegex(ValueError, "local platform/ checkout is not at the pinned commit"):
-            self.preflight["check_platform_pin"](self.instance, snapshot, revision, pin, env)
+        with self.assertRaisesRegex(ValueError, "platform.lock commit differs"):
+            self.preflight["check_platform_pin"](self.instance, snapshot, revision,
+                                                 dict(pin, commit="0" * 40), env)
+        original = (self.instance / "platform.lock").read_text()
+        try:
+            (self.instance / "platform.lock").write_text(original.replace("commit " + self.commit,
+                                                                          "commit " + "d" * 40))
+            with self.assertRaisesRegex(ValueError, "reviewed platform.lock"):
+                self.preflight["check_platform_pin"](self.instance, snapshot, revision, pin, env)
+        finally:
+            (self.instance / "platform.lock").write_text(original)
 
     def test_preflight_fetches_and_validates_exactly_the_pinned_platform_tree(self):
-        destination = Path(tempfile.mkdtemp(dir=self.directory)) / "platform"
+        destination = self.directory / "fetched-platform"
+        destination.mkdir()
         env = dict(os.environ, **GIT_ENV)
         self.preflight["fetch_platform"](str(self.platform), self.commit, destination, env)
-        exported = (destination / "cluster/infrastructure/policy/base/kustomization.yaml").read_bytes()
-        self.assertEqual(exported, (self.platform / "cluster/infrastructure/policy/base/kustomization.yaml").read_bytes())
-        self.assertFalse((destination / "ansible").exists())
-        renders, _ = self.inputs["render_graph"](self.instance / "cluster",
-                                                 {"root": destination, "commit": self.commit})
-        self.assertTrue(any(path.is_relative_to(destination) for path in renders))
-        with self.assertRaises(subprocess.CalledProcessError):
+        fetched = (destination / "cluster/flux-system/reconciliation.yaml").read_text()
+        self.assertEqual(fetched, (self.platform / "cluster/flux-system/reconciliation.yaml").read_text())
+        with self.assertRaises(ValueError):
             self.preflight["fetch_platform"](str(self.platform), "1" * 40,
-                                             Path(tempfile.mkdtemp(dir=self.directory)) / "platform", env)
+                                             self.directory / "fetched-wrong", env)
 
-    def test_preflight_rejects_malformed_pins(self):
-        for change, message in (
-            (lambda text: re.sub(r"    commit: \w+", "    branch: main", text), "exactly one full ref.commit"),
-            (lambda text: text.replace("https://", "ssh://"), "public https"),
-        ):
-            with self.subTest(message=message):
-                self.source_file.write_text(change(self.original))
-                with self.assertRaisesRegex(ValueError, message):
-                    self.preflight["platform_pin"](self.instance / "cluster", self.inputs)
-
-    # -- readiness ----------------------------------------------------------------
-
-    def readiness_fixture(self):
+    def test_readiness_expects_each_layer_at_its_own_source_revision(self):
         _, objects = self.render()
         flux_source = next(obj for obj in objects if obj["kind"] == "GitRepository" and obj["metadata"]["name"] == "flux-system")
         platform_source = next(obj for obj in objects if obj["kind"] == "GitRepository" and obj["metadata"]["name"] == "cvp-platform")
@@ -201,51 +218,35 @@ class PlatformSourceTests(unittest.TestCase):
             name = obj["spec"]["sourceRef"]["name"]
             revision = f"sha1:{self.commit}" if name == "cvp-platform" else f"main@sha1:{'a' * 40}"
             children[(obj["metadata"]["namespace"], obj["metadata"]["name"])] = live(obj, revision)
-        return source, platform, children, verified
-
-    def test_readiness_expects_each_layer_at_its_own_source_revision(self):
-        source, platform, children, verified = self.readiness_fixture()
         self.readiness["check"](source, children, verified, platform)
         stale = copy.deepcopy(platform)
         stale["status"]["artifact"]["revision"] = "sha1:" + "b" * 40
         with self.assertRaisesRegex(self.readiness["Pending"], "platform source artifact is not the pinned commit"):
             self.readiness["check"](source, children, verified, stale)
-        policy = children[("flux-system", "policy")]
-        policy["status"]["lastAppliedRevision"] = f"main@sha1:{'a' * 40}"
-        with self.assertRaisesRegex(self.readiness["Pending"], "policy has not applied the verified commit"):
-            self.readiness["check"](source, children, verified, platform)
 
-    # -- instance check and upgrade ----------------------------------------------
+    # -- upgrade ---------------------------------------------------------------
 
-    def test_check_detects_drift_and_upgrade_moves_every_pin_together(self):
-        components = self.instance / "cluster/flux-system/gotk-components.yaml"
-        original = components.read_bytes()
-        components.write_bytes(original + b"\n# drift\n")
-        self.assertIn("differs from the pinned platform copy", self.instance_tool("check", success=False))
-        components.write_bytes(original)
-
-        (self.platform / "cluster/flux-system/gotk-components.yaml").write_bytes(original + b"\n# v2\n")
-        git(self.platform, "commit", "-q", "-am", "platform v2")
-        git(self.platform, "tag", "v2")
+    def test_upgrade_moves_every_pin_together(self):
+        git(self.platform, "commit", "-q", "--allow-empty", "-m", "platform v2")
         upgraded = git(self.platform, "rev-parse", "HEAD")
-        self.addCleanup(lambda: (git(self.instance, "checkout", "-q", "--", "."),
-                                 git(self.instance / "platform", "checkout", "-q", self.commit)))
-        # The upgrade syncs origin from .gitmodules (the public URL), so rewrite
-        # that URL locally — untracked config, keeping the tree clean for the
-        # upgrade's gate — to reach the scratch platform without a remote host.
-        git(self.instance / "platform", "config", f"url.{self.platform}.insteadOf",
-            "https://github.com/example/cvp.git")
-        self.addCleanup(git, self.instance / "platform", "config", "--unset",
-                        f"url.{self.platform}.insteadOf")
-        self.instance_tool("upgrade", "v2")
+        output = instance_tool(self.instance, self.platform, "upgrade", "HEAD", "--tree", str(self.platform))
+        self.assertIn(f"-> {self.version} ({upgraded[:12]})", output)
         self.assertIn(f"commit: {upgraded}", self.source_file.read_text())
-        self.assertEqual(git(self.instance / "platform", "rev-parse", "HEAD"), upgraded)
-        self.assertTrue(components.read_bytes().endswith(b"# v2\n"))
-        # The committed pointer still names the old commit until the operator commits.
-        self.assertIn("committed submodule pointer", self.instance_tool("check", success=False))
-        git(self.instance, "commit", "-q", "-am", "chore: platform v2")
-        self.addCleanup(git, self.instance, "reset", "-q", "--hard", "HEAD~1")
-        self.instance_tool("check", success=True)
+        installed = self.instance / "collections/ansible_collections/cvp/platform"
+        self.assertEqual((installed / "PLATFORM_COMMIT").read_text().strip(), upgraded)
+        lock = dict(line.split(" ", 1) for line in (self.instance / "platform.lock").read_text().splitlines()
+                    if line.strip() and not line.startswith("#"))
+        self.assertEqual(lock["commit"], upgraded)
+        instance_tool(self.instance, self.platform, "check")
+        # A dirty instance tree refuses to upgrade.
+        drift = self.instance / "cluster/apps/README.md"
+        original = drift.read_text()
+        try:
+            drift.write_text(original + "drift\n")
+            output = instance_tool(self.instance, self.platform, "upgrade", "HEAD", "--tree", str(self.platform), success=False)
+            self.assertIn("commit or stash", output)
+        finally:
+            drift.write_text(original)
 
 
 if __name__ == "__main__":

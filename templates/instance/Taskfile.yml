@@ -1,25 +1,39 @@
 ---
 # Instance tasks. Every platform task (init, node-*, site, verify,
 # bootstrap-flux, cloudflare-*, tailscale-*, ...) comes from the pinned
-# platform/ submodule and runs against this repository's inventory and cluster.
+# platform's copied taskfile and runs against this repository's inventory and
+# cluster; platform content is served from the installed cvp.platform
+# collection under collections/ (materialized from platform.lock).
 version: "3"
 
 includes:
-  platform:
-    taskfile: ./platform/tasks/ops.yml
+  ops:
+    taskfile: ./tasks/ops.yml
     flatten: true
     vars:
       INSTANCE_NAME: __NAME__
+      CVP_PLATFORM_DIR: '{{.ROOT_DIR}}/collections/ansible_collections/cvp/platform'
+      CVP_COLLECTIONS_DIR: '{{.ROOT_DIR}}/collections'
 
 tasks:
+  platform-install:
+    desc: Install (or reinstall) the platform release pinned in platform.lock
+    cmds:
+      - |
+        commit="$(sed -n 's/^commit //p' platform.lock)"
+        url="$(sed -n 's/^url //p' platform.lock)"
+        mise exec -- uvx --from "git+${url}@${commit}" cvp-instance install
+
   validate:
     desc: Credential-free checks for this instance (platform pin, cluster manifests, inventory)
-    deps:
-      - deps
     cmds:
-      - mise exec -- python3 -B platform/scripts/cvp_instance.py validate {{.CLI_ARGS}}
+      - >-
+        mise exec -- python3 -B
+        collections/ansible_collections/cvp/platform/scripts/cvp_instance.py validate {{.CLI_ARGS}}
 
   platform-upgrade:
     desc: Move to another platform release and refresh the pin (e.g. task platform-upgrade -- v0.2.0)
     cmds:
-      - mise exec -- python3 -B platform/scripts/cvp_instance.py upgrade {{.CLI_ARGS}}
+      - >-
+        mise exec -- python3 -B
+        collections/ansible_collections/cvp/platform/scripts/cvp_instance.py upgrade {{.CLI_ARGS}}

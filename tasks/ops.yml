@@ -1,25 +1,36 @@
 ---
 # Operational tasks. The platform's root Taskfile includes this file, and every
-# instance repository includes it from its platform/ submodule (flattened), so
-# the same task names work in both. Commands run in the including directory
-# and reach platform files through PLATFORM_DIR.
+# instance repository includes its copied tasks/ops.yml (flattened), so the same
+# task names work in both. Commands run in the including directory and reach
+# platform files through PLATFORM_DIR: the platform checkout in the platform
+# repository, or the installed cvp.platform collection in an instance (set via
+# CVP_PLATFORM_DIR/CVP_COLLECTIONS_DIR by the instance Taskfile).
 version: "3"
 
 vars:
-  PLATFORM_DIR: '{{dir .TASKFILE_DIR}}'
-  # An instance passes INSTANCE_NAME through its include; run inside the
-  # platform repository itself, the bundled example instance is used.
+  # Instances pass CVP_PLATFORM_DIR pointing at the installed collection
+  # through their include; otherwise the including repository's root is the
+  # platform tree (the platform checkout, or nothing before install).
+  PLATFORM_DIR: '{{.CVP_PLATFORM_DIR | default .ROOT_DIR}}'
+  # Where third-party Ansible collections install: instance-local in an
+  # instance, inside the checkout for platform development.
+  COLLECTIONS_DIR: '{{.CVP_COLLECTIONS_DIR | default (printf "%s/ansible/collections" .PLATFORM_DIR)}}'
+  # An instance passes INSTANCE_NAME through its include; the platform
+  # repository runs against the bundled, empty example instance.
   INSTANCE_DIR: >-
-    {{.CVP_INSTANCE_DIR | default (ternary (printf "%s/examples/instance" (dir .TASKFILE_DIR))
-    .ROOT_DIR (eq .ROOT_DIR (dir .TASKFILE_DIR)))}}
+    {{.CVP_INSTANCE_DIR | default (ternary .ROOT_DIR (printf "%s/examples/instance" .ROOT_DIR)
+    (eq .PLATFORM_DIR .ROOT_DIR))}}
   INSTANCE_NAME: '{{.INSTANCE_NAME | default ""}}'
   INVENTORY: >-
-    -i {{dir .TASKFILE_DIR}}/ansible/defaults/inventory.yml -i {{.INSTANCE_DIR}}/inventory/hosts.yml
+    -i {{.PLATFORM_DIR}}/ansible/defaults/inventory.yml -i {{.INSTANCE_DIR}}/inventory/hosts.yml
 
 env:
   ANSIBLE_CONFIG: '{{.PLATFORM_DIR}}/ansible/ansible.cfg'
+  ANSIBLE_COLLECTIONS_PATH: '{{.COLLECTIONS_DIR}}'
   CVP_INSTANCE_DIR: '{{.INSTANCE_DIR}}'
   CVP_INSTANCE_NAME: '{{.INSTANCE_NAME}}'
+  CVP_PLATFORM_DIR: '{{.PLATFORM_DIR}}'
+  CVP_COLLECTIONS_DIR: '{{.COLLECTIONS_DIR}}'
 
 tasks:
   deps:
@@ -27,7 +38,7 @@ tasks:
     cmds:
       - >-
         mise exec -- ansible-galaxy collection install
-        -r {{.PLATFORM_DIR}}/ansible/requirements.yml -p {{.PLATFORM_DIR}}/ansible/collections
+        -r {{.PLATFORM_DIR}}/ansible/requirements.yml -p {{.COLLECTIONS_DIR}}
 
   tailscale-identity-init:
     desc: Establish the protected tailnet identity in empty state before imports

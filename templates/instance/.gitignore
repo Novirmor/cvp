@@ -1,4 +1,7 @@
 # Secrets, state, and plans never enter Git. Encrypted *.sops.yaml files do.
+# The installed platform is materialized from platform.lock, not committed.
+collections/
+.platform-state/
 *.tfstate
 *.tfstate.*
 *.tfplan

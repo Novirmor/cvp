@@ -52,21 +52,27 @@ class CollectionBuildTests(unittest.TestCase):
             "roles/k3s_server/tasks/main.yml", "roles/k3s_server/files/cvp-lifecycle.py",
             "roles/k3s_server/files/cvp-k3s-config-check.py", "roles/wireguard/files/cvp-wireguard-state",
             "roles/firewall/files/cvp-admin-access-check", "roles/base/tasks/activate-service.yml",
-            "defaults/inventory.yml", "defaults/group_vars/all.yml",
-            "playbooks/site.yml", "playbooks/verify.yml", "playbooks/probe.yml",
-            "playbooks/restore-k3s.yml", "playbooks/validate-inventory.yml",
-            "playbooks/onboard-preflight.yml", "playbooks/load-operator-config.yml",
+            "ansible/defaults/inventory.yml", "ansible/defaults/group_vars/all.yml",
+            "ansible/ansible.cfg", "ansible/requirements.yml",
+            "ansible/playbooks/site.yml", "ansible/playbooks/verify.yml", "ansible/playbooks/probe.yml",
+            "ansible/playbooks/restore-k3s.yml", "ansible/playbooks/validate-inventory.yml",
+            "ansible/playbooks/onboard-preflight.yml", "ansible/playbooks/load-operator-config.yml",
+            "scripts/cvp_node.py", "scripts/cvp_init.py", "scripts/cvp_instance.py",
+            "scripts/cvp_wrapper_common.py", "scripts/bootstrap-flux", "scripts/node-bootstrap.sh",
+            "scripts/cvp-topology.py", "scripts/cluster-manifest-inputs",
+            "tests/policy/helpers.rego", "tests/policy/secrets.rego", "VERSION",
             "cluster/infrastructure/policy/base/namespaces.yaml",
             "cluster/flux-system/reconciliation.yaml",
             "tofu/tailscale/resources.tf", "tofu/cloudflare/.terraform.lock.hcl", "tasks/ops.yml",
             "templates/instance/Taskfile.yml", "examples/instance/inventory/hosts.yml",
-            "ansible-requirements.yml",
         ]
         for name in expected:
             self.assertIn(name, members, f"missing from collection: {name}")
-        for forbidden in ("playbooks/test-labels.yml", "playbooks/test-templates.yml",
-                          "playbooks/tasks/test-invalid-node-tags.yml", "playbooks/test_node_patches.py",
-                          "scripts/cvp_node.py", "tofu/cloudflare/.terraform",
+        for forbidden in ("ansible/playbooks/test-labels.yml", "ansible/playbooks/test-templates.yml",
+                          "ansible/playbooks/tasks/test-invalid-node-tags.yml",
+                          "ansible/playbooks/test_node_patches.py",
+                          "scripts/test-init.py", "scripts/test_host_network_security.py",
+                          "tofu/cloudflare/.terraform",
                           "tofu/tailscale/.terraform"):
             self.assertFalse(any(name == forbidden or name.startswith(forbidden + "/") for name in members),
                              f"excluded content shipped: {forbidden}")
@@ -77,20 +83,21 @@ class CollectionBuildTests(unittest.TestCase):
                       "-p", str(collections), "--force"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         installed = collections / "ansible_collections/cvp/platform"
-        self.assertTrue((installed / "playbooks/site.yml").is_file())
+        self.assertTrue((installed / "ansible/playbooks/site.yml").is_file())
+        self.assertTrue((installed / "scripts/cvp_node.py").is_file())
         # Third-party collections the playbooks need, installed side by side
         # (--force: a satisfying copy elsewhere on the machine must not make
         # this isolated path incomplete).
         result = run(["ansible-galaxy", "collection", "install", "-r",
-                      str(installed / "ansible-requirements.yml"), "-p", str(collections), "--force"])
+                      str(installed / "ansible/requirements.yml"), "-p", str(collections), "--force"])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         empty_config = self.output / "empty.cfg"
         empty_config.write_text("# isolated defaults: no repository ansible.cfg\n")
         for playbook in ("site.yml", "verify.yml", "restore-k3s.yml", "validate-inventory.yml"):
             result = run(["ansible-playbook", "--syntax-check",
-                          "-i", str(installed / "defaults/inventory.yml"),
+                          "-i", str(installed / "ansible/defaults/inventory.yml"),
                           "-i", str(ROOT / "examples/instance/inventory/hosts.yml"),
-                          str(installed / "playbooks" / playbook)],
+                          str(installed / "ansible/playbooks" / playbook)],
                          cwd=str(self.output),
                          env={"PATH": __import__("os").environ["PATH"],
                               "HOME": __import__("os").environ.get("HOME", ""),

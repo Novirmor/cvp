@@ -21,22 +21,31 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = (ROOT / "VERSION").read_text().strip()
 NAMESPACE, NAME = "cvp", "platform"
-# Repository paths staged into the collection root.
+# Repository paths staged into the collection. The ansible/ subpaths keep
+# their repository shape so scripts and the shared taskfile resolve identically
+# against a checkout and against an installed collection; roles/ is the
+# collection-canonical copy ansible resolves `role:` names from.
 PAYLOAD = {
     "ansible/roles/": "roles/",
-    "ansible/playbooks/": "playbooks/",
-    "ansible/defaults/": "defaults/",
+    "ansible/playbooks/": "ansible/playbooks/",
+    "ansible/defaults/": "ansible/defaults/",
+    "ansible/ansible.cfg": "ansible/ansible.cfg",
+    "ansible/requirements.yml": "ansible/requirements.yml",
+    "scripts/": "scripts/",
     "cluster/": "cluster/",
+    "tests/policy/": "tests/policy/",
     "tofu/": "tofu/",
     "tasks/ops.yml": "tasks/ops.yml",
+    "VERSION": "VERSION",
     "templates/instance/": "templates/instance/",
     "examples/instance/": "examples/instance/",
-    "ansible/requirements.yml": "ansible-requirements.yml",
 }
 # Playbooks and playbook helper files that only the repository's own test
 # suite runs; they never belong in an installed collection.
 PLAYBOOK_EXCLUDES = {"test-labels.yml", "test-templates.yml", "test-host-network-security.yml",
                      "test_node_patches.py", "test-invalid-node-tags.yml"}
+# The repository's test harness never ships in the collection.
+SCRIPTS_EXCLUDES = ("test-", "test_", "conftest")
 EXCLUDE_NAMES = {"__pycache__", ".terraform", ".tofu", ".ruff_cache"}
 
 
@@ -44,18 +53,20 @@ def say(message):
     print(message, flush=True)
 
 
-def copy_tree(source, target):
+def copy_tree(source, target, exclude=None):
     for path in sorted(source.rglob("*")):
         if any(part in EXCLUDE_NAMES for part in path.parts):
             continue
         relative = path.relative_to(source)
+        if exclude is not None and exclude(relative):
+            continue
         if path.is_dir():
             (target / relative).mkdir(parents=True, exist_ok=True)
             continue
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, destination)
-        destination.chmod(0o644)
+        destination.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
 
 
 def stage(staging, commit):
@@ -63,14 +74,18 @@ def stage(staging, commit):
     for source, destination in PAYLOAD.items():
         source_path, target = ROOT / source, staging / destination
         if source_path.is_dir():
-            copy_tree(source_path, target)
+            exclude = ((lambda relative: relative.name.startswith(SCRIPTS_EXCLUDES))
+                       if source == "scripts/" else None)
+            copy_tree(source_path, target, exclude=exclude)
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source_path, target)
-    for path in sorted((staging / "playbooks").rglob("*")):
+            target.chmod(0o755 if source_path.stat().st_mode & 0o111 else 0o644)
+    playbooks = staging / "ansible/playbooks"
+    for path in sorted(playbooks.rglob("*")):
         if path.is_file() and path.name in PLAYBOOK_EXCLUDES:
             path.unlink()
-    for empty in sorted((staging / "playbooks").rglob("*"), reverse=True):
+    for empty in sorted(playbooks.rglob("*"), reverse=True):
         if empty.is_dir() and not any(empty.iterdir()):
             empty.rmdir()
     (staging / "galaxy.yml").write_text(

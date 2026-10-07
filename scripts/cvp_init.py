@@ -32,7 +32,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cvp_node as node_cli  # noqa: E402
 from cvp_node import NodeError, ROOT, require, say  # noqa: E402
 
-COLLECTIONS = ROOT / "ansible/collections/ansible_collections"
 FIRST_MESH_ADDRESS = "10.77.0.1"
 TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
@@ -91,10 +90,15 @@ class Wizard:
         self.step("Checking the controller")
         for tool in ("ansible-playbook", "ansible-inventory", "ssh", "scp", "ssh-keygen", "ssh-keyscan"):
             require(shutil.which(tool), f"{tool} is missing: run `mise install` and use `task init`")
-        if not (COLLECTIONS / "kubernetes/core").is_dir():
+        # Instances install collections beside their inventory; a platform
+        # checkout keeps them under ansible/collections.
+        collections = Path(os.environ.get("CVP_COLLECTIONS_DIR")
+                           or ROOT / "ansible/collections") / "ansible_collections"
+        if not (collections / "kubernetes/core").is_dir():
             say("Installing the pinned Ansible collections...")
-            node_cli.run(["ansible-galaxy", "collection", "install", "-r", str(ROOT / "ansible/requirements.yml"),
-                          "-p", str(ROOT / "ansible/collections")], env=node_cli.ansible_env())
+            node_cli.run(["ansible-galaxy", "collection", "install",
+                          "-r", str(ROOT / "ansible/requirements.yml"),
+                          "-p", str(collections.parent)], env=node_cli.ansible_env())
         key = Path(self.args.ssh_key or Path.home() / ".ssh/cvp-ops")
         require(key.is_absolute(), "--ssh-key must be an absolute path")
         if not key.exists():

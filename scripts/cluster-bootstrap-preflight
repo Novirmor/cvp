@@ -17,14 +17,17 @@ def git_environment(env=None):
     return clean
 
 
-def git(directory, *args, env=None, ssh_command=None, timeout=60):
+def git(directory, *args, env=None, ssh_command=None, timeout=60, check=True):
     clean = git_environment(env)
     if ssh_command is not None:
         clean["GIT_SSH_COMMAND"] = ssh_command
-    return subprocess.check_output(
+    result = subprocess.run(
         ["git", "-C", str(directory), *args], text=True, env=clean,
-        stderr=subprocess.PIPE, timeout=timeout,
-    ).strip()
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+    )
+    if check and result.returncode:
+        raise ValueError(f"git {' '.join(args[:3])} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 def source_branch(source, expected_url):
@@ -164,13 +167,21 @@ def fetch_platform(url, commit, destination, env):
 
 def check_platform_pin(root, snapshot, revision, pin, env):
     """The reviewed checkout and the published commit must both record the pinned platform."""
-    recorded = git(snapshot / ".git", "ls-tree", revision, "platform", env=env).split()
-    if recorded[:3] != ["160000", "commit", pin["commit"]]:
-        raise ValueError("the published platform/ submodule pointer differs from the Flux platform pin")
-    if git(root, "rev-parse", "HEAD:platform", env=env) != pin["commit"]:
-        raise ValueError("the reviewed local platform/ pointer differs from the Flux platform pin")
-    if git(root / "platform", "rev-parse", "HEAD", env=env) != pin["commit"]:
-        raise ValueError("the local platform/ checkout is not at the pinned commit; run git submodule update")
+    if git(snapshot / ".git", "cat-file", "-e", f"{revision}:.gitmodules", env=env, check=False):
+        raise ValueError("this instance still pins its platform with a git submodule; "
+                         "recreate it from a current platform with `task new-instance`")
+    lock = git(snapshot / ".git", "show", f"{revision}:platform.lock", env=env, check=False)
+    reviewed = (root / "platform.lock").read_text() if (root / "platform.lock").is_file() else ""
+    for label, text in (("published", lock), ("reviewed", reviewed)):
+        if not text:
+            raise ValueError(f"the {label} commit has no platform.lock; commit it together with "
+                             "cluster/flux-system/platform-source.yaml")
+        fields = dict(line.split(" ", 1) for line in text.splitlines()
+                      if line.strip() and not line.startswith("#"))
+        if fields.get("commit") != pin["commit"]:
+            raise ValueError(f"the {label} platform.lock commit differs from the Flux platform pin")
+        if fields.get("url") != pin["url"]:
+            raise ValueError(f"the {label} platform.lock URL differs from the Flux platform pin")
 
 
 def prepare(root, snapshot, url, command):

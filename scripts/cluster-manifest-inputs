@@ -119,10 +119,18 @@ def check_build_inputs(root):
 
 
 def platform_checkout(path):
-    """A platform checkout and the commit it is at (the instance's platform/ submodule)."""
+    """A platform tree and the commit it is at: an installed cvp.platform
+    collection (whose PLATFORM_COMMIT stamp is authoritative — the collection
+    may live inside the instance's own git repository) or a git checkout (a
+    platform repository or a CI snapshot)."""
     root = Path(path).resolve()
-    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-    return {"root": root, "commit": commit}
+    stamp = root / "PLATFORM_COMMIT"
+    if stamp.is_file():
+        return {"root": root, "commit": stamp.read_text().strip()}
+    commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, capture_output=True)
+    require(commit.returncode == 0,
+            f"{root} is neither an installed cvp.platform collection nor a git checkout")
+    return {"root": root, "commit": commit.stdout.strip()}
 
 
 def check_platform_source(obj, platform):

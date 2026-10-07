@@ -37,7 +37,7 @@ done
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 snapshot="$tmp_dir/snapshot"
-python3 scripts/cluster-bootstrap-preflight prepare --snapshot "$snapshot"
+python3 "$root_dir"/scripts/cluster-bootstrap-preflight prepare --snapshot "$snapshot"
 
 kubectl config get-contexts -o name | grep -Fqx "$FLUX_KUBE_CONTEXT" || {
   printf 'Kubernetes context does not exist: %s\n' "$FLUX_KUBE_CONTEXT" >&2
@@ -46,7 +46,7 @@ kubectl config get-contexts -o name | grep -Fqx "$FLUX_KUBE_CONTEXT" || {
 
 kubectl --context="$FLUX_KUBE_CONTEXT" cluster-info >/dev/null
 
-python3 scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
+python3 "$root_dir"/scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
 kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/namespace.yaml"
 kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/gotk-components.yaml"
 kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system wait \
@@ -61,14 +61,14 @@ kubectl --context="$FLUX_KUBE_CONTEXT" -n flux-system create secret generic sops
   --from-file=age.agekey="$SOPS_AGE_KEY_FILE" --dry-run=client -o yaml | \
   kubectl --context="$FLUX_KUBE_CONTEXT" apply -f -
 
-python3 scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
+python3 "$root_dir"/scripts/cluster-bootstrap-preflight check-branch --snapshot "$snapshot"
 kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/source.yaml"
 kubectl --context="$FLUX_KUBE_CONTEXT" apply -f "$snapshot/cluster/flux-system/sync.yaml"
-python3 scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
+python3 "$root_dir"/scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
 # An instance's ingress layer comes from its pinned platform tree.
 ingress_root="$snapshot"
 [[ ! -d "$snapshot/platform/cluster" ]] || ingress_root="$snapshot/platform"
-python3 scripts/cluster-ingress-ready --context "$FLUX_KUBE_CONTEXT" --root "$ingress_root" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
-python3 scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
+python3 "$root_dir"/scripts/cluster-ingress-ready --context "$FLUX_KUBE_CONTEXT" --root "$ingress_root" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
+python3 "$root_dir"/scripts/cluster-bootstrap-ready --context "$FLUX_KUBE_CONTEXT" --snapshot "$snapshot" --timeout "$FLUX_BOOTSTRAP_TIMEOUT"
 
 printf 'Flux bootstrap complete for context %s.\n' "$FLUX_KUBE_CONTEXT"
