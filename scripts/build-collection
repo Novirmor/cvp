@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Build the cvp.platform Ansible collection from this platform checkout.
+
+The collection is the platform's whole runtime payload — roles, playbooks,
+platform defaults, the Flux cluster layers, the OpenTofu roots, the shared
+task surface, and the instance templates — staged from the repository layout
+into a collection tree and packed by `ansible-galaxy collection build`.
+Instance repositories install the tarball and pin it in `platform.lock`;
+the operator CLI ships separately as the `cvp-platform` Python package.
+
+The tarball carries PLATFORM_VERSION and PLATFORM_COMMIT files so an
+installation can prove which platform release it is.
+"""
+import argparse
+import hashlib
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+VERSION = (ROOT / "VERSION").read_text().strip()
+NAMESPACE, NAME = "cvp", "platform"
+# Repository paths staged into the collection root.
+PAYLOAD = {
+    "ansible/roles/": "roles/",
+    "ansible/playbooks/": "playbooks/",
+    "ansible/defaults/": "defaults/",
+    "cluster/": "cluster/",
+    "tofu/": "tofu/",
+    "tasks/ops.yml": "tasks/ops.yml",
+    "templates/instance/": "templates/instance/",
+    "examples/instance/": "examples/instance/",
+    "ansible/requirements.yml": "ansible-requirements.yml",
+}
+# Playbooks and playbook helper files that only the repository's own test
+# suite runs; they never belong in an installed collection.
+PLAYBOOK_EXCLUDES = {"test-labels.yml", "test-templates.yml", "test-host-network-security.yml",
+                     "test_node_patches.py", "test-invalid-node-tags.yml"}
+EXCLUDE_NAMES = {"__pycache__", ".terraform", ".tofu", ".ruff_cache"}
+
+
+def say(message):
+    print(message, flush=True)
+
+
+def copy_tree(source, target):
+    for path in sorted(source.rglob("*")):
+        if any(part in EXCLUDE_NAMES for part in path.parts):
+            continue
+        relative = path.relative_to(source)
+        if path.is_dir():
+            (target / relative).mkdir(parents=True, exist_ok=True)
+            continue
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, destination)
+        destination.chmod(0o644)
+
+
+def stage(staging, commit):
+    (staging / "roles").mkdir(parents=True)
+    for source, destination in PAYLOAD.items():
+        source_path, target = ROOT / source, staging / destination
+        if source_path.is_dir():
+            copy_tree(source_path, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, target)
+    for path in sorted((staging / "playbooks").rglob("*")):
+        if path.is_file() and path.name in PLAYBOOK_EXCLUDES:
+            path.unlink()
+    for empty in sorted((staging / "playbooks").rglob("*"), reverse=True):
+        if empty.is_dir() and not any(empty.iterdir()):
+            empty.rmdir()
+    (staging / "galaxy.yml").write_text(
+        f"namespace: {NAMESPACE}\n"
+        f"name: {NAME}\n"
+        f"version: \"{VERSION}\"\n"
+        "readme: README.md\n"
+        "authors:\n"
+        "  - cvp platform\n"
+        "license:\n"
+        "  - MIT\n"
+        "description: Host, network, and cluster convergence for a small K3s fleet.\n"
+        "repository: https://github.com/novirmor/cvp\n"
+        "dependencies: {}\n"
+    )
+    (staging / "README.md").write_text(
+        f"# {NAMESPACE}.{NAME}\n\n"
+        f"Platform release {VERSION} built from commit {commit}.\n"
+        "See the platform repository for documentation and runbooks.\n"
+    )
+    (staging / "PLATFORM_VERSION").write_text(VERSION + "\n")
+    (staging / "PLATFORM_COMMIT").write_text(commit + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--output", default="dist", help="output directory (default: dist)")
+    parser.add_argument("--commit", help="platform commit to stamp (default: this checkout's HEAD)")
+    parser.add_argument("--keep-stage", action="store_true",
+                        help="keep the staged collection tree for inspection")
+    args = parser.parse_args()
+    output = Path(args.output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    if args.commit:
+        commit = args.commit.strip()
+    else:
+        commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    staging = output / "stage" / f"{NAMESPACE}-{NAME}"
+    shutil.rmtree(staging.parent, ignore_errors=True)
+    stage(staging, commit)
+    subprocess.run(["ansible-galaxy", "collection", "build", str(staging),
+                    "--output-path", str(output), "--force"], check=True)
+    tarball = output / f"{NAMESPACE}-{NAME}-{VERSION}.tar.gz"
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    if not args.keep_stage:
+        shutil.rmtree(staging.parent, ignore_errors=True)
+    say(f"collection: {tarball}")
+    say(f"version:    {VERSION}  commit: {commit}")
+    say(f"sha256:     {digest}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

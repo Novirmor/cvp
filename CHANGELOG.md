@@ -13,6 +13,19 @@ deployment; see the open items and exit gates in `PLAN.md`.
 
 ### Added
 
+- **Distribution artifacts for the platform/instance split.** `task
+  build-collection` (`scripts/build-collection`) stages and packs the
+  `cvp.platform` Ansible collection — roles, playbooks, platform defaults,
+  the Flux cluster layers, OpenTofu roots, the shared task surface, and the
+  instance templates — stamped with `PLATFORM_VERSION` and `PLATFORM_COMMIT`.
+  `pyproject.toml` builds the `cvp-platform` wheel exposing the operator CLI
+  entry points (`cvp-init`, `cvp-node`, `cvp-instance`, `cvp-export-kubeconfig`,
+  `cvp-tofu`) from `scripts/`. `VERSION` is the single version source, kept in
+  lockstep with the CHANGELOG by `scripts/test-collection-build.py`, which also
+  proves the collection installs and its playbooks syntax-check from the
+  installed collection path. These artifacts are the foundation for pinning an
+  instance to one platform release across every channel (Ansible collection,
+  Python CLI, taskfile, and Flux source) without a git submodule.
 - **Platform and instance repositories.** This repository is now a reusable
   platform; each operator runs an instance repository created with
   `task new-instance -- ../my-platform --platform-url https://...`:

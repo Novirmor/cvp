@@ -18,6 +18,11 @@ tasks:
     cmds:
       - mise exec -- python3 -B scripts/cvp_instance.py new {{.CLI_ARGS}}
 
+  build-collection:
+    desc: Build the cvp.platform collection tarball and print its sha256
+    cmds:
+      - mise exec -- python3 -B scripts/build-collection {{.CLI_ARGS}}
+
   default:
     cmds:
       - task: lint
@@ -79,6 +84,7 @@ tasks:
       - mise exec -- python3 -B scripts/test-onboarding-path.py -v
       - mise exec -- python3 -B scripts/test-verification.py
       - mise exec -- python3 -B scripts/test-backup-config.py
+      - mise exec -- python3 -B scripts/test-collection-build.py
       - mise exec -- python3 -B scripts/test-k3s-lifecycle.py -v
       - >-
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook

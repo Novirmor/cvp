@@ -1,0 +1,37 @@
+# The operator CLI half of the platform. The Ansible/runtime half ships as the
+# cvp.platform collection built by scripts/build-collection; instances pin both
+# to the same version through platform.lock.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cvp-platform"
+description = "Operator CLI for the cvp platform: guided node setup, guarded joins, instance and OpenTofu operations"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "cvp platform" }]
+dependencies = ["pyyaml"]
+dynamic = ["version"]
+
+[project.scripts]
+cvp-init = "cvp_init:main"
+cvp-node = "cvp_node:main"
+cvp-instance = "cvp_instance:main"
+cvp-export-kubeconfig = "cvp_export_kubeconfig:main"
+cvp-tofu = "cvp_tofu_operation:main"
+
+[tool.setuptools]
+package-dir = { "" = "scripts" }
+py-modules = [
+    "cvp_init",
+    "cvp_node",
+    "cvp_instance",
+    "cvp_wrapper_common",
+    "cvp_export_kubeconfig",
+    "cvp_tofu_operation",
+]
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }

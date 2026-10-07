@@ -62,3 +62,7 @@ crash.*.log
 
 # Per-instance OpenTofu data directories (TF_DATA_DIR)
 .tofu/
+
+# Collection and wheel build output (scripts/build-collection, uv build)
+dist/
+scripts/cvp_platform.egg-info/
