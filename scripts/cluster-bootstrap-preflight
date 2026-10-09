@@ -186,12 +186,18 @@ def check_platform_pin(root, snapshot, revision, pin, env):
 
 def prepare(root, snapshot, url, command):
     inputs = runpy.run_path(str(Path(__file__).resolve().parent / "cluster-manifest-inputs"))
-    source = inputs["documents"]((root / "cluster/flux-system/source.yaml").read_text())[0]
-    branch = source_branch(source, url)
+    try:
+        source = inputs["documents"]((root / "cluster/flux-system/source.yaml").read_text())[0]
+        branch = source_branch(source, url)
+    except ValueError as error:
+        raise ValueError(f"local bootstrap source: {error}") from error
     revision = verify_published(root, url, branch, os.environ, ssh_command=command, snapshot=snapshot)
     fetched = inputs["documents"]((snapshot / "cluster/flux-system/source.yaml").read_text())[0]
-    if source_branch(fetched, url) != branch:
-        raise ValueError("fetched source branch differs from the reviewed branch")
+    try:
+        if source_branch(fetched, url) != branch:
+            raise ValueError("fetched source branch differs from the reviewed branch")
+    except ValueError as error:
+        raise ValueError(f"published bootstrap source: {error}") from error
     pin = platform_pin(snapshot / "cluster", inputs)
     platform = None
     if pin is not None:
