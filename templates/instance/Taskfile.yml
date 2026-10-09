@@ -18,6 +18,12 @@ includes:
 tasks:
   platform-install:
     desc: Install (or reinstall) the platform release pinned in platform.lock
+    env: &instance-env
+      # The included taskfile's environment resolves without these include
+      # vars in this file's own tasks; pin them explicitly.
+      CVP_INSTANCE_DIR: '{{.ROOT_DIR}}'
+      CVP_PLATFORM_DIR: '{{.ROOT_DIR}}/collections/ansible_collections/cvp/platform'
+      CVP_COLLECTIONS_DIR: '{{.ROOT_DIR}}/collections'
     cmds:
       - |
         commit="$(sed -n 's/^commit //p' platform.lock)"
@@ -26,6 +32,7 @@ tasks:
 
   validate:
     desc: Credential-free checks for this instance (platform pin, cluster manifests, inventory)
+    env: *instance-env
     cmds:
       - >-
         mise exec -- python3 -B
@@ -33,6 +40,7 @@ tasks:
 
   platform-upgrade:
     desc: Move to another platform release and refresh the pin (e.g. task platform-upgrade -- v0.2.0)
+    env: *instance-env
     cmds:
       - >-
         mise exec -- python3 -B
