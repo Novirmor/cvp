@@ -31,7 +31,18 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates/instance"
-VERSION = (ROOT / "VERSION").read_text().strip()
+
+
+def _version():
+    """A checkout reads VERSION; an installed wheel asks its metadata."""
+    try:
+        return (ROOT / "VERSION").read_text().strip()
+    except FileNotFoundError:
+        from importlib.metadata import version
+        return version("cvp-platform")
+
+
+VERSION = _version()
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 PLATFORM_SOURCE = "cvp-platform"

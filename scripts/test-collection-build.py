@@ -144,6 +144,21 @@ class WheelBuildTests(unittest.TestCase):
         self.assertIn(f"[{VERSION}]", header,
                       "VERSION must match the unreleased CHANGELOG version")
 
+    def test_installed_entry_points_run_outside_the_repository(self):
+        # The uvx bootstrap path: the wheel installed standalone, with no
+        # repository checkout beside it. Import-time file reads must fall back
+        # to package metadata.
+        environment = self.output / "toolvenv"
+        result = run(["uv", "venv", str(environment), "--python", sys.executable])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(["uv", "pip", "install", "--python", str(environment / "bin/python"), str(self.wheel)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run([str(environment / "bin/cvp-instance"), "--help"], cwd=str(self.output))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("cvp-instance", result.stdout)
+        result = run([str(environment / "bin/cvp-node"), "--help"], cwd=str(self.output))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
