@@ -29,6 +29,8 @@ tasks:
 
   lint:
     desc: Run repository formatting and lint checks
+    deps:
+      - deps
     cmds:
       - mise exec -- ./scripts/lint-worktree
       - ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-lint ansible
