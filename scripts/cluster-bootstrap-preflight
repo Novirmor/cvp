@@ -37,7 +37,7 @@ def source_branch(source, expected_url):
         raise ValueError("expected the flux-system GitRepository")
     spec = source["spec"]
     if spec.get("url") != expected_url:
-        raise ValueError(f"source URL must equal {expected_url}")
+        raise ValueError(f"source URL must equal {expected_url}, found {spec.get('url')!r}")
     if spec.get("suspend") is not False or spec.get("secretRef") != {"name": "flux-system"}:
         raise ValueError("bootstrap source must explicitly set suspend: false and use the flux-system deploy key")
     if any(spec.get(key) for key in ("ignore", "include", "recurseSubmodules", "sparseCheckout")):
