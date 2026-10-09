@@ -18,8 +18,8 @@ vars:
   # An instance passes INSTANCE_NAME through its include; the platform
   # repository runs against the bundled, empty example instance.
   INSTANCE_DIR: >-
-    {{.CVP_INSTANCE_DIR | default (ternary .ROOT_DIR (printf "%s/examples/instance" .ROOT_DIR)
-    (eq .PLATFORM_DIR .ROOT_DIR))}}
+    {{.CVP_INSTANCE_DIR | default (ternary (printf "%s/examples/instance" .ROOT_DIR)
+    .ROOT_DIR (eq .PLATFORM_DIR .ROOT_DIR))}}
   INSTANCE_NAME: '{{.INSTANCE_NAME | default ""}}'
   INVENTORY: >-
     -i {{.PLATFORM_DIR}}/ansible/defaults/inventory.yml -i {{.INSTANCE_DIR}}/inventory/hosts.yml
