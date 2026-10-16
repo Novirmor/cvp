@@ -223,13 +223,6 @@ tasks:
     cmds:
       - mise exec -- {{.PLATFORM_DIR}}/scripts/tofu-operation cloudflare state-list
 
-  cloudflare-state-pull:
-    desc: Snapshot Cloudflare state to an absolute path outside the repository
-    env:
-      TF_DATA_DIR: '{{.INSTANCE_DIR}}/.tofu/cloudflare'
-    cmds:
-      - mise exec -- {{.PLATFORM_DIR}}/scripts/tofu-operation cloudflare state-pull {{.CLI_ARGS}}
-
   tailscale-init:
     desc: >-
       Initialize the Tailscale root against its backend
@@ -283,9 +276,9 @@ tasks:
     cmds:
       - mise exec -- {{.PLATFORM_DIR}}/scripts/tofu-operation tailscale state-list
 
-  tailscale-state-pull:
-    desc: Snapshot Tailscale state to an absolute path outside the repository
+  tailscale-export-enrollment-key:
+    desc: Export one generated enrollment key straight into a SOPS/age encrypted JSON file
     env:
       TF_DATA_DIR: '{{.INSTANCE_DIR}}/.tofu/tailscale'
     cmds:
-      - mise exec -- {{.PLATFORM_DIR}}/scripts/tofu-operation tailscale state-pull {{.CLI_ARGS}}
+      - mise exec -- {{.PLATFORM_DIR}}/scripts/tofu-operation tailscale export-enrollment-key {{.CLI_ARGS}}

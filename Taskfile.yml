@@ -78,6 +78,7 @@ tasks:
       - mise exec -- ./scripts/test-prepare-access
       - mise exec -- python3 -B scripts/test-wrapper-safety.py
       - mise exec -- python3 -B scripts/test-tofu-identity.py
+      - mise exec -- python3 -B scripts/test-tofu-encryption.py
       - mise exec -- python3 -B scripts/test-storage-safety.py
       - mise exec -- python3 -B scripts/test-operator-config.py
       - mise exec -- python3 -B scripts/test-kubeconfig-export.py -v
@@ -97,10 +98,14 @@ tasks:
         if mise exec -- ./scripts/tofu-operation cloudflare plan -var-file=/tmp/vars; then
           echo "unsafe tofu plan unexpectedly succeeded" >&2
           exit 1
+        else
+          : # expected refusal; a failed condition alone is not a successful task
         fi
         if mise exec -- ./scripts/tofu-operation cloudflare apply; then
           echo "unsafe tofu apply unexpectedly succeeded" >&2
           exit 1
+        else
+          : # expected refusal
         fi
       - |
         for module in tofu/cloudflare tofu/tailscale; do

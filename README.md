@@ -52,12 +52,17 @@ You need a controller (your machine) and one host with a public IP.
    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
    ```
 
-4. **Tailscale admin console:** create an auth key tagged `tag:k3s` (and
-   `tag:k3s-ingress` for the first host).
-5. **In your instance**, run the guided setup and answer its questions:
+4. **Tailscale:** inventory and adopt the existing tailnet policy first. Use the
+   [encrypted local OpenTofu workflow](docs/runbooks/tofu.md#enrollment-keys)
+   to generate a one-use node key tagged `tag:k3s` (and `tag:k3s-ingress` for
+   the selected ingress host). The guided setup still requires a temporary
+   private plaintext auth-key file; do not commit or retain it after use.
+5. **In your instance**, decrypt the exported SOPS key into a restricted tmpfs
+   file for the duration of enrollment (see [key staging](docs/runbooks/tofu.md#enrollment-keys)),
+   then run the guided setup and answer its questions:
 
    ```sh
-   task init
+   task init -- --tailscale-auth-key-file /dev/shm/YOUR-PRIVATE-DIR/node1.ts-authkey
    ```
 
 It creates your operator SSH key if needed, verifies the host key against the
@@ -65,7 +70,8 @@ fingerprint, detects the address you SSH from (the only address that may SSH
 to the node afterwards), bootstraps the host, writes and validates the
 inventory, joins the node, and exports a kubeconfig that reaches the API over
 Tailscale. It shows every plan before writing and is safe to rerun; after a
-failure, fix the reported problem and run `task init` again.
+failure, fix the reported problem and run `task init` again. The wizard does
+not save a pasted key; remove the temporary file after use.
 
 **To add a host**, install Debian on it and run `task init` again. Every answer
 can also be given as a flag, for example
@@ -129,8 +135,10 @@ all credential/identity placeholders must be replaced.
 - K3s owns cluster networking, service discovery, ingress, workloads, storage
   declarations, and application lifecycle.
 - Flux reconciles in-cluster desired state from Git.
-- OpenTofu owns only external Cloudflare and Tailscale policy resources.
-- An operator-chosen external secrets store holds credentials and recovery keys.
+- OpenTofu owns Cloudflare DNS and Tailscale policy/DNS and enrollment keys,
+  with encrypted local state and plans by default.
+- SOPS/age holds persisted operator credentials and recovery keys; an external
+  secrets store is optional and must also be encrypted if used.
 - Recovery, not uninterrupted high availability, is the availability model.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) and [PLAN.md](PLAN.md).

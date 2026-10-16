@@ -1,9 +1,10 @@
-# OpenTofu External Providers
+# OpenTofu External Providers (Encrypted Local State)
 
 The two roots under `tofu/` have separate state boundaries:
 
 - `tofu/cloudflare` owns explicitly declared public Cloudflare DNS records.
-- `tofu/tailscale` owns the complete Tailscale ACL policy and DNS configuration.
+- `tofu/tailscale` owns the complete Tailscale ACL policy, DNS configuration,
+  and explicitly requested one-use node enrollment keys.
 
 Neither root creates Kubernetes resources or configures hosts. K3s cluster
 networking, WireGuard ports, host firewall rules, and Tailscale installation
@@ -11,26 +12,38 @@ remain owned by the other repository layers described in `ARCHITECTURE.md`.
 
 ## Credentials
 
-Provide credentials through the environment or an external secret manager. Do
-not put them in `*.tfvars`, backend files, shell history, or this repository.
+Use SOPS/age-encrypted environment files for provider credentials and each
+root's **separate high-entropy** `TF_VAR_state_passphrase`. Keep the age private
+key outside Git with an offline recovery copy. A remote secret store is optional;
+if later adopted, encrypt its contents as well. Never put secrets in `*.tfvars`,
+backend files, arguments, shell history, or unencrypted local state backups.
+Prefer a separate operator age identity from the Flux cluster-decryption
+identity; the latter must not be required just to recover OpenTofu state.
 
 - Cloudflare: `CLOUDFLARE_API_TOKEN`, scoped to the required zone with DNS Read
   and DNS Write permissions.
 - Tailscale: `TAILSCALE_API_KEY`, or the provider's OAuth environment variables
   with permissions to manage the tailnet policy and DNS configuration.
-- S3 backend: use environment credentials or workload credentials. Guarded
-  operations disable shared AWS configuration/credential files and reject
-  profiles and explicit shared-file overrides. Do not select the backend via
-  `AWS_ENDPOINT_URL*` or other AWS endpoint environment variables: put the
-  region and any S3-compatible endpoint explicitly in the backend configuration.
+
+OpenTofu uses PBKDF2 and AES-GCM with `enforced = true` for **both state and
+saved plans**. SOPS protects the passphrase and provider credentials, not the
+state itself; a `0600` plaintext `.tfstate` is **not acceptable**. Do not lose
+the SOPS age key or the root passphrase: either loss makes state unrecoverable.
+For example, create a private SOPS JSON file with `TF_VAR_state_passphrase`
+and the root's provider API credential, then run the tasks under
+`sops exec-env /absolute/path/to/root.sops.json 'task <root>-plan -- ...'`.
+Set `SOPS_AGE_KEY_FILE` to the backed-up age private key path. Never invoke
+`tofu state pull > file`: it **decrypts** state to stdout.
 
 ## First Use
 
 Run each root independently. Do not initialize one root from the other root's
-directory or reuse its backend key. The committed dependency locks require
+directory or reuse its state path or passphrase. The committed dependency locks require
 OpenTofu 1.12 or later (and before 2.0).
 
 ```sh
+# Copy the local backend example OUTSIDE Git, replace its absolute paths, and
+# create the private state directory before init. Keep it backed up encrypted.
 task cloudflare-init -- -backend-config=/path/outside/repository/cloudflare-backend.hcl
 # Prepare the variables file outside the repository:
 #   cp tofu/cloudflare/examples/terraform.tfvars.example \
@@ -38,15 +51,15 @@ task cloudflare-init -- -backend-config=/path/outside/repository/cloudflare-back
 # Replace the zone and documentation addresses in the copied variables file.
 mise exec -- tofu fmt -check tofu/cloudflare
 task test
-task cloudflare-plan -- \
+SOPS_AGE_KEY_FILE=/path/to/age-key.txt sops exec-env /path/to/cloudflare.sops.json 'task cloudflare-plan -- \
   -var-file=/path/outside/repository/cloudflare.tfvars \
-  -out=/path/outside/repository/plans/cloudflare-YYYYMMDD.tfplan
-task cloudflare-show -- \
-  /path/outside/repository/plans/cloudflare-YYYYMMDD.tfplan
+  -out=/path/outside/repository/plans/cloudflare-YYYYMMDD.tfplan'
+SOPS_AGE_KEY_FILE=/path/to/age-key.txt sops exec-env /path/to/cloudflare.sops.json 'task cloudflare-show -- \
+  /path/outside/repository/plans/cloudflare-YYYYMMDD.tfplan'
 ```
 
 Repeat for Tailscale with `task tailscale-init`, `task tailscale-plan`, and its
-own backend file, state key, and variable file. The example identity values
+own backend file, state path, passphrase, and variable file. The example identity values
 are placeholders and must be replaced with real Tailscale identities.
 Before the first Tailscale imports or normal plan, establish its durable tailnet
 identity using the adoption procedure below.
@@ -59,11 +72,15 @@ public addresses. Enable the example A record only if that node has a public
 IPv4 address; include an AAAA record only if it has public IPv6. Review every
 declared address family before planning.
 
+Run `tailscale-identity-init`, imports, plan/show/apply, and key export under
+the matching `sops exec-env` file as well; without that root's passphrase,
+identity establishment and imports cannot read encrypted state.
+
 Review the saved plan before applying. Apply that exact reviewed artifact; do
 not run a second plan+apply, which creates and applies a new plan instead.
 
 ```sh
-task cloudflare-apply -- /path/outside/repository/plans/cloudflare-YYYYMMDD.tfplan
+SOPS_AGE_KEY_FILE=/path/to/age-key.txt sops exec-env /path/to/cloudflare.sops.json 'task cloudflare-apply -- /path/outside/repository/plans/cloudflare-YYYYMMDD.tfplan'
 ```
 
 The tasks require saved plan paths to be absolute and outside the repository;
@@ -94,6 +111,9 @@ backend/workspace and follow a reviewed state-recovery procedure before any
 further mutation. If OpenTofu could not write that file, its raw-state fallback
 is in the private `stderr.log` instead. Preserve the entire directory until
 recovery is complete, and do not paste these logs into tickets or CI output.
+The wrapper's failure logs are private but **not SOPS-encrypted** and can contain
+secrets (including raw-state fallbacks); encrypt retained recovery material for
+off-host storage. Never treat `0600` alone as encryption.
 
 Keep the plan's adjacent `.cvp.json` binding file with the plan. Show and apply
 verify the artifact hash, repository root, initialized backend configuration,
@@ -103,13 +123,11 @@ review. This binding detects accidental mix-ups; it does not certify human
 review or protect against an operator who can rewrite both files.
 Binding format 2 also requires regeneration of older format-1 plans. Backend
 endpoint/shared-configuration overrides are rejected rather than silently
-changing the effective destination behind the binding. Local backends are
-supported for isolated testing only with explicit absolute external `path` and
-`workspace_dir` settings; operational roots use S3.
-If a root was initialized using an environment-selected endpoint or profile,
-review and reinitialize its explicit backend configuration and credential
-source before regenerating plans. Merely unsetting a routing variable can
-select a different backend and is not a migration procedure.
+changing the effective destination behind the binding. Local backends are the
+operational default and require explicit absolute external `path` and
+`workspace_dir` settings. The backend initialization cache is not the state
+file. Back up each encrypted state file and its SOPS-protected passphrase
+separately. Remote backends are an optional, reviewed future migration.
 
 The wrapper rejects `TF_CLI_ARGS*`, targeted/excluded plans, mode overrides,
 unlocked operations, and additional output flags. Pass supported variable,
@@ -118,9 +136,50 @@ retains OpenTofu's exit status 2 for a successful plan containing changes.
 `TF_LOG*` and `TOFU_LOG*` settings are rejected too, including `TF_LOG_PATH`:
 ambient debug logging must not introduce an unvalidated output destination.
 
+## Enrollment Keys
+
+After inventorying and importing the existing tailnet ACL and DNS, add only
+the next node to `enrollment_keys` in the Tailscale variables file. For example,
+`eve282 = { tags = ["tag:k3s", "tag:k3s-ingress"] }` if Eve is confirmed as
+the ingress host. The provider creates a preauthorized, single-use key with a
+one-hour expiry; it lives in encrypted OpenTofu state. Review the bound plan
+before applying it. Keys are **not** auto-recreated after use or expiry; rotate
+deliberately after review. An OAuth/API credential authorized to create keys
+and assign the selected tags is still required for the provider.
+
+Export only that key directly to a SOPS/age-encrypted external JSON file:
+
+```sh
+SOPS_AGE_KEY_FILE=/path/to/age-key.txt sops exec-env /path/to/tailscale.sops.json \
+  'task tailscale-export-enrollment-key -- eve282 /private/eve282.sops.json age1YOUR_PUBLIC_RECIPIENT'
+```
+
+The export never prints the key or writes a plaintext key file. The current
+`node-join`/`init` interfaces need a private plaintext auth-key file at join
+time. Stage it in a short-lived, restricted tmpfs directory and remove it
+immediately after join. In one Bash shell (replace node, recipient, and endpoint):
+
+```sh
+set -euo pipefail
+umask 077
+export SOPS_AGE_KEY_FILE=/path/to/age-key.txt
+key_dir="$(mktemp -d /dev/shm/cvp-enroll.XXXXXX)"
+trap 'rm -f "$key_dir/auth-key"; rmdir "$key_dir"' EXIT
+sops decrypt /private/node1.sops.json |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["TAILSCALE_AUTH_KEY"])' > "$key_dir/auth-key"
+task init -- --address node.example.net --ssh-port 12345 \
+  --tailscale-auth-key-file "$key_dir/auth-key"
+```
+
+`/dev/shm` must actually be tmpfs on the controller; check before staging.
+The wizard will not paste or persist a new key itself. Do **not** commit the
+encrypted operator JSON to the cluster GitOps path:
+it is an operator credential, not a Kubernetes Secret.
+
 ## Deletion Safeguards
 
-All Cloudflare records, the Tailscale ACL, and the Tailscale DNS configuration
+All Cloudflare records, the Tailscale ACL, the Tailscale DNS configuration, and
+enrollment keys
 use `lifecycle.prevent_destroy`. The guard exists only while the resource block
 remains in configuration:
 
@@ -225,56 +284,13 @@ scheduled and CI applies, revoke or pause any other apply path, and keep it
 frozen until the new root has applied cleanly and the old state no longer owns
 the resources. Two active states must never manage the same external object.
 
-For a complete root whose backend location alone is changing, initialize from
-that same root with the new backend configuration and let OpenTofu copy the
-whole state. These raw commands bypass the guarded tasks, so export the same
-per-instance state directory the tasks use
-(`TF_DATA_DIR=$INSTANCE_DIR/.tofu/<root>`, where `INSTANCE_DIR` is the instance
-repository) or they will initialize a fresh backend in the platform checkout:
-
-```sh
-export TF_DATA_DIR=/path/to/instance/.tofu/cloudflare
-tofu init -migrate-state -backend-config=/path/outside/repository/new-backend.hcl
-tofu state pull > /path/outside/repository/state-backups/root-after-migration.tfstate
-```
-
-Do not use `-migrate-state` to split a shared old state into these two roots.
-For a split, make local state artifacts while the old automation is frozen,
-move each address into the destination artifact, then push the destination and
-remove the source ownership. Initialize both the old root and the destination
-root against their real backends before these commands, and keep the same
-`TF_DATA_DIR` export (or replace `tofu/cloudflare` with the platform root's
-absolute path) so these raw commands reach the initialized backend:
-
-```sh
-# Snapshot both remote states before changing either one.
-tofu -chdir=/path/to/old/root state pull \
-  > /path/outside/repository/state-backups/old-before-handoff.tfstate
-tofu -chdir=tofu/cloudflare state pull \
-  > /path/outside/repository/state-backups/cloudflare-before-handoff.tfstate
-
-# Preserve immutable snapshots; state mv rewrites its input and output artifacts.
-cp /path/outside/repository/state-backups/old-before-handoff.tfstate \
-  /path/outside/repository/state-backups/old-working.tfstate
-cp /path/outside/repository/state-backups/cloudflare-before-handoff.tfstate \
-  /path/outside/repository/state-backups/cloudflare-working.tfstate
-
-# Move one address between local working artifacts. Repeat for every record.
-tofu state mv \
-  -state=/path/outside/repository/state-backups/old-working.tfstate \
-  -state-out=/path/outside/repository/state-backups/cloudflare-working.tfstate \
-  'module.external.cloudflare_dns_record.public["ingress_a"]' \
-  'cloudflare_dns_record.public["ingress_a"]'
-
-# Upload destination ownership, then remove only that address from the old backend.
-tofu -chdir=tofu/cloudflare state push \
-  /path/outside/repository/state-backups/cloudflare-working.tfstate
-tofu -chdir=/path/to/old/root state rm \
-  'module.external.cloudflare_dns_record.public["ingress_a"]'
-```
-
-Use the actual old address shown by `tofu state list`; do not copy the example
-module path blindly. Run `tofu state list` in both roots after each move.
+Never use `tofu state pull > file`, `state -state-out=...`, or the former
+`task <root>-state-pull`: these publish **plaintext** state. An encrypted local
+state backup is a copy of the encrypted backend file, not OpenTofu's decrypted
+`state pull` output. Migrations and splits need an explicitly reviewed procedure
+that keeps intermediate artifacts encrypted throughout; none is automated here.
+Stop and design that procedure before a backend migration or handoff rather than
+using commands that briefly write plaintext state.
 
 Transferring state ownership alone is not complete: the old root still declares
 the transferred objects, so resuming its automation would recreate them (for
@@ -319,7 +335,7 @@ individual DNS resources. Split-DNS nameservers must be reachable by Tailscale
 clients; Kubernetes service discovery remains CoreDNS inside the cluster and
 should not be represented by a guessed ClusterIP here.
 
-The backend examples are placeholders only. No backend state, credentials, or
+The local backend examples are placeholders only. No backend state, credentials, or
 generated plan belongs in Git. The generated `.terraform.lock.hcl` files are
 provider selections and should remain committed for reproducible initialization.
 

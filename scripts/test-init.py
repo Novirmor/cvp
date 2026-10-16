@@ -129,6 +129,9 @@ class InitWizardTests(unittest.TestCase):
                 for call in self.recorded() if call[0] == "ansible-playbook"]
 
     def first_host(self, *extra, **kwargs):
+        node = next((extra[index + 1] for index, value in enumerate(extra[:-1]) if value == "--node"), "server1")
+        if "--tailscale-auth-key-file" not in extra:
+            extra = (*extra, "--tailscale-auth-key-file", str(self.keys / f"{node}.ts-authkey"))
         return self.wizard("--address", "203.0.113.20", "--host-key-fingerprint", fingerprint(HOST_KEY), *extra,
                            **kwargs)
 
@@ -161,6 +164,7 @@ class InitWizardTests(unittest.TestCase):
         self.first_host()
         self.calls.unlink()
         self.wizard("--address", "203.0.113.21", "--host-key-fingerprint", fingerprint(HOST_KEY),
+                    "--tailscale-auth-key-file", str(self.keys / "worker1.ts-authkey"),
                     env={"CVP_TEST_SSH_CONNECTION": "203.0.113.10 50000 203.0.113.21 22",
                          "CVP_TEST_OPS_READY": str(self.directory / "worker-ready")},
                     expected="worker1 is part of the cluster")
@@ -195,8 +199,10 @@ class InitWizardTests(unittest.TestCase):
     def test_missing_answers_without_a_terminal_name_their_flags(self):
         self.wizard(success=False, expected="pass --address")
         self.wizard("--address", "203.0.113.20", success=False, expected="pass --host-key-fingerprint")
+        self.wizard("--address", "203.0.113.20", "--host-key-fingerprint", fingerprint(HOST_KEY),
+                    success=False, expected="pass --tailscale-auth-key-file")
         (self.keys / "server1.ts-authkey").unlink()
-        self.first_host(success=False, expected="pass --tailscale-auth-key-file")
+        self.first_host(success=False, expected="--tailscale-auth-key-file must")
 
 
 if __name__ == "__main__":

@@ -50,6 +50,8 @@ def arguments(args, *, plan, positionals=2):
             else:
                 if name == "var-file":
                     value = str(external_path(value))
+                if name == "var" and value.split("=", 1)[0].strip() == "state_passphrase":
+                    raise ValueError("never pass the state passphrase on the command line; use SOPS exec-env")
                 forwarded.append(f"-{name}={value}")
         elif name in booleans and (not separator or value in ("true", "false")):
             forwarded.append(f"-{name}" + (f"={value}" if separator else ""))
@@ -86,7 +88,7 @@ def backend_configuration(root):
         for key in ("path", "workspace_dir"):
             value = config.get(key)
             if not value or not Path(value).is_absolute():
-                raise ValueError("local test backends require explicit absolute external path and workspace_dir")
+                raise ValueError("local backends require explicit absolute external path and workspace_dir")
             path = Path(value).resolve()
             if path == ROOT or ROOT in path.parents:
                 raise ValueError("local state must be outside the repository")
@@ -152,7 +154,7 @@ def detailed_exitcode(args):
     return enabled
 
 
-def tofu(root, *args, capture_output=False, stdout=None, input=None):
+def tofu(root, *args, capture_output=False, stdout=None, input=None, sensitive_output=False):
     env = guarded_environment(root)
     backend_configuration(root)
     directory = Path(tempfile.mkdtemp(prefix=f"{root.name}-{args[0]}-", dir=recovery_directory()))
@@ -170,20 +172,27 @@ def tofu(root, *args, capture_output=False, stdout=None, input=None):
             saved_plan = directory / "input.tfplan"
             saved_plan.write_bytes(Path(args[-1]).read_bytes())
             args = (*args[:-1], str(saved_plan))
-        with (directory / "stdout.log").open("xb") as out, (directory / "stderr.log").open("xb") as err:
-            result = subprocess.run(["tofu", f"-chdir={directory}", *args], cwd=directory,
-                                    env=env, input=input, stdout=out, stderr=err)
-        output = (directory / "stdout.log").read_bytes()
+        with (directory / "stderr.log").open("xb") as err:
+            if sensitive_output:
+                # Enrollment keys must never land in even a private log file.
+                result = subprocess.run(["tofu", f"-chdir={directory}", *args], cwd=directory,
+                                        env=env, input=input, stdout=subprocess.PIPE, stderr=err)
+                output = result.stdout
+            else:
+                with (directory / "stdout.log").open("xb") as out:
+                    result = subprocess.run(["tofu", f"-chdir={directory}", *args], cwd=directory,
+                                            env=env, input=input, stdout=out, stderr=err)
+                output = (directory / "stdout.log").read_bytes()
         errors = (directory / "stderr.log").read_bytes()
         succeeded = result.returncode == 0 or (args[0] == "plan" and result.returncode == 2 and detailed_exitcode(args))
-        if succeeded and not capture_output:
+        if succeeded and not capture_output and not sensitive_output:
             if stdout is not None:
                 stdout.write(output)
             else:
                 sys.stdout.buffer.write(output)
                 sys.stdout.buffer.flush()
-        return subprocess.CompletedProcess(result.args, result.returncode, output if capture_output else None,
-                                           errors if capture_output else None)
+        return subprocess.CompletedProcess(result.args, result.returncode, output if capture_output or sensitive_output else None,
+                                            errors if capture_output else None)
     finally:
         if succeeded:
             shutil.rmtree(directory)
@@ -192,7 +201,7 @@ def tofu(root, *args, capture_output=False, stdout=None, input=None):
 
 
 def bound_tailnet(root):
-    result = tofu(root, "state", "pull", capture_output=True)
+    result = tofu(root, "state", "pull", sensitive_output=True)
     if result.returncode:
         raise ValueError("establish the tailnet identity before importing or planning")
     try:
@@ -228,7 +237,7 @@ def check_identity(root, forwarded):
 def check_adoption(root, plan):
     if root.name != "tailscale":
         return
-    result = tofu(root, "show", "-json", str(plan), capture_output=True)
+    result = tofu(root, "show", "-json", str(plan), sensitive_output=True)
     if result.returncode:
         raise ValueError("could not inspect the Tailscale plan for singleton adoption")
     try:
@@ -328,7 +337,7 @@ def establish_identity(root, args):
     if not tailnet or tailnet == "-" or tailnet != tailnet.strip() or any(ord(c) < 32 for c in tailnet):
         raise ValueError("provide one explicit tailnet ID/domain")
     context = binding(root)
-    existing = tofu(root, "show", "-json", capture_output=True)
+    existing = tofu(root, "show", "-json", sensitive_output=True)
     existing_root = json.loads(existing.stdout).get("values", {}).get("root_module", {}) if existing.returncode == 0 else None
     if existing_root is None or existing_root.get("resources") or existing_root.get("child_modules"):
         raise ValueError("establish-identity requires empty state; existing/imported state needs a reviewed migration")
@@ -338,7 +347,7 @@ def establish_identity(root, args):
                       f"-var=tailnet={tailnet}", "-target=terraform_data.tailnet_identity", f"-out={plan}")
         if result.returncode:
             return result.returncode
-        result = tofu(root, "show", "-json", str(plan), capture_output=True)
+        result = tofu(root, "show", "-json", str(plan), sensitive_output=True)
         if result.returncode:
             raise ValueError("could not inspect identity establishment plan")
         inspected = json.loads(result.stdout)
@@ -360,9 +369,40 @@ def establish_identity(root, args):
         return result.returncode
 
 
+def export_enrollment_key(root, args):
+    if root.name != "tailscale" or len(args) != 3:
+        raise ValueError("export-enrollment-key requires a node, an external .sops.json path, and an age recipient")
+    node, target, recipient = args
+    if not node or not recipient.startswith("age1") or any(ord(c) < 32 for c in node + recipient):
+        raise ValueError("provide a node name and age public recipient")
+    if not target.endswith(".sops.json"):
+        raise ValueError("export destination must end with .sops.json")
+    destination = external_path(target, output=True)
+    if not bound_tailnet(root):
+        raise ValueError("establish tailnet identity first")
+    result = tofu(root, "output", "-json", "enrollment_keys", sensitive_output=True)
+    if result.returncode:
+        raise ValueError("could not read enrollment keys from encrypted state")
+    keys = json.loads(result.stdout)
+    key = keys.get(node) if isinstance(keys, dict) else None
+    if not isinstance(key, str) or not key.startswith("tskey-"):
+        raise ValueError("no enrollment key found for node; generate and apply its reviewed Tailscale plan first")
+    encrypted = subprocess.run(
+        ["sops", "--encrypt", "--age", recipient, "--input-type", "json", "--output-type", "json", "/dev/stdin"],
+        input=json.dumps({"TAILSCALE_AUTH_KEY": key}).encode(), capture_output=True,
+    )
+    if encrypted.returncode or b'"sops"' not in encrypted.stdout or key.encode() in encrypted.stdout:
+        raise ValueError("SOPS/age did not produce an encrypted enrollment key")
+    with staging(destination) as temporary:
+        temporary.write_bytes(encrypted.stdout)
+        publish(temporary, destination)
+    print(f"Wrote SOPS/age-encrypted enrollment key: {destination}")
+    return 0
+
+
 def main():
     if len(sys.argv) < 3 or sys.argv[1] not in {"cloudflare", "tailscale"}:
-        raise ValueError("usage: tofu-operation <cloudflare|tailscale> <plan|drift-plan|apply|show|import|establish-identity|state-list|state-pull> [arguments]")
+        raise ValueError("usage: tofu-operation <cloudflare|tailscale> <plan|drift-plan|apply|show|import|establish-identity|state-list|export-enrollment-key> [arguments]")
     os.umask(0o077)
     root = ROOT / "tofu" / sys.argv[1]
     guarded_environment(root)
@@ -383,19 +423,10 @@ def main():
         return tofu(root, "import", "-input=false", *forwarded).returncode
     if operation == "establish-identity":
         return establish_identity(root, args)
+    if operation == "export-enrollment-key":
+        return export_enrollment_key(root, args)
     if operation == "state-list" and not args:
         return tofu(root, "state", "list").returncode
-    if operation == "state-pull" and len(args) == 1:
-        destination = external_path(args[0], output=True)
-        with staging(destination) as temporary:
-            with temporary.open("wb") as output:
-                result = tofu(root, "state", "pull", stdout=output)
-            if result.returncode:
-                return result.returncode
-            if not temporary.stat().st_size:
-                raise ValueError("OpenTofu returned empty state")
-            publish(temporary, destination)
-        return 0
     raise ValueError("unknown operation or invalid arguments")
 
 

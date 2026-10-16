@@ -54,8 +54,8 @@ context only after reviewing the rendered output.
    `svccontroller.k3s.cattle.io/lbpool=public`; verify that other nodes carry
    neither label. It must also have `cvp.novirmor.io/ingress=true` for Traefik; the
    smoke app itself schedules on any `cvp.novirmor.io/compute=true` node.
-3. Recover or generate the cluster age identity out of band and store its
-   private half in an operator-chosen external secrets store. An operator seeds
+3. Recover or generate the cluster age identity out of band and keep its
+   private half outside Git with an offline backup. An operator seeds
    `sops-age`; Ansible does not create or recover this Secret. See
    [`secrets/README.md`](secrets/README.md).
 4. Replace the `example.invalid/repository.git` placeholder in
@@ -139,7 +139,7 @@ kustomize build cluster/operations/overlays/cluster
    node: `svccontroller.k3s.cattle.io/enablelb=true` and
    `svccontroller.k3s.cattle.io/lbpool=public`.
 4. Restore the read-only Git deploy key and `sops-age` identity from the
-   operator-chosen external secrets store.
+   operator's offline backup (or an optional encrypted external store).
    An operator manually seeds both through `scripts/bootstrap-flux`; Ansible
    does not own or reconstruct either private key.
 5. Run `task bootstrap-flux` with explicit `FLUX_GITHUB_OWNER`,

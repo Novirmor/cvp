@@ -1,15 +1,5 @@
-# Backend configuration example only. Do not commit real bucket credentials.
-# Use a private bucket with encryption and versioning enabled.
-
-bucket       = "replace-with-encrypted-state-bucket"
-key          = "cvp/tofu/cloudflare/terraform.tfstate"
-region       = "replace-with-state-region"
-encrypt      = true
-use_lockfile  = true
-
-# For an S3-compatible backend, add the endpoint and the provider-specific
-# validation flags here. Supply credentials through the backend's environment.
-# Note: use_lockfile locking requires S3 conditional writes (If-None-Match);
-# if the store does not implement them, set use_lockfile = false and use a
-# lock-table-capable endpoint instead.
-# endpoints = { s3 = "https://replace-with-s3-compatible-endpoint" }
+# Copy outside Git. Choose different absolute paths for Cloudflare and Tailscale.
+# OpenTofu encrypts state and plans before writing them. Back up both the state
+# file and its separate SOPS-protected state_passphrase.
+path          = "/home/operator/.local/state/cvp/midgard/cloudflare/state.tfstate"
+workspace_dir = "/home/operator/.local/state/cvp/midgard/cloudflare/workspaces"

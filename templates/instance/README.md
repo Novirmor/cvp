@@ -26,11 +26,13 @@ cd __NAME__
 mise install
 task platform-install   # materialize the locked platform release (creation already did)
 task validate
-task init               # take a fresh Debian host to a cluster node; rerun for more hosts
+task init -- --tailscale-auth-key-file /path/to/tmpfs/node.ts-authkey
+                        # take a fresh Debian host to a cluster node; rerun for more hosts
 ```
 
-`task init` asks for the host's public IP, the SSH fingerprint from the
-provider console, and a Tailscale auth key, then bootstraps, joins, and exports
+`task init` asks for the host's SSH endpoint, the SSH fingerprint from the
+provider console, and a one-use Tailscale auth key exported from encrypted
+local OpenTofu state, then bootstraps, joins, and exports
 a kubeconfig. Network rules, the manual steps, and troubleshooting are in
 [the node runbook](__PLATFORM_URL__/blob/main/docs/runbooks/nodes.md).
 

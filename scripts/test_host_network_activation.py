@@ -45,13 +45,20 @@ class NetworkCheckModeTests(LocalAnsibleTests):
         values = defaults("base") | {
             "ansible_os_family": "Debian", "ansible_service_mgr": "systemd", "node_virtualization": "auto",
             "node_container_ids": ["lxc"], "node_vm_ids": ["kvm"], "ansible_interfaces": ["eth0"],
-            "base_ra_interfaces": ["eth0"], "base_module_paths": {"results": [{"stat": {"exists": True}}]},
+            "base_ra_interfaces": ["eth0"], "base_module_paths": {"results": [
+                {"item": "br_netfilter", "stat": {"exists": False}},
+                {"item": "overlay", "stat": {"exists": True}},
+                {"item": "vxlan", "stat": {"exists": True}},
+            ]},
             "base_cgroup_v2": {"stat": {"exists": True}}, "base_tun_device": {"stat": {"exists": True, "ischr": True}},
             "base_cgroup_controllers": {"content": base64.b64encode(b"cpu memory pids").decode()},
         }
         self.play(tasks + [{"name": "Check discovery results", "ansible.builtin.assert": {
             "that": ["base_env == 'lxc'", "base_virt.stdout == 'lxc'", "base_swap_devices.stdout == ''"]}}],
-            values, check=True)
+             values, check=True)
+        missing_vxlan = {"results": [*values["base_module_paths"]["results"][:2],
+                                     {"item": "vxlan", "stat": {"exists": False}}]}
+        self.play(tasks, values | {"base_module_paths": missing_vxlan}, check=True, success=False)
         self.play(tasks, values | {"node_virtualization": "vm"}, check=True, success=False)
 
     def test_fresh_wireguard_check_mode_never_generates_or_persists_keys(self):

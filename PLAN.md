@@ -128,8 +128,8 @@ account, or restore drill is ticked, and no exit gate has been passed yet.
 - [x] Define ordered Flux Kustomizations for policy, infrastructure, data, apps,
   and operations.
 - [x] Enable pruning and drift correction.
-- [ ] Recover or generate one age key for the cluster, store its private half in
-  an operator-chosen external secrets store, and seed it into `flux-system` through
+- [ ] Recover or generate one age key for the cluster, keep its private half
+  outside Git with an offline backup, and seed it into `flux-system` through
   `scripts/bootstrap-flux`; Ansible never owns this key.
 - [ ] Add `.sops.yaml` rules that encrypt only Secret payloads.
 - [ ] Prove that Git contains no plaintext secret and Flux can restore an

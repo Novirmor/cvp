@@ -28,6 +28,11 @@ dns_nameservers = [
 split_dns   = {}
 search_paths = []
 
+# Only after importing and reviewing the existing ACL/DNS configuration:
+# enrollment_keys = {
+#   eve282 = { tags = ["tag:k3s", "tag:k3s-ingress"] }
+# }
+
 # Example split-DNS rule:
 # split_dns = {
 #   internal = {

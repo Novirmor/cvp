@@ -156,22 +156,15 @@ class Wizard:
         node_cli.trust_bootstrap_key(self.address, self.port, fingerprint)
 
     def tailscale_key(self):
-        """Return (path, created); created is True when this run wrote the file."""
-        path = Path(self.args.tailscale_auth_key_file or
-                    node_cli.common.config_dir() / "keys" / f"{self.node}.ts-authkey")
-        if path.exists():
-            return str(path), False
-        self.step("Tailscale enrollment key")
-        say("Create a reusable or one-off auth key in the Tailscale admin console, tagged "
-            + ("tag:k3s and tag:k3s-ingress." if self.first else "tag:k3s."))
-        value = self.ask("Paste the Tailscale auth key (hidden)", None, None, "--tailscale-auth-key-file",
-                         lambda text: text.startswith("tskey-") and "\n" not in text, secret=True)
-        node_cli.private_directory(path.parent)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as stream:
-            stream.write(value + "\n")
-        say(f"Saved to {path} (mode 0600)")
-        return str(path), True
+        """Require an explicitly staged, temporary key file; never persist a pasted key."""
+        path = self.args.tailscale_auth_key_file
+        require(path is not None,
+                "export the one-use key with OpenTofu, decrypt it to a private tmpfs file, "
+                "then pass --tailscale-auth-key-file; remove that file after join")
+        source = Path(path)
+        require(source.is_file() and not source.is_symlink() and source.stat().st_mode & 0o077 == 0,
+                "--tailscale-auth-key-file must be a regular private file (mode 0600)")
+        return str(source), False
 
     def detect_source(self, session):
         if self.args.ssh_source:

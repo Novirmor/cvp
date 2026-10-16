@@ -1,14 +1,13 @@
 # SOPS and age
 
 Secret payloads are encrypted in Git with SOPS and age. The age private key is
-never stored in this repository. An operator-chosen external secrets store
-holds the recovery copy of that private key; Bitwarden Secrets Manager is an
-optional example.
+never stored in this repository. Keep an offline recovery copy outside Git;
+an external secrets store is optional and must also protect its contents.
 
 ## Bootstrap
 
-1. Generate one age key pair outside this repository and store the private key
-   in the operator-chosen external secrets store.
+1. Generate one age key pair outside this repository and back up its private
+   key offline in a protected location.
 2. Put only the public recipient in a local copy of
 [`../.sops.yaml.example`](../.sops.yaml.example), or pass it through
 `SOPS_AGE_RECIPIENTS`.

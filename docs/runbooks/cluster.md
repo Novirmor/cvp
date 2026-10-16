@@ -89,8 +89,8 @@ through an SSH stub and a kubectl stub; it never contacts Kubernetes.
     `.sourceignore`, source filters/includes/submodules, cluster symlinks, and
     transforms that make directly applied bootstrap files differ from their
     validated render. Repository-local Flux paths must stay inside `cluster/`.
-4. Recover the Git deploy key and SOPS age identity from an operator-chosen
-   external secrets store and seed them through the context-safe bootstrap
+4. Recover the Git deploy key and SOPS age identity from the operator's
+    offline backup (or an optional encrypted external store) and seed them through the context-safe bootstrap
    helper; Ansible does not own either private key:
 
    ```sh

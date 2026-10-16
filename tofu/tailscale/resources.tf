@@ -144,3 +144,24 @@ resource "tailscale_dns_configuration" "tailnet" {
     prevent_destroy = true
   }
 }
+
+# The provider stores generated keys in state even though its key attribute is
+# sensitive. State and saved plans are encrypted by encryption.tf. A consumed
+# single-use key must be rotated deliberately, never silently regenerated.
+resource "tailscale_tailnet_key" "enrollment" {
+  for_each = var.enrollment_keys
+
+  depends_on = [tailscale_acl.policy, tailscale_dns_configuration.tailnet]
+
+  description         = each.key
+  tags                = each.value.tags
+  expiry              = each.value.expiry
+  reusable            = false
+  ephemeral           = false
+  preauthorized       = true
+  recreate_if_invalid = "never"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}

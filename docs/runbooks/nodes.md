@@ -18,8 +18,10 @@ rules; there is no "move SSH to Tailscale" step.
 ## Quick path: `task init`
 
 `task init` runs everything in sections 2–4 for one host, asking only for what
-it cannot detect: the host's public IP, the console fingerprint (section 3.1),
-and the Tailscale auth key (stored as a `0600` file). It reads the address you
+it cannot detect: the host's SSH endpoint and port and the console fingerprint
+(section 3.1). Pass `--tailscale-auth-key-file` pointing at a temporary private
+`0600` tmpfs file staged from [SOPS/age-encrypted OpenTofu output](tofu.md#enrollment-keys).
+It never saves a pasted key. It reads the address you
 SSH from out of the host's own view of the connection (`$SSH_CONNECTION`) and
 asks you to confirm it as the node's permanent SSH source. It then runs
 `node-new` (showing the plan first), `node-bootstrap`, `node-join`, and, for the

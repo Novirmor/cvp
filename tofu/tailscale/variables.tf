@@ -110,3 +110,24 @@ variable "split_dns" {
     error_message = "split_dns domains must be unique across entries; merge the resolvers for a duplicated domain into a single entry, because the provider silently overwrites duplicate domains."
   }
 }
+
+variable "enrollment_keys" {
+  description = "Explicit one-use node enrollment keys; add only after ACL/DNS adoption and reviewed plan."
+  type = map(object({
+    tags   = set(string)
+    expiry = optional(number, 3600)
+  }))
+  default  = {}
+  nullable = false
+
+  validation {
+    condition = alltrue([
+      for name, key in var.enrollment_keys :
+      can(regex("^[a-z0-9][a-z0-9-]*$", name)) && length(name) <= 63
+      && contains(key.tags, "tag:k3s")
+      && length(setsubtract(key.tags, ["tag:k3s", "tag:k3s-ingress"])) == 0
+      && key.expiry >= 60 && key.expiry <= 86400
+    ])
+    error_message = "Keys need a lowercase node name, tag:k3s (optionally tag:k3s-ingress), and expiry between 60 and 86400 seconds."
+  }
+}

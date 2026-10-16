@@ -20,3 +20,9 @@ output "allowed_tcp_ports" {
     ci    = [6443]
   }
 }
+
+output "enrollment_keys" {
+  description = "Sensitive one-use enrollment keys; never show or export as plaintext."
+  value       = { for name, key in tailscale_tailnet_key.enrollment : name => key.key }
+  sensitive   = true
+}

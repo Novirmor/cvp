@@ -408,11 +408,12 @@ It must remain single-instance under the initial availability model.
 
 ## Secrets
 
-- An operator-chosen external secrets store holds host, recovery, and OpenTofu
-  credentials; Bitwarden Secrets Manager is one optional example.
+- SOPS/age encrypts persisted host, recovery, and OpenTofu credentials; an
+  external store is optional, but its copies must remain encrypted. OpenTofu
+  local state and saved plans use enforced native encryption.
 - Cluster Secrets are encrypted in Git with SOPS and age.
 - Flux decrypts only Secret data immediately before applying it.
-- The age private key is stored in that external secrets store and injected
+- The age private key is kept outside Git and backed up offline, then injected
   into `flux-system` during bootstrap; it is never committed.
 - K3s encrypts Kubernetes Secrets in its datastore.
 - Workloads receive only explicitly referenced Secrets and never receive

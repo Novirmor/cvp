@@ -85,7 +85,7 @@ def main():
         plan = artifacts / "reviewed.tfplan"
         for operation, args in (
             ("plan", [f"-out={plan}"]), ("show", [str(plan)]),
-            ("apply", [str(plan)]), ("state-pull", [str(artifacts / "state")]),
+            ("apply", [str(plan)]), ("state-list", []),
         ):
             result = subprocess.run(
                 ["bash", str(scripts / "tofu-operation"), "cloudflare", operation, *args],

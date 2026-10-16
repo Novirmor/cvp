@@ -211,6 +211,7 @@ class WrapperSafety(unittest.TestCase):
             [good, "--target=tailscale_acl.policy"], [good, "-exclude=terraform_data.tailnet_identity"],
             [good, "-refresh-only=false"], [good, "-destroy"], [good, "-lock=false"],
             [good, "-input=true"], [good, "-generate-config-out=artifact"],
+            [good, "-var=state_passphrase=unsafe"],
         ):
             self.tofu("plan", *args, code=None)
         self.env["TF_CLI_ARGS_plan"] = "--out=artifact"
@@ -240,16 +241,11 @@ class WrapperSafety(unittest.TestCase):
         self.assertEqual(victim.read_text(), "preserve")
         self.assertEqual(list(self.artifacts.iterdir()), [self.artifacts / "plan"])
 
-    def test_private_atomic_state_and_shared_directory_rejection(self):
+    def test_plaintext_state_export_is_forbidden(self):
         path = self.artifacts / "state"
-        self.env["TEST_STATE_RC"] = "1"
-        self.tofu("state-pull", path, code=1)
-        self.assertEqual(list(self.artifacts.iterdir()), [])
-        self.env["TEST_STATE_RC"] = "0"
-        self.tofu("state-pull", path)
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.artifacts.chmod(0o777)
-        self.tofu("state-pull", self.artifacts / "other", code=None)
+        self.tofu("state-pull", path, code=None)
+        self.assertFalse(path.exists())
+        self.assertFalse(self.logged())
 
     def test_drift_mode_and_dns_adoption(self):
         self.env["TEST_DNS_ACTION"] = "create"
