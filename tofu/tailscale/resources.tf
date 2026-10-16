@@ -4,10 +4,9 @@ locals {
   # Traefik. SSH uses the nodes' public addresses, and WireGuard-only cluster
   # ports are not Tailscale permissions.
   policy = {
-    groups = {
+    groups = merge({
       "group:admin" = var.admin_users
-      "group:ci"    = var.ci_users
-    }
+    }, length(var.ci_users) > 0 ? { "group:ci" = var.ci_users } : {})
 
     tagOwners = {
       "tag:k3s"         = ["group:admin"]
@@ -29,14 +28,14 @@ locals {
       {
         action = "accept"
         proto  = "tcp"
-        src    = ["group:ci", "tag:ci"]
+        src    = concat(length(var.ci_users) > 0 ? ["group:ci"] : [], ["tag:ci"])
         dst    = ["tag:k3s:6443"]
       },
     ]
 
     # These assertions prevent later policy edits from granting CI
     # administrative or ingress access.
-    tests = [
+    tests = concat([
       {
         src   = "group:admin"
         proto = "tcp"
@@ -47,6 +46,7 @@ locals {
         ]
         deny = ["tag:k3s:22"]
       },
+      ], length(var.ci_users) > 0 ? [
       {
         src    = "group:ci"
         proto  = "tcp"
@@ -57,6 +57,7 @@ locals {
           "tag:k3s-ingress:443",
         ]
       },
+      ] : [], [
       {
         src    = "tag:ci"
         proto  = "tcp"
@@ -67,7 +68,7 @@ locals {
           "tag:k3s-ingress:443",
         ]
       },
-    ]
+    ])
   }
 }
 

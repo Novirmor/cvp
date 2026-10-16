@@ -4,7 +4,8 @@
 
 tailnet     = "replace-with-tailnet-id-or-domain"
 admin_users = ["admin@example.invalid"]
-ci_users    = ["ci@example.invalid"]
+# Leave empty until there is a separate CI identity; tag:ci remains available.
+ci_users = []
 
 magic_dns          = true
 override_local_dns = true

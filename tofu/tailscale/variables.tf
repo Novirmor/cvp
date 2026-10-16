@@ -23,15 +23,16 @@ variable "admin_users" {
 }
 
 variable "ci_users" {
-  description = "Tailscale identities representing CI operators or CI service users."
+  description = "Optional Tailscale identities representing CI operators or service users. Empty omits group:ci; tag:ci remains available for CI devices."
   type        = list(string)
   nullable    = false
+  default     = []
 
   validation {
-    condition = length(var.ci_users) > 0 && alltrue([
+    condition = alltrue([
       for user in var.ci_users : user != "" && user == trimspace(user)
     ])
-    error_message = "ci_users must contain at least one non-empty Tailscale identity."
+    error_message = "ci_users may be empty or contain only non-empty Tailscale identities."
   }
 }
 

@@ -79,6 +79,7 @@ tasks:
       - mise exec -- python3 -B scripts/test-wrapper-safety.py
       - mise exec -- python3 -B scripts/test-tofu-identity.py
       - mise exec -- python3 -B scripts/test-tofu-encryption.py
+      - mise exec -- python3 -B scripts/test-tofu-policy.py
       - mise exec -- python3 -B scripts/test-storage-safety.py
       - mise exec -- python3 -B scripts/test-operator-config.py
       - mise exec -- python3 -B scripts/test-kubeconfig-export.py -v

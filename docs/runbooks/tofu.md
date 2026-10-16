@@ -311,7 +311,9 @@ the K3s layout:
 
 - `group:admin` to `tag:k3s`: Kubernetes API `6443`.
 - `group:admin` to `tag:k3s-ingress`: internal applications on `80`, `443`.
-- `group:ci` and `tag:ci` to `tag:k3s`: Kubernetes API `6443` only.
+- `tag:ci` (and `group:ci` when explicitly populated) to `tag:k3s`:
+  Kubernetes API `6443` only. An empty `ci_users` omits the human CI group;
+  it does not invent a CI login or disable the future tagged CI device path.
 
 SSH (`22`) is never granted over the tailnet; the policy tests assert that it is
 denied. Nodes accept SSH only on their public addresses.
