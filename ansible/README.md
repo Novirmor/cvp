@@ -94,6 +94,11 @@ their kernel modules loaded and persisted by the base role. Forwarding-enabled
 uplinks retain IPv6 router advertisements via `accept_ra=2`. Before a fresh
 host probe, the OS must have `kmod` and `procps` available; `task probe` is
 read-only and does not install packages or require an active WireGuard mesh.
+On LXC, `br_netfilter` may be hidden under `/sys/module` even when bridge
+filtering works. Probe and convergence require its bridge sysctls to be enabled
+instead of requiring that module entry; overlay and VXLAN checks remain. Use
+the [isolated bridged-packet readiness test](../docs/runbooks/nodes.md#31-install-debian-from-scratch)
+to confirm filtering on any host with a hidden module before joining it.
 Every node, including the initial server, starts as a fresh Debian install and
 is scaffolded, bootstrapped, and joined through `docs/runbooks/nodes.md`
 (`task node-new`, `task node-bootstrap`, `task node-join`). `examples/instance/inventory/host_vars/example-newnode.yml.example`

@@ -73,6 +73,7 @@ tasks:
         ANSIBLE_CONFIG=ansible/ansible.cfg mise exec -- ansible-playbook
         {{.EXAMPLE_INVENTORY}} ansible/playbooks/test-labels.yml
       - mise exec -- python3 -B scripts/test-node-lifecycle.py
+      - mise exec -- python3 -B scripts/test-host-readiness.py
       - mise exec -- python3 -B scripts/test-init.py
       - mise exec -- ./scripts/test-prepare-access
       - mise exec -- python3 -B scripts/test-wrapper-safety.py

@@ -104,19 +104,23 @@
   when: base_env == 'lxc'
 
 # An LXC guest cannot load modules or persist module loads; the host kernel
-# must already provide everything, exactly as the probe gate requires. Writing
+# must already provide overlay and VXLAN, exactly as the probe gate requires.
+# br_netfilter can work without a visible /sys/module entry, so its bridge
+# sysctls are checked below instead. Writing
 # modules-load.d here would promise a reboot persistence the guest cannot
 # deliver, so convergence only verifies the host-provided state.
 - name: Require host-provided kernel facilities on LXC guests
   ansible.builtin.assert:
     that:
       - base_overlay_fs.rc == 0
-      - base_module_paths.results | rejectattr('stat.exists') | list | length == 0
+      - >-
+        base_module_paths.results | rejectattr('item', 'equalto', 'br_netfilter')
+        | rejectattr('stat.exists') | list | length == 0
     fail_msg: >-
-      This LXC guest needs a host kernel that already provides overlay as a
-      registered filesystem and required modules (loaded or built in).
-      Run task probe first and resolve the hosting decision; convergence
-      cannot fix a guest that shares an underprovisioned kernel.
+      This LXC guest needs registered overlay and visible VXLAN support.
+      Bridge netfilter is checked by the provider sysctls below, not by
+      /sys/module/br_netfilter. Run task probe first; convergence cannot
+      load missing host modules.
   when: base_env == 'lxc'
 
 - name: Read cgroup v2 marker

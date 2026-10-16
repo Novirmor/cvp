@@ -99,18 +99,21 @@
         - probe_env != 'lxc'
         - not probe_module_paths.results[module_index].stat.exists
 
-    # An LXC guest shares the host kernel and cannot load modules itself, so
-    # everything the cluster needs must already be provided by the host.
+    # br_netfilter may be functional in LXC while hidden from /sys/module;
+    # the bridge sysctls are checked below. Overlay and VXLAN must still be
+    # registered/visible before admitting the host.
     - name: Require host-provided kernel facilities on LXC guests
       ansible.builtin.assert:
         that:
           - probe_overlay_fs.rc == 0
-          - probe_module_paths.results | rejectattr('stat.exists') | list | length == 0
+          - >-
+            probe_module_paths.results | rejectattr('item', 'equalto', 'br_netfilter')
+            | rejectattr('stat.exists') | list | length == 0
         fail_msg: >-
-          This LXC guest needs a host kernel that already provides overlay as a
-          registered filesystem and required modules (loaded or built in);
-          the guest cannot load them itself. Ask the provider to load them,
-          onboard the node as a VM, or record an explicit hosting decision.
+          This LXC guest needs registered overlay and visible VXLAN support;
+          it cannot load missing modules itself. Bridge netfilter is checked
+          by the provider sysctls below, not by /sys/module/br_netfilter.
+          Ask the provider to expose the facilities or use a VM.
       when: probe_env == 'lxc'
 
     # A VM or metal host owns its kernel: the modules only need to be

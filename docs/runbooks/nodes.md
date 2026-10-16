@@ -126,6 +126,29 @@ LXC containers additionally need provider-supplied overlay/VXLAN/bridge-netfilte
 support, delegated cgroups, TUN access, and bridge sysctls; a failing probe
 calls for provider changes or a VM.
 
+Before scaffolding an LXC node, you can inspect these prerequisites over a
+previously authenticated SSH connection without modifying the guest:
+
+```sh
+ssh -p <external-ssh-port> root@<trusted-host> 'python3 -' \
+  < scripts/host-readiness.py
+```
+
+The script is standalone (Python standard library only). Its default mode is
+read-only and reports whether CVP's conservative LXC probe will pass.
+`br_netfilter` module visibility is informational: some LXC guests hide it
+despite working bridge filtering. CVP still requires enabled bridge netfilter
+sysctls, registered overlay, and visible VXLAN. Before admitting a guest with a
+hidden `br_netfilter` module, use the functional test below to verify the
+bridged IPv4 hook; the sysctls alone do not prove packet filtering. The
+optional `python3 - --functional` mode
+creates a temporary bridge and VXLAN device, sends one synthetic IPv4 frame
+across the bridge, and checks an IPv4 netfilter forward counter **only inside a
+newly isolated user/network namespace**. It refuses to fall back to the guest's
+real network namespace, but can cause the shared kernel to autoload modules.
+An isolation failure is inconclusive, not proof that the facilities cannot
+work. Neither mode replaces `task probe` or tests cross-host pod traffic.
+
 ### 3.2 Scaffold it
 
 Paste the Tailscale enrollment key from your secret store into a private file
