@@ -3,6 +3,11 @@ token-file: "{{ k3s_agent_token_path }}"
 data-dir: "{{ k3s_data_dir }}"
 node-name: "{{ node_name }}"
 node-ip: "{{ wireguard_address }}"
+{% if k3s_tolerate_virtual_swap | default(false) | bool %}
+# Kubelet tolerates host-owned LXC virtual swap; pods retain default NoSwap.
+kubelet-arg:
+  - "fail-swap-on=false"
+{% endif %}
 kube-proxy-arg:
   - "proxy-mode=iptables"
   - "iptables-localhost-nodeports=true"

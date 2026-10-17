@@ -41,6 +41,9 @@ base_packages:
   - wireguard-tools
 
 base_disable_swap: true
+# Per-host, explicit exception for an LXC's sole host-owned `none virtual`
+# swap entry. Pods stay NoSwap; kubelet is configured to tolerate host swap.
+k3s_tolerate_virtual_swap: false
 
 # Network-namespace sysctls that the guest may manage. The bridge netfilter
 # switches can be host-owned in LXC and must already be set by the provider.
@@ -63,9 +66,10 @@ base_kernel_modules:
 # Host environment classification: lxc, vm, metal, or auto (detected by the
 # probe and the base role via systemd-detect-virt). A declared value that
 # disagrees with the detected one fails the probe and convergence. LXC guests
-# share the host kernel and cannot load
-# kernel modules themselves, so the required facilities must be provided by
-# the host; VM and metal hosts load and persist the modules themselves.
+# share the host kernel and cannot persist kernel module loading. Their
+# isolated functional test may trigger VXLAN autoload, but the required
+# facilities must work and remain visible afterward. VM and metal hosts
+# load and persist the modules themselves.
 node_virtualization: auto
 
 # systemd-detect-virt identifiers grouped into the three environments the

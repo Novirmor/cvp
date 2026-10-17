@@ -1545,6 +1545,10 @@ class NodePortTemplateTests(unittest.TestCase):
             with self.subTest(role=role, init=init):
                 template = ROOT / f"ansible/roles/{role}/templates/config.yaml.j2"
                 config = yaml.safe_load(env.from_string(template.read_text()).render(base | {"k3s_server_init": init}))
+                self.assertNotIn("kubelet-arg", config)
+                tolerating = yaml.safe_load(env.from_string(template.read_text()).render(
+                    base | {"k3s_server_init": init, "k3s_tolerate_virtual_swap": True}))
+                self.assertEqual(tolerating["kubelet-arg"], ["fail-swap-on=false"])
                 args = dict(arg.split("=", 1) for arg in config["kube-proxy-arg"])
                 self.assertEqual(args["proxy-mode"], "iptables")
                 self.assertEqual(args["iptables-localhost-nodeports"], "true")

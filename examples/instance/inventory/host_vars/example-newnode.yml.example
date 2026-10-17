@@ -9,9 +9,9 @@ ansible_port: 22
 node_name: ""               # must equal the inventory host key
 
 # LXC guests and ordinary VMs (or metal) are both supported.
-#   lxc   : shares the host kernel; the probe requires overlay registered and
-#           br_netfilter/vxlan loaded or built into the host, and convergence only
-#           verifies that state — the guest cannot load or persist modules.
+#   lxc   : shares the host kernel; the isolated functional probe may trigger
+#           VXLAN autoload, then requires registered overlay, visible VXLAN,
+#           and working bridge filtering. It cannot persist module loading.
 #   vm    : owns its kernel; the probe requires the modules to be available and
 #           convergence loads them and persists them across reboots.
 #   metal : like vm, without a hypervisor.
@@ -19,6 +19,8 @@ node_name: ""               # must equal the inventory host key
 # Pin the real environment instead of leaving auto: a pinned value that later
 # disagrees (provider migration, rebuilt image) fails probe, site, and verify.
 node_virtualization: auto   # replace with lxc | vm | metal before onboarding
+# Only for a reviewed LXC with one host-owned `none virtual` swap entry:
+# k3s_tolerate_virtual_swap: true  # kubelet allows host swap; pods use NoSwap
 
 wireguard_address: ""       # free address in the operator-selected mesh subnet
 wireguard_endpoint: ""      # "[public-ipv6]:51820" or "public-ipv4:51820"

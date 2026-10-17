@@ -50,6 +50,7 @@ class NetworkCheckModeTests(LocalAnsibleTests):
                 {"item": "overlay", "stat": {"exists": True}},
                 {"item": "vxlan", "stat": {"exists": True}},
             ]},
+            "base_vxlan_after": {"stat": {"exists": True}},
             "base_cgroup_v2": {"stat": {"exists": True}}, "base_tun_device": {"stat": {"exists": True, "ischr": True}},
             "base_cgroup_controllers": {"content": base64.b64encode(b"cpu memory pids").decode()},
         }
@@ -60,6 +61,56 @@ class NetworkCheckModeTests(LocalAnsibleTests):
                                      {"item": "vxlan", "stat": {"exists": False}}]}
         self.play(tasks, values | {"base_module_paths": missing_vxlan}, check=True, success=False)
         self.play(tasks, values | {"node_virtualization": "vm"}, check=True, success=False)
+
+    def test_lxc_kernel_gate_requires_real_functional_evidence(self):
+        gate = task_named("base", "Require host-provided kernel facilities on LXC guests")
+        initially_missing = {"results": [
+            {"item": "br_netfilter", "stat": {"exists": False}},
+            {"item": "overlay", "stat": {"exists": True}},
+            {"item": "vxlan", "stat": {"exists": False}},
+        ]}
+        values = {"base_env": "lxc", "base_overlay_fs": {"rc": 0},
+                  "base_module_paths": initially_missing,
+                  "base_vxlan_after": {"stat": {"exists": True}},
+                  "base_vxlan_functional": {"rc": 0, "stdout": '{"passed": true}'}}
+        self.play([gate], values)
+        self.play([gate], values | {"base_vxlan_after": {"stat": {"exists": False}}}, success=False)
+        self.play([gate], values | {"base_vxlan_functional": {"rc": 1, "stdout": ""}}, success=False)
+        self.play([gate], values | {"base_vxlan_functional": {"rc": 0, "stdout": '{"passed": false}'}},
+                  success=False)
+        self.play([gate], values | {"base_overlay_fs": {"rc": 1}}, success=False)
+        self.play([gate], values | {"base_module_paths": {"results": [
+            {"item": "br_netfilter", "stat": {"exists": False}},
+            {"item": "overlay", "stat": {"exists": False}},
+            {"item": "vxlan", "stat": {"exists": True}},
+        ]}}, success=False)
+
+    def test_virtual_swap_exception_is_explicit_and_only_for_one_lxc_virtual_entry(self):
+        self.executable("swapon", r'''
+import os, sys
+assert sys.argv[1:] in (["--show", "--noheadings"],
+                        ["--show=NAME,TYPE", "--raw", "--noheadings"])
+if sys.argv[1] == "--show=NAME,TYPE":
+    print(os.environ.get("MOCK_SWAP_KIND", ""))
+else:
+    print(os.environ.get("MOCK_SWAP_ACTIVE", ""))
+''')
+        tasks = [task_named("base", name) for name in (
+            "Read active swap devices", "Identify the sole LXC virtual swap entry for an explicit exception",
+            "Refuse swap tolerance outside the explicit LXC exception",
+            "Require LXC host to provide swap-free operation")]
+        values = defaults("base") | {"base_env": "lxc", "base_disable_swap": True}
+        self.environment["MOCK_SWAP_ACTIVE"] = "none virtual 4G 0B"
+        self.environment["MOCK_SWAP_KIND"] = "none virtual"
+        self.play(tasks, values, success=False)
+        self.play(tasks, values | {"k3s_tolerate_virtual_swap": True})
+        for kind in ("/dev/sda1 partition", "none virtual\n/dev/sda1 partition", "none file"):
+            self.environment["MOCK_SWAP_KIND"] = kind
+            self.play(tasks, values | {"k3s_tolerate_virtual_swap": True}, success=False)
+        self.environment["MOCK_SWAP_KIND"] = "none virtual"
+        self.play(tasks, values | {"base_env": "vm", "k3s_tolerate_virtual_swap": True}, success=False)
+        self.play(tasks, values | {"base_disable_swap": False, "k3s_tolerate_virtual_swap": True},
+                  success=False)
 
     def test_fresh_wireguard_check_mode_never_generates_or_persists_keys(self):
         calls = Path(self.environment["MOCK_CALLS"])

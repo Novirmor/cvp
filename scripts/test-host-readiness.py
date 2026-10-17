@@ -4,6 +4,7 @@
 from contextlib import redirect_stdout
 import importlib.util
 from io import StringIO
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -19,6 +20,21 @@ spec.loader.exec_module(probe)
 
 
 class ReadinessTests(unittest.TestCase):
+    def test_ensure_vxlan_requires_all_functional_evidence_and_postcheck(self):
+        names = ("bridge creation", "VXLAN creation", "bridged IPv4 netfilter hook")
+        results = [{"name": name, "passed": True} for name in names]
+        for evidence, visible, expected in ((results, True, 0), (results, False, 1),
+                                            (results[:2], True, 1), (None, True, 1)):
+            output = StringIO()
+            with patch.object(probe, "functional_test", return_value=(evidence, "unshare denied" if evidence is None else "")), \
+                    patch.object(probe, "Path") as path, redirect_stdout(output):
+                path.return_value.is_dir.side_effect = (False, visible)
+                self.assertEqual(probe.ensure_vxlan(), expected)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["passed"], expected == 0)
+            self.assertEqual(report["vxlan_before"], False)
+            self.assertEqual(report["vxlan_after"], visible)
+
     def test_default_does_not_enter_a_namespace(self):
         with patch.object(probe, "check_readiness", return_value=[
                 {"name": "module vxlan", "passed": False, "detail": "not visible"}]), \

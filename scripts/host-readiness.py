@@ -183,11 +183,29 @@ def functional_test():
         return None, f"unexpected sandbox output: {output[:300]}"
 
 
+def ensure_vxlan():
+    """Try isolated kernel autoload, never accept a merely hidden VXLAN module."""
+    before = Path("/sys/module/vxlan").is_dir()
+    results, error = functional_test()
+    after = Path("/sys/module/vxlan").is_dir()
+    passed = (results is not None and
+              {item["name"] for item in results} ==
+              {"bridge creation", "VXLAN creation", "bridged IPv4 netfilter hook"} and
+              all(item["passed"] for item in results) and after)
+    print(json.dumps({"passed": passed, "vxlan_before": before, "vxlan_after": after,
+                      "checks": results, "error": error}))
+    return 0 if passed else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--functional", action="store_true",
                         help="opt-in isolated bridge/VXLAN and packet test; may autoload host modules")
+    parser.add_argument("--ensure-vxlan", action="store_true",
+                        help="Ansible gate: isolated functional test, JSON result, and post-test VXLAN visibility")
     args = parser.parse_args()
+    if args.ensure_vxlan:
+        return ensure_vxlan()
     checks = check_readiness()
     for item in checks:
         status = "INFO" if not item.get("required", True) else "PASS" if item["passed"] else "FAIL"

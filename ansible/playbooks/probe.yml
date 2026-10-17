@@ -2,7 +2,7 @@
 - name: Load persistent operator configuration
   ansible.builtin.import_playbook: load-operator-config.yml
 
-- name: Probe the host and network prerequisites without changing state
+- name: Probe host prerequisites (isolated LXC test may autoload VXLAN)
   hosts: wireguard
   become: true
   gather_facts: true
@@ -99,21 +99,45 @@
         - probe_env != 'lxc'
         - not probe_module_paths.results[module_index].stat.exists
 
-    # br_netfilter may be functional in LXC while hidden from /sys/module;
-    # the bridge sysctls are checked below. Overlay and VXLAN must still be
-    # registered/visible before admitting the host.
+    # Test the facilities, not just sysfs: user/network namespaces isolate the
+    # devices, though creating them may autoload a host kernel module.
+    - name: Functionally check LXC networking in isolated namespaces
+      ansible.builtin.script: "{{ playbook_dir }}/../../scripts/host-readiness.py --ensure-vxlan"
+      register: probe_vxlan_functional
+      changed_when: >-
+        probe_vxlan_functional.rc == 0 and
+        not (probe_vxlan_functional.stdout | from_json).vxlan_before and
+        (probe_vxlan_functional.stdout | from_json).vxlan_after
+      failed_when: false
+      when:
+        - probe_env == 'lxc'
+        - not ansible_check_mode
+
+    - name: Recheck LXC VXLAN visibility after functional test
+      ansible.builtin.stat:
+        path: /sys/module/vxlan
+      register: probe_vxlan_after
+      when: probe_env == 'lxc'
+
+    # br_netfilter may be hidden in LXC; the bridge sysctls below and the
+    # functional bridged-packet test check the actual behavior.
     - name: Require host-provided kernel facilities on LXC guests
       ansible.builtin.assert:
         that:
           - probe_overlay_fs.rc == 0
           - >-
-            probe_module_paths.results | rejectattr('item', 'equalto', 'br_netfilter')
-            | rejectattr('stat.exists') | list | length == 0
+            (probe_module_paths.results | selectattr('item', 'equalto', 'overlay') | first).stat.exists
+          - probe_vxlan_after.stat.exists
+          - >-
+            (ansible_check_mode and
+             (probe_module_paths.results | selectattr('item', 'equalto', 'vxlan') | first).stat.exists)
+            or (not ansible_check_mode and probe_vxlan_functional.rc == 0 and
+                (probe_vxlan_functional.stdout | from_json).passed)
         fail_msg: >-
-          This LXC guest needs registered overlay and visible VXLAN support;
-          it cannot load missing modules itself. Bridge netfilter is checked
-          by the provider sysctls below, not by /sys/module/br_netfilter.
-          Ask the provider to expose the facilities or use a VM.
+          LXC needs registered overlay, visible VXLAN, and working isolated
+          bridge/VXLAN/netfilter tests (except in check mode, which cannot
+          autoload). Check namespace permissions or host kernel support;
+          the guest cannot guarantee autoload survives reboot.
       when: probe_env == 'lxc'
 
     # A VM or metal host owns its kernel: the modules only need to be
@@ -152,6 +176,27 @@
       check_mode: false
       when: base_disable_swap | bool
 
+    - name: Identify the sole LXC virtual swap entry for an explicit exception
+      ansible.builtin.command:
+        argv: [swapon, "--show=NAME,TYPE", --raw, --noheadings]
+      register: probe_swap_kind
+      changed_when: false
+      check_mode: false
+      when:
+        - probe_env == 'lxc'
+        - k3s_tolerate_virtual_swap | bool
+
+    - name: Refuse swap tolerance outside the explicit LXC exception
+      ansible.builtin.assert:
+        that:
+          - probe_env == 'lxc'
+          - base_disable_swap | bool
+          - probe_swap_kind.stdout | trim == 'none virtual'
+        fail_msg: >-
+          Swap tolerance is only supported for the sole host-owned LXC
+          `none virtual` entry, with base_disable_swap still enabled.
+      when: k3s_tolerate_virtual_swap | bool
+
     - name: Check LXC network sysctl availability
       ansible.builtin.command:
         argv: [sysctl, -n, "{{ item.key }}"]
@@ -187,12 +232,15 @@
           - >-
             probe_lxc_writable.results | rejectattr('skipped', 'defined')
             | rejectattr('rc', 'equalto', 0) | list | length == 0
-          - not (base_disable_swap | bool) or probe_swap.stdout | trim | length == 0
+          - >-
+            not (base_disable_swap | bool) or
+            probe_swap.stdout | trim | length == 0 or
+            (k3s_tolerate_virtual_swap | bool and
+             probe_swap_kind.stdout | trim == 'none virtual')
         fail_msg: >-
           LXC requires host-provided bridge netfilter switches set to 1,
-          writable guest network sysctls, and no active host-owned swap.
-          Ask the provider to expose these facilities; the guest cannot
-          safely set host-owned switches or disable host swap.
+          writable guest network sysctls, and no active host-owned swap
+          unless the sole virtual entry has been explicitly accepted.
       when: probe_env == 'lxc'
 
     - name: Require an identified uplink for IPv6 router advertisements

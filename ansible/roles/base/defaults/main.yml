@@ -15,6 +15,7 @@ base_kernel_modules:
   - overlay
   - vxlan
 base_disable_swap: true
+k3s_tolerate_virtual_swap: false
 base_manage_admin_user: false
 base_admin_user: cvp-admin
 base_admin_authorized_keys: []

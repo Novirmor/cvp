@@ -124,9 +124,10 @@ SSH server yet, run `apt-get install -y openssh-server` in the console first.
 Cloud images that allow only a sudo user (such as `admin` or `debian`) are
 supported with `--login-user`.
 
-LXC containers additionally need provider-supplied overlay/VXLAN/bridge-netfilter
-support, delegated cgroups, TUN access, and bridge sysctls; a failing probe
-calls for provider changes or a VM.
+LXC containers additionally need working overlay/VXLAN/bridge-netfilter
+support, delegated cgroups, TUN access, and bridge sysctls. VXLAN may become
+visible after the isolated test triggers kernel autoload; a failed functional
+test still blocks deployment.
 
 Before scaffolding an LXC node, you can inspect these prerequisites over a
 previously authenticated SSH connection without modifying the guest:
@@ -149,7 +150,16 @@ across the bridge, and checks an IPv4 netfilter forward counter **only inside a
 newly isolated user/network namespace**. It refuses to fall back to the guest's
 real network namespace, but can cause the shared kernel to autoload modules.
 An isolation failure is inconclusive, not proof that the facilities cannot
-work. Neither mode replaces `task probe` or tests cross-host pod traffic.
+work. `task probe` and the base role now run the isolated bridge/VXLAN/netfilter
+test on LXC guests (except in Ansible check mode), even when VXLAN is already
+visible. They require VXLAN to be visible after the test, registered overlay,
+the existing bridge sysctls, and no active swap by default. An explicitly
+configured host-only `k3s_tolerate_virtual_swap: true` permits **only** a sole
+`none virtual` LXC swap entry; kubelet gets `fail-swap-on=false`, with Kubernetes'
+default `NoSwap` for pods. Host processes can still use swap. Never set
+`base_disable_swap: false` to bypass the gate. The test may autoload VXLAN
+on the shared host kernel; it cannot persist that load across a reboot.
+Neither mode tests cross-host pod traffic.
 
 ### 3.2 Scaffold it
 

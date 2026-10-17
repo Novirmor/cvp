@@ -87,18 +87,25 @@ synthetic mesh `192.0.2.0/24`; replace these before use. Leave
 carries a `node_virtualization` classification (`lxc`, `vm`, `metal`, or `auto`) that the
 probe, the base role, and verification all validate against
 `systemd-detect-virt` with the same shared identifier lists. LXC guests share
-the host kernel, so the probe requires usable host-provided modules, cgroup
-delegation, TUN, and bridge sysctls. Convergence
-never loads modules or disables host-owned swap there; VM and metal hosts get
-their kernel modules loaded and persisted by the base role. Forwarding-enabled
+the host kernel, so the probe requires usable kernel facilities, cgroup
+delegation, TUN, and bridge sysctls. The probe and base role test bridge,
+VXLAN, and packet filtering inside isolated namespaces; this can autoload
+VXLAN on the shared kernel, but does not persist that load or disable
+host-owned swap. VM and metal hosts get their kernel modules loaded and persisted by
+the base role. Forwarding-enabled
 uplinks retain IPv6 router advertisements via `accept_ra=2`. Before a fresh
-host probe, the OS must have `kmod` and `procps` available; `task probe` is
-read-only and does not install packages or require an active WireGuard mesh.
+host probe, the OS must have `kmod` and `procps` available; the LXC functional
+probe also needs `unshare`, `ip`, and `nft`. `task probe` installs nothing and
+does not require an active WireGuard mesh; the isolated test may autoload VXLAN.
 On LXC, `br_netfilter` may be hidden under `/sys/module` even when bridge
-filtering works. Probe and convergence require its bridge sysctls to be enabled
-instead of requiring that module entry; overlay and VXLAN checks remain. Use
-the [isolated bridged-packet readiness test](../docs/runbooks/nodes.md#31-install-debian-from-scratch)
-to confirm filtering on any host with a hidden module before joining it.
+filtering works. Probe and convergence require its bridge sysctls and a
+successful isolated bridged-packet test instead of requiring that module entry;
+overlay registration and post-test VXLAN visibility remain mandatory. Swap is
+rejected unless a host explicitly opts into `k3s_tolerate_virtual_swap: true`
+and has exactly one `none virtual` LXC entry. This only allows kubelet to run
+with host swap present; pods retain the Kubernetes default `NoSwap` behavior.
+See the
+[standalone readiness test](../docs/runbooks/nodes.md#31-install-debian-from-scratch).
 Every node, including the initial server, starts as a fresh Debian install and
 is scaffolded, bootstrapped, and joined through `docs/runbooks/nodes.md`
 (`task node-new`, `task node-bootstrap`, `task node-join`). `examples/instance/inventory/host_vars/example-newnode.yml.example`

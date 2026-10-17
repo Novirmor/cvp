@@ -55,9 +55,10 @@ after the control plane exists.
 
 Nodes may be LXC guests or ordinary VMs (`node_virtualization`: `lxc`, `vm`,
 `metal`, or `auto` for probe-time detection). The compatibility probe applies
-stricter shared-kernel checks to LXC guests: overlay must be a registered
-filesystem and the required modules must already be loaded on the host,
-because the guest cannot load them itself. VM and metal hosts only need the
+stricter shared-kernel checks to LXC guests: overlay must be registered and
+visible; an isolated bridge/VXLAN/packet-filter test may autoload VXLAN on the
+shared host kernel and must confirm VXLAN visibility afterward. This does not
+persist module loading across reboots. VM and metal hosts only need the
 modules available; the base role loads them and persists the loads across
 reboots. The probe, the base role, and the verification playbook classify
 environments with the same shared identifier lists, and a pinned declaration
