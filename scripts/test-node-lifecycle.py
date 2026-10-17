@@ -404,6 +404,31 @@ class NodeLifecycleTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(expected, result.stderr)
 
+    def test_bootstrap_reports_supported_host_keys_without_failing_on_legacy_dsa(self):
+        script = (ROOT / "scripts/node-bootstrap.sh").read_text()
+        function = script.split("report_host_keys() {\n", 1)[1].split("\n}\n", 1)[0]
+        with tempfile.TemporaryDirectory(prefix="cvp-bootstrap-hostkeys-") as directory:
+            directory = Path(directory)
+            for name in ("ed25519", "rsa", "dsa"):
+                (directory / f"ssh_host_{name}_key.pub").write_text("fixture\n")
+            helper = directory / "ssh-keygen"
+            helper.write_text("#!/bin/sh\ncase \"$2\" in *dsa*) exit 99;; esac\nprintf '%s\\n' \"$2\"\n")
+            helper.chmod(0o755)
+            harness = ("set -eu\nfail() { printf '%s\\n' \"$*\" >&2; exit 2; }\n"
+                       + "report_host_keys() {\n" + function + "\n}\nreport_host_keys \"$1\"\n")
+            env = dict(os.environ, PATH=str(directory) + ":" + os.environ["PATH"])
+            result = subprocess.run(["sh", "-c", harness, "sh", str(directory)],
+                                    env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("ssh_host_ed25519_key.pub", result.stdout)
+            self.assertIn("ssh_host_rsa_key.pub", result.stdout)
+            self.assertNotIn("ssh_host_dsa_key.pub", result.stdout + result.stderr)
+            (directory / "ssh_host_ed25519_key.pub").unlink()
+            result = subprocess.run(["sh", "-c", harness, "sh", str(directory)],
+                                    env=env, text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ED25519 SSH host key is missing", result.stderr)
+
 
 if __name__ == "__main__":
     sys.path.insert(0, str(ROOT / "scripts"))

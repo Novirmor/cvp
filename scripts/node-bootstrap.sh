@@ -14,6 +14,18 @@ fail() {
   exit 2
 }
 
+report_host_keys() {
+  key_dir="$1"
+  [ -f "$key_dir/ssh_host_ed25519_key.pub" ] || fail "ED25519 SSH host key is missing"
+  for file in "$key_dir"/ssh_host_*_key.pub; do
+    case "$file" in
+      */ssh_host_dsa_key.pub) continue ;; # OpenSSH 10 rejects legacy DSA keys.
+    esac
+    [ -f "$file" ] || continue
+    ssh-keygen -lf "$file" || fail "could not inspect SSH host key $file"
+  done
+}
+
 [ "$#" -eq 1 ] || fail "usage: $0 '<operator SSH public key>'"
 key="$1"
 case "$key" in
@@ -55,7 +67,5 @@ mv "$sudoers" /etc/sudoers.d/ops
 systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null
 
 printf '==> host key fingerprints\n'
-for file in /etc/ssh/ssh_host_*_key.pub; do
-  ssh-keygen -lf "$file"
-done
+report_host_keys /etc/ssh
 printf 'Bootstrap complete: ops can log in with the supplied key and use sudo.\n'
