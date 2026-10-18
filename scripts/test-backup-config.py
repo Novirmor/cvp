@@ -207,6 +207,11 @@ class BackupConfigTests(unittest.TestCase):
         for index, task in enumerate(prefix):
             if task.get("ansible.builtin.include_tasks") == "validate-nodeport.yml":
                 prefix[index] = {"name": task["name"], "ansible.builtin.assert": {"that": True}}
+            elif task.get("ansible.builtin.include_tasks") == "validate-userns.yml":
+                # The optional LXC gate has its own fixture; backup fixtures
+                # only need to preserve its position before any mutation.
+                prefix[index] = {"name": task["name"], "ansible.builtin.assert": {"that": True},
+                                 "when": task["when"]}
             elif "ansible.builtin.stat" in task:
                 task["ansible.builtin.stat"]["path"] = str(self.work / "no-restore-guard")
             elif task.get('ansible.builtin.include_tasks') == 'validate-config.yml':
