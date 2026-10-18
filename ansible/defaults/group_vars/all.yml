@@ -101,6 +101,9 @@ base_journal_max_use: 500M
 base_journal_max_file_size: 50M
 
 tailscale_package_version: ""
+# Explicitly defer the human/CI access overlay while keeping the WireGuard,
+# firewall, and K3s convergence and verification gates intact.
+tailscale_enabled: true
 tailscale_auth_key: ""
 tailscale_login_server: ""
 tailscale_accept_dns: false

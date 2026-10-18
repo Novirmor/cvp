@@ -170,20 +170,23 @@
   no_log: true
   when: not k3s_server_init | bool and not ansible_check_mode
 
-# People reach the API over Tailscale, so the certificate must cover this
-# server's tailnet addresses. Tailscale enrolls earlier in the same site run.
+# When the human access overlay is enabled, cover live tailnet addresses in
+# the API certificate. Deferred enrollment must not invoke the Tailscale CLI.
 - name: Read this server's Tailscale addresses for the API certificate
   ansible.builtin.command: tailscale ip
   register: k3s_tailscale_ips
   changed_when: false
   failed_when: false
   check_mode: false
+  when: tailscale_enabled | default(true) | bool
 
 - name: Cover the Tailscale addresses in the API certificate
   ansible.builtin.set_fact:
     k3s_effective_tls_sans: >-
       {{ (k3s_tls_sans
-          + ((k3s_tailscale_ips.stdout_lines | default([])) if k3s_tailscale_ips.rc | default(1) == 0 else [])
+          + ((k3s_tailscale_ips.stdout_lines | default([]))
+             if tailscale_enabled | default(true) | bool and k3s_tailscale_ips.rc | default(1) == 0
+             else [])
             | map('trim') | select('match', k3s_tailnet_address_pattern) | list)
          | unique }}
   vars:

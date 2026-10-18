@@ -284,6 +284,14 @@ class SiteOrchestrationTests(unittest.TestCase):
                 with self.subTest(play=play["name"]):
                     self.assertIs(play.get("any_errors_fatal"), True)
 
+    def test_deferred_tailscale_skips_only_the_access_overlay(self):
+        self.success(self.f.run(extra={"tailscale_enabled": False}))
+        phases = [row["phase"] for row in self.f.events()]
+        self.assertNotIn("tailscale", phases)
+        for role in ("base", "wireguard", "firewall", "storage", "k3s_server", "k3s_agent"):
+            self.assertIn(role, phases)
+        self.assertEqual(phases.count("release"), len(self.f.hosts))
+
     def test_success_locks_before_roles_atomic_patches_before_release_and_restore_sequence(self):
         self.success(self.f.run())
         rows = self.f.events()
@@ -306,7 +314,7 @@ class SiteOrchestrationTests(unittest.TestCase):
                 expected_labels["node-role.kubernetes.io/control-plane"] = "true"
             if host == "alpha":
                 expected_labels.update({"cvp.novirmor.io/ingress": "true", "svccontroller.k3s.cattle.io/enablelb": "true",
-                                        "svccontroller.k3s.cattle.io/lbpool": "public"})
+                                         "svccontroller.k3s.cattle.io/lbpool": "public"})
             self.assertEqual(node["metadata"]["labels"], expected_labels)
             self.assertEqual(json.loads(node["metadata"]["annotations"]["cvp.novirmor.io/managed-taints"]),
                              [{"key": "dedicated", "value": "batch", "effect": "NoSchedule"}])

@@ -1,4 +1,5 @@
 ---
+tailscale_enabled: true
 tailscale_package_version: ""
 tailscale_auth_key: ""
 tailscale_login_server: ""

@@ -12,6 +12,17 @@ Debian system with nothing else on it.
 | WireGuard (`wg0`) | Node-to-node cluster traffic: API `6443`, etcd `2379`/`2380`, kubelet `10250`, Flannel VXLAN `8472` | SSH |
 | Tailscale | People (and CI) reaching internal services: Kubernetes API `6443`, internal applications through the ingress node's Traefik | SSH, cluster-internal ports |
 
+For a staged cluster bring-up, set `tailscale_enabled: false` in the instance's
+`inventory/group_vars/all.yml` **before** site convergence. This explicitly
+defers installation, enrollment, and verification of the human/CI access
+overlay; it does not change the WireGuard, SSH firewall, LXC networking, swap,
+or K3s checks. The Kubernetes API remains reachable on the cluster's WireGuard
+network, not over Tailscale; use public SSH plus `sudo k3s kubectl` on a server
+for initial administration. Do not export a tailnet kubeconfig until enrollment
+is restored and the server certificate includes its live Tailscale address.
+Review enrollment and verify the complete site again before setting
+`tailscale_enabled: true`.
+
 The host firewall, the tailnet policy, and the commands below enforce these
 rules; there is no "move SSH to Tailscale" step.
 

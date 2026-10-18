@@ -349,7 +349,20 @@ class LocalAnsibleTests(unittest.TestCase):
                 self.environment["MOCK_TAILSCALE_RC"] = rc
                 self.play(tasks, {"k3s_tls_sans": ["api.internal"]})
                 self.assertEqual(json.loads((self.directory / "sans.json").read_text()), expected)
+        self.environment["MOCK_TAILSCALE_RC"] = "0"
+        self.play(tasks, {"k3s_tls_sans": ["api.internal"], "tailscale_enabled": False})
+        self.assertEqual(json.loads((self.directory / "sans.json").read_text()), ["api.internal"])
         self.assertIn("k3s_effective_tls_sans", (ROLES / "k3s_server/templates/config.yaml.j2").read_text())
+
+    def test_verify_defers_only_tailscale_when_explicitly_disabled(self):
+        plays = yaml.safe_load((ROOT / "ansible/playbooks/verify.yml").read_text())
+        tasks = [copy.deepcopy(task) for play in plays for task in play.get("tasks", [])
+                 if task.get("name") in ("Check Tailscale without changing enrollment",
+                                         "Require Tailscale to be running")]
+        self.assertEqual(len(tasks), 2)
+        self.play(tasks, {"tailscale_enabled": False})
+        self.mock_tailscale()
+        self.play(tasks, {"tailscale_enabled": True})
 
     def play(self, tasks, variables, success=True, module_defaults=None, check=False):
         play = [{"name": "Isolated host security regression", "hosts": "localhost", "connection": "local",
