@@ -43,7 +43,7 @@
       changed_when: false
       check_mode: false
       failed_when: false
-      when: tailscale_enabled | bool
+      when: tailscale_enabled | default(true) | bool
 
     - name: Require Tailscale to be running
       ansible.builtin.assert:
@@ -51,7 +51,7 @@
           - verify_tailscale.rc == 0
           - (verify_tailscale.stdout | from_json).BackendState == 'Running'
         fail_msg: Tailscale must report BackendState Running in valid JSON.
-      when: tailscale_enabled | bool
+      when: tailscale_enabled | default(true) | bool
 
     # Evidence for gate records: which environment each node actually runs on.
     - name: Detect the virtualization environment

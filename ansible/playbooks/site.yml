@@ -57,7 +57,7 @@
   roles:
     - role: base
     - role: tailscale
-      when: tailscale_enabled | bool
+      when: tailscale_enabled | default(true) | bool
     - role: wireguard
     - role: firewall
     - role: storage
