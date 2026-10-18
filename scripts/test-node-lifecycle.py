@@ -56,7 +56,10 @@ if fail and fail in name + " " + joined:
 if name == "ansible":
     if os.environ.get("CVP_TEST_ANSIBLE_FAIL"):
         sys.exit(4)
-    print("node | CHANGED | rc=0 >>\\nroot")
+    if "-o" in args:
+        print("node | CHANGED | rc=0 | (stdout) root")
+    else:
+        print("node | CHANGED | rc=0 >>\\nroot")
 elif name == "ssh-keyscan":
     key = os.environ.get("CVP_TEST_SCAN_KEY", "")
     print(args[-1] + " ssh-ed25519 " + key)

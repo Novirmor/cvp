@@ -529,7 +529,10 @@ def save_state(path, state):
 
 def operator_ssh_check(inventory, node, ssh):
     options = dict(ssh, ansible_ssh_extra_args="-o BatchMode=yes")
-    result = run(["ansible", *common.inventory_args(inventory), node, "-o", "-m", "ansible.builtin.command", "-a", "id -un",
+    # Default Ansible output puts command stdout on its own line. The -o
+    # callback instead emits `(stdout) root` on the host-status line, which
+    # cannot satisfy the whole-line identity check below.
+    result = run(["ansible", *common.inventory_args(inventory), node, "-m", "ansible.builtin.command", "-a", "id -un",
                   "-e", json.dumps(options)], capture=True, check=False, env=ansible_env())
     # `id -un` must print root as its whole output line, not merely contain it.
     return result.returncode == 0 and any(line.strip() == "root" for line in result.stdout.splitlines())
