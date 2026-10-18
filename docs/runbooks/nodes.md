@@ -172,6 +172,17 @@ default `NoSwap` for pods. Host processes can still use swap. Never set
 on the shared host kernel; it cannot persist that load across a reboot.
 Neither mode tests cross-host pod traffic.
 
+An unprivileged LXC user namespace can also hide `/dev/kmsg`, causing kubelet's
+OOM watcher to abort startup. If the K3s journal explicitly reports this error,
+set `k3s_kubelet_in_user_namespace: true` **for that host only**. This enables
+Kubernetes' `KubeletInUserNamespace` kubelet feature gate; CVP requires an
+explicit LXC declaration, a shifted root UID mapping, and cgroup v2 before
+rendering it. The gate tolerates missing `/dev/kmsg` and certain inaccessible
+host sysctls; it does **not** replace the overlay/VXLAN/bridge/swap checks above
+or guarantee pod networking works in the guest. Do not enable it on privileged
+containers, VMs, or bare-metal nodes. Independently confirm workload health
+after the service starts.
+
 ### 3.2 Scaffold it
 
 Paste the Tailscale enrollment key from your secret store into a private file

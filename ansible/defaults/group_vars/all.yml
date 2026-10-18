@@ -44,6 +44,9 @@ base_disable_swap: true
 # Per-host, explicit exception for an LXC's sole host-owned `none virtual`
 # swap entry. Pods stay NoSwap; kubelet is configured to tolerate host swap.
 k3s_tolerate_virtual_swap: false
+# Explicit opt-in for a kubelet running in an unprivileged LXC user namespace.
+# Kubernetes then tolerates the guest's inaccessible /dev/kmsg OOM watcher.
+k3s_kubelet_in_user_namespace: false
 
 # Network-namespace sysctls that the guest may manage. The bridge netfilter
 # switches can be host-owned in LXC and must already be set by the provider.

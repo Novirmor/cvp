@@ -18,6 +18,10 @@
 - name: Validate the private NodePort address
   ansible.builtin.include_tasks: validate-nodeport.yml
 
+- name: Validate the explicitly selected kubelet user namespace
+  ansible.builtin.include_tasks: validate-userns.yml
+  when: k3s_kubelet_in_user_namespace | default(false) | bool
+
 - name: Refuse convergence during an unresolved restore
   ansible.builtin.stat:
     path: "{{ k3s_restore_guard_path | default('/var/lib/cvp/k3s-restore-in-progress') }}"

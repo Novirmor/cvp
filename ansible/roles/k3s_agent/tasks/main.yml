@@ -17,6 +17,10 @@
 - name: Validate the private NodePort address
   ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/validate-nodeport.yml"
 
+- name: Validate the explicitly selected kubelet user namespace
+  ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/validate-userns.yml"
+  when: k3s_kubelet_in_user_namespace | default(false) | bool
+
 - name: Validate configuration sources before agent changes
   ansible.builtin.include_tasks: "{{ role_path }}/../k3s_server/tasks/validate-config.yml"
 

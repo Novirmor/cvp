@@ -3,10 +3,15 @@ token-file: "{{ k3s_agent_token_path }}"
 data-dir: "{{ k3s_data_dir }}"
 node-name: "{{ node_name }}"
 node-ip: "{{ wireguard_address }}"
-{% if k3s_tolerate_virtual_swap | default(false) | bool %}
-# Kubelet tolerates host-owned LXC virtual swap; pods retain default NoSwap.
+{% if k3s_tolerate_virtual_swap | default(false) | bool or k3s_kubelet_in_user_namespace | default(false) | bool %}
 kubelet-arg:
+{% if k3s_tolerate_virtual_swap | default(false) | bool %}
+  # Kubelet tolerates host-owned LXC virtual swap; pods retain default NoSwap.
   - "fail-swap-on=false"
+{% endif %}
+{% if k3s_kubelet_in_user_namespace | default(false) | bool %}
+  - "feature-gates=KubeletInUserNamespace=true"
+{% endif %}
 {% endif %}
 kube-proxy-arg:
   - "proxy-mode=iptables"

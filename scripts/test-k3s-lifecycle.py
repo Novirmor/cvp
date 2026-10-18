@@ -1574,6 +1574,14 @@ class NodePortTemplateTests(unittest.TestCase):
                 tolerating = yaml.safe_load(env.from_string(template.read_text()).render(
                     base | {"k3s_server_init": init, "k3s_tolerate_virtual_swap": True}))
                 self.assertEqual(tolerating["kubelet-arg"], ["fail-swap-on=false"])
+                userns = yaml.safe_load(env.from_string(template.read_text()).render(
+                    base | {"k3s_server_init": init, "k3s_kubelet_in_user_namespace": True}))
+                self.assertEqual(userns["kubelet-arg"], ["feature-gates=KubeletInUserNamespace=true"])
+                combined = yaml.safe_load(env.from_string(template.read_text()).render(
+                    base | {"k3s_server_init": init, "k3s_kubelet_in_user_namespace": True,
+                            "k3s_tolerate_virtual_swap": True}))
+                self.assertEqual(combined["kubelet-arg"], ["fail-swap-on=false",
+                                                          "feature-gates=KubeletInUserNamespace=true"])
                 args = dict(arg.split("=", 1) for arg in config["kube-proxy-arg"])
                 self.assertEqual(args["proxy-mode"], "iptables")
                 self.assertEqual(args["iptables-localhost-nodeports"], "true")
@@ -1612,6 +1620,31 @@ class NodePortTemplateTests(unittest.TestCase):
                                     input=json.dumps(play), text=True, capture_output=True, env=fixture.env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(fixture.events.exists())
+
+    def test_user_namespace_gate_rejects_privileged_or_non_lxc_hosts(self):
+        gate = yaml.safe_load((SERVER / "tasks/validate-userns.yml").read_text())[-1]
+        with tempfile.TemporaryDirectory(prefix="cvp-userns-") as tmp:
+            fixture = Fixture(Path(tmp))
+            cases = [("lxc", "0 100000 65536", True, True),
+                     ("vm", "0 100000 65536", True, False),
+                     ("lxc", "0 0 4294967295", True, False),
+                     ("lxc", "0 100000 65536", False, False)]
+            tasks = []
+            for kind, uid_map, cgroup, accepted in cases:
+                tasks.extend([
+                    {"ansible.builtin.set_fact": {"userns_accepted": False}},
+                    {"block": [gate, {"ansible.builtin.set_fact": {"userns_accepted": True}}],
+                     "rescue": [{"ansible.builtin.set_fact": {"userns_accepted": False}}],
+                     "vars": {"node_virtualization": kind,
+                              "k3s_userns_uid_map": {"stdout": uid_map},
+                              "k3s_userns_cgroup_v2": {"stat": {"exists": cgroup}}}},
+                    {"ansible.builtin.assert": {"that": "userns_accepted == " + str(accepted).lower()}},
+                ])
+            play = [{"hosts": "k3s_servers", "connection": "local", "become": False,
+                     "gather_facts": False, "tasks": tasks}]
+            result = subprocess.run(["ansible-playbook", "-i", str(fixture.inventory), "/dev/stdin"],
+                                    input=json.dumps(play), text=True, capture_output=True, env=fixture.env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

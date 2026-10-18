@@ -1,0 +1,22 @@
+---
+- name: Read the kubelet host's user namespace mapping
+  ansible.builtin.command: cat /proc/self/uid_map
+  register: k3s_userns_uid_map
+  changed_when: false
+  check_mode: false
+
+- name: Check that the kubelet host uses cgroup v2
+  ansible.builtin.stat:
+    path: /sys/fs/cgroup/cgroup.controllers
+  register: k3s_userns_cgroup_v2
+
+- name: Limit the user namespace feature gate to mapped LXC guests with cgroup v2
+  ansible.builtin.assert:
+    that:
+      - node_virtualization == 'lxc'
+      - k3s_userns_uid_map.stdout is match('(?m)^\s*0\s+[1-9][0-9]*\s+[1-9][0-9]*\s*$')
+      - k3s_userns_cgroup_v2.stat.exists
+    fail_msg: >-
+      KubeletInUserNamespace requires an explicitly declared unprivileged LXC
+      guest with a shifted root UID mapping and cgroup v2. Do not enable this
+      kubelet gate on a VM, bare-metal host, or privileged container.
