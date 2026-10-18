@@ -1486,6 +1486,31 @@ class RecoveryChecksumTests(unittest.TestCase):
 
 
 class EffectiveConfigurationTests(unittest.TestCase):
+    def test_absent_systemd_unit_may_omit_only_execution_properties(self):
+        source = SERVER / 'files/cvp-k3s-config-check.py'
+        spec = importlib.util.spec_from_file_location('cvp_config_check_fixture', source)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        base = {'LoadState': 'not-found', 'FragmentPath': '', 'DropInPaths': '',
+                'Environment': '', 'PassEnvironment': '', 'Type': ''}
+        optional = {'EnvironmentFiles': '', 'ExecStart': '', 'ExecCondition': ''}
+
+        def inspect(values):
+            output = ''.join(f'{name}={value}\n' for name, value in values.items())
+            with mock.patch.object(checker.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                    [], 0, output, '')):
+                return checker.properties('k3s.service')
+
+        self.assertEqual(inspect(base)['LoadState'], 'not-found')
+        self.assertEqual(inspect(base | optional), base | optional)
+        with self.assertRaisesRegex(ValueError, 'Incomplete'):
+            inspect({name: value for name, value in base.items() if name != 'DropInPaths'})
+        with self.assertRaisesRegex(ValueError, 'Incomplete'):
+            inspect(base | {'UnaccountedProperty': 'value'})
+        with self.assertRaisesRegex(ValueError, 'Incomplete'):
+            inspect({name: value for name, value in
+                     (base | optional | {'LoadState': 'loaded'}).items() if name != 'ExecCondition'})
+
     def test_previous_guard_is_accepted_only_for_preflight_not_loaded_fencing(self):
         with tempfile.TemporaryDirectory(prefix='cvp-legacy-config-') as directory:
             f = Fixture(Path(directory))

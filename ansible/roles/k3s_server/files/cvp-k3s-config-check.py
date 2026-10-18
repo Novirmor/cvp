@@ -14,7 +14,16 @@ def properties(unit):
                              '--', unit], capture_output=True, text=True, check=True, timeout=15)
     rows = result.stdout.splitlines()
     values = dict(row.split('=', 1) for row in rows)
-    if result.stderr.strip() or len(rows) != len(names) or set(values) != set(names):
+    # systemd omits some execution-only properties for a unit that has never
+    # been installed. Every property remains mandatory for an installed unit.
+    optional_when_absent = {'EnvironmentFiles', 'ExecStart', 'ExecCondition'}
+    expected = set(names)
+    observed = set(values)
+    absent = values.get('LoadState') == 'not-found'
+    if (result.stderr.strip() or len(rows) != len(values) or
+            (not absent and observed != expected) or
+            (absent and (not (expected - optional_when_absent) <= observed or
+                         not observed <= expected))):
         raise ValueError('Incomplete effective systemd configuration')
     return values
 
@@ -73,6 +82,8 @@ def check(request):
         raise ValueError('Unaccounted K3S manager environment')
     values = properties(unit)
     if values['LoadState'] == 'not-found' and not request.get('require_unit', False):
+        if any(value for name, value in values.items() if name != 'LoadState'):
+            raise ValueError('Unaccounted systemd settings on an absent K3s unit')
         return
     if values['LoadState'] != 'loaded' or values['FragmentPath'] != request['unit_path']:
         raise ValueError('K3s must use the expected installed systemd unit')
