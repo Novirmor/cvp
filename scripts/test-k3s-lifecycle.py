@@ -1132,7 +1132,7 @@ class ActivationTests(unittest.TestCase):
         write(self.f.guard_helper, (SERVER / 'files/cvp-k3s-start-guard.py').read_text(), 0o755)
         guard_template = jinja2.Environment().from_string((SERVER / 'templates/restore-guard.conf.j2').read_text())
         write(self.f.guard_dropin, guard_template.render(self.f.vars) + '\n', 0o644)
-        write(self.proc / "100/exe", f"#!/bin/sh\necho 'k3s version {VERSION} (synthetic)'\n", 0o700)
+        write(self.proc / "100/exe", f"#!/bin/sh\necho 'exe version {VERSION} (synthetic)'\n", 0o700)
         write(self.f.systemctl, f'''#!{sys.executable}
 import pathlib, sys
 args = sys.argv[1:]
@@ -1160,7 +1160,7 @@ if args[0] == 'service':
         exe = pathlib.Path({str(self.proc)!r}) / pid / 'exe'
         exe.parent.mkdir()
         version = pathlib.Path({str(self.version)!r}).read_text()
-        exe.write_text("#!/bin/sh\\necho 'k3s version " + version + " (synthetic)'\\n")
+        exe.write_text("#!/bin/sh\\necho 'exe version " + version + " (synthetic)'\\n")
         exe.chmod(0o700)
 elif '--property=ActiveState' in args:
     print('ActiveState=active\\nMainPID=' + pid)
@@ -1253,9 +1253,15 @@ else:
 
     def test_runtime_version_drift_restarts_even_with_matching_disk_stamp(self):
         self.assert_success(self.activate())
-        write(self.proc / self.pid.read_text() / "exe", "#!/bin/sh\necho 'k3s version v1.34.0+k3s1 (old-process)'\n", 0o700)
+        write(self.proc / self.pid.read_text() / "exe", "#!/bin/sh\necho 'exe version v1.34.0+k3s1 (old-process)'\n", 0o700)
         self.assert_success(self.activate())
         self.assertEqual(self.f.events.read_text().splitlines(), ["restarted", "restarted"])
+
+    def test_unexpected_runtime_version_never_records_activation(self):
+        write(self.version, 'v1.34.0+k3s1')
+        result = self.activate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.stamp.exists())
 
     def test_role_check_mode_skips_token_exchange_and_activation(self):
         server_tasks = yaml.safe_load((SERVER / "tasks/main.yml").read_text())

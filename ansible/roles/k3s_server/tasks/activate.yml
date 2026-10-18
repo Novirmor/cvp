@@ -51,12 +51,14 @@
   failed_when: false
   when: k3s_activation_pid_before.stdout | trim is match('^[1-9][0-9]*$')
 
+# K3s derives the command name from argv[0]. Invoking the active process via
+# /proc/<pid>/exe therefore prints "exe version", not always "k3s version".
 - name: Decide whether activation is required
   ansible.builtin.set_fact:
     k3s_activation_needed: >-
       {{ (k3s_activation_previous.content | default('') | b64decode | trim) != k3s_activation_desired
          or not (k3s_activation_runtime_before.stdout | default('') is
-                 search('(?m)^k3s version ' ~ (k3s_version | regex_escape) ~ '(?: |$)')) }}
+                  search('(?m)^(?:k3s|exe) version ' ~ (k3s_version | regex_escape) ~ '(?: |$)')) }}
 
 - name: Activate changed or previously unverified K3s state
   ansible.builtin.systemd_service:
@@ -114,7 +116,8 @@
   changed_when: false
   failed_when: >-
     k3s_activation_runtime.rc != 0 or not
-    (k3s_activation_runtime.stdout is search('(?m)^k3s version ' ~ (k3s_version | regex_escape) ~ '(?: |$)'))
+    (k3s_activation_runtime.stdout is search('(?m)^(?:k3s|exe) version ' ~
+                                             (k3s_version | regex_escape) ~ '(?: |$)'))
 
 - name: Record only a verified successful activation
   ansible.builtin.copy:
